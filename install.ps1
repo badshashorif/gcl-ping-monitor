@@ -72,8 +72,9 @@ if ($env:GCLPM_NOAUTOSTART -ne '1') {
 
 # ---- launch ----
 if ($env:GCLPM_NOLAUNCH -ne '1') {
+    $myPid = $PID
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*GCL-PingMonitor.ps1*' } |
+        Where-Object { $_.ProcessId -ne $myPid -and $_.CommandLine -like "*-File*$Script*" } |
         ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch { } }
     Start-Sleep -Milliseconds 500
     Start-Process powershell -WindowStyle Hidden -ArgumentList @(
