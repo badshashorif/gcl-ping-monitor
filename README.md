@@ -1,26 +1,55 @@
 # GCL Ping Monitor
 
-Windows desktop ping monitor for the support desk. No install, no dependencies —
-just Windows PowerShell 5.1 (built into Windows 10/11).
+Windows desktop ping monitor for the support desk. No admin rights, no
+dependencies — just Windows PowerShell 5.1 (built into Windows 10/11).
 
-## Download
+## Install (recommended)
 
-- **Code → Download ZIP** on the GitHub page, then extract anywhere, **or**
-- `git clone https://github.com/badshashorif/gcl-ping-monitor.git`
-
-## Run
-
-Double-click **`Start-PingMonitor.cmd`**.
-
-> First run may show a SmartScreen / "Windows protected your PC" prompt because
-> the `.cmd` is unsigned — click **More info → Run anyway**. Or unblock the files:
-> right-click each file → Properties → **Unblock**.
-
-Or from PowerShell:
+Open **Windows PowerShell** on the support PC and paste this one line:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -STA -File .\GCL-PingMonitor.ps1
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/badshashorif/gcl-ping-monitor/main/install.ps1 | iex"
 ```
+
+It will:
+
+1. download the latest version into `%LOCALAPPDATA%\GCL-PingMonitor`
+2. create a **Desktop** shortcut ("GCL Ping Monitor")
+3. set it to **start automatically with Windows**
+4. launch it
+
+Run the exact same line again any time to force an update. Your host list and
+settings (kept in `%APPDATA%`) are never touched.
+
+Options — set before pasting the line:
+
+```powershell
+$env:GCLPM_NOAUTOSTART = 1   # don't add the start-with-Windows shortcut
+$env:GCLPM_NOLAUNCH    = 1   # install but don't open it now
+```
+
+### Uninstall
+
+Delete these two shortcuts and one folder:
+
+- `%USERPROFILE%\Desktop\GCL Ping Monitor.lnk`
+- `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\GCL Ping Monitor.lnk`
+- `%LOCALAPPDATA%\GCL-PingMonitor`
+
+## Install (manual, no installer)
+
+- **Code → Download ZIP** on GitHub → extract to a user-writable folder
+  (Desktop / Documents — **not** `C:\Program Files`), **or**
+  `git clone https://github.com/badshashorif/gcl-ping-monitor.git`
+- Double-click **`Start-PingMonitor.cmd`** (or run
+  `powershell -NoProfile -ExecutionPolicy Bypass -STA -File .\GCL-PingMonitor.ps1`)
+
+> First run may show a SmartScreen / "Windows protected your PC" prompt — click
+> **More info → Run anyway**, or right-click each file → Properties → **Unblock**.
+
+> A `git clone` is treated as a dev checkout: auto-update is turned **off** there
+> so your local edits are safe. Use the ZIP or the installer on machines that
+> should auto-update.
 
 ## What it does
 
@@ -86,5 +115,5 @@ auto-update overwrites.
   freeze the UI.
 - Alarm sound is `C:\Windows\Media\Alarm01.wav` if present, otherwise it falls
   back to the Windows "critical stop" system sound.
-- To auto-start with Windows: put a shortcut to `Start-PingMonitor.cmd` in
-  `shell:startup`.
+- The installer already sets up start-with-Windows. For a manual copy, put a
+  shortcut to `Start-PingMonitor.cmd` in `shell:startup`.

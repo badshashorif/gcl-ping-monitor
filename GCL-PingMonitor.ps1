@@ -26,7 +26,7 @@ param(
 # ---------------------------------------------------------------------------
 $script:Repo         = 'badshashorif/gcl-ping-monitor'
 $script:Branch       = 'main'
-$script:UpdateFiles  = @('GCL-PingMonitor.ps1', 'Start-PingMonitor.cmd', 'README.md', 'LICENSE')
+$script:UpdateFiles  = @('GCL-PingMonitor.ps1', 'Start-PingMonitor.cmd', 'install.ps1', 'README.md', 'LICENSE')
 $script:ScriptPath   = $MyInvocation.MyCommand.Path
 $script:ScriptDir    = Split-Path -Parent $script:ScriptPath
 $script:IsGitCheckout = Test-Path (Join-Path $script:ScriptDir '.git')
