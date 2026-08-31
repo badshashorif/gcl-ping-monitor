@@ -71,17 +71,23 @@ if ($env:GCLPM_NOAUTOSTART -ne '1') {
 }
 
 # ---- launch ----
+$ErrorActionPreference = 'Continue'
 if ($env:GCLPM_NOLAUNCH -ne '1') {
-    $myPid = $PID
-    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.ProcessId -ne $myPid -and $_.CommandLine -like "*-File*$Script*" } |
-        ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch { } }
-    Start-Sleep -Milliseconds 500
-    Start-Process powershell -WindowStyle Hidden -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"{0}"' -f $Script)
-    )
-    Say ''
-    Say '  launched. Look for the "GCL Ping Monitor" window.' Green
+    try {
+        $myPid = $PID
+        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProcessId -ne $myPid -and $_.CommandLine -like "*-File*$Script*" } |
+            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch { } }
+        Start-Sleep -Milliseconds 500
+        Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"{0}"' -f $Script)
+        )
+        Say ''
+        Say '  launched. Look for the "GCL Ping Monitor" window.' Green
+    } catch {
+        Say ''
+        Say '  installed OK - start it from the "GCL Ping Monitor" Desktop shortcut.' Yellow
+    }
 }
 
 Say ''
