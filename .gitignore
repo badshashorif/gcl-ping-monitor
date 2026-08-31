@@ -1,0 +1,4 @@
+# local runtime output (config + logs live in %APPDATA%, but just in case)
+config.json
+events.log
+*.log
