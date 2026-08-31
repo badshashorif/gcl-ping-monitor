@@ -17,8 +17,19 @@
 param(
     [int]$IntervalSeconds = 5,
     [int]$TimeoutMs       = 1000,
-    [int]$FailThreshold   = 2
+    [int]$FailThreshold   = 2,
+    [switch]$NoUpdate                # skip the GitHub self-update check
 )
+
+# ---------------------------------------------------------------------------
+#  Self-update settings  (edit these if you fork the repo)
+# ---------------------------------------------------------------------------
+$script:Repo         = 'badshashorif/gcl-ping-monitor'
+$script:Branch       = 'main'
+$script:UpdateFiles  = @('GCL-PingMonitor.ps1', 'Start-PingMonitor.cmd', 'README.md', 'LICENSE')
+$script:ScriptPath   = $MyInvocation.MyCommand.Path
+$script:ScriptDir    = Split-Path -Parent $script:ScriptPath
+$script:IsGitCheckout = Test-Path (Join-Path $script:ScriptDir '.git')
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -43,12 +54,14 @@ if (-not $script:Config) {
         TimeoutMs       = $TimeoutMs
         FailThreshold   = $FailThreshold
         AlwaysOnTop     = $false
+        AutoUpdate      = $true
+        UpdateHours     = 6
         Hosts           = @()
     }
 }
-foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','Hosts') {
+foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','AutoUpdate','UpdateHours','Hosts') {
     if ($null -eq $script:Config.$p) {
-        $def = switch ($p) { 'IntervalSeconds' {$IntervalSeconds} 'TimeoutMs' {$TimeoutMs} 'FailThreshold' {$FailThreshold} 'AlwaysOnTop' {$false} 'Hosts' {@()} }
+        $def = switch ($p) { 'IntervalSeconds' {$IntervalSeconds} 'TimeoutMs' {$TimeoutMs} 'FailThreshold' {$FailThreshold} 'AlwaysOnTop' {$false} 'AutoUpdate' {$true} 'UpdateHours' {6} 'Hosts' {@()} }
         $script:Config | Add-Member -NotePropertyName $p -NotePropertyValue $def -Force
     }
 }
@@ -105,12 +118,83 @@ function Write-Event {
     }
 }
 
+# ---------------------------------------------------------------------------
+#  Self-update  (pulls the latest files straight from GitHub - no git needed)
+# ---------------------------------------------------------------------------
+#  * Compares each tracked file against raw.githubusercontent.com and rewrites
+#    only the ones that differ. Any push to the repo is picked up automatically
+#    (nothing to version-bump).
+#  * A dev checkout (folder has a .git) is left alone so local edits survive.
+#  * Startup: if files changed, the script relaunches itself so new code runs
+#    immediately. While running: a background check downloads updates and shows
+#    a "restart to apply" bar instead of yanking the window away mid-incident.
+
+function Get-LocalScriptVersion {
+    try { (Get-FileHash -Path $script:ScriptPath -Algorithm SHA1).Hash.Substring(0, 7).ToLower() } catch { '???????' }
+}
+
+function Invoke-SelfUpdate {
+    param([switch]$Silent)
+    if ($script:IsGitCheckout) { return $false }
+    if (-not $script:ScriptDir) { return $false }
+    $base = "https://raw.githubusercontent.com/$($script:Repo)/$($script:Branch)/"
+    $changed = $false
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+    } catch { }
+    foreach ($name in $script:UpdateFiles) {
+        try {
+            $resp = Invoke-WebRequest -Uri ($base + $name + '?_=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) `
+                        -UseBasicParsing -TimeoutSec 8 -Headers @{ 'Cache-Control' = 'no-cache'; 'Pragma' = 'no-cache' }
+        } catch {
+            # network problem / offline / rate-limited - abort cleanly, retry later
+            if (-not $Silent) { Write-Event ("UPDATE err : {0} ({1})" -f $name, $_.Exception.Message) }
+            return $false
+        }
+        if ($resp.StatusCode -ne 200) { return $false }
+        $remote = [string]$resp.Content
+        $dest   = Join-Path $script:ScriptDir $name
+        $local  = if (Test-Path $dest) { [System.IO.File]::ReadAllText($dest) } else { $null }
+        if ($remote -ne $local) {
+            try {
+                [System.IO.File]::WriteAllText($dest, $remote, (New-Object System.Text.UTF8Encoding($false)))
+                $changed = $true
+                Write-Event ("UPDATE    : refreshed {0}" -f $name)
+            } catch {
+                if (-not $Silent) { Write-Event ("UPDATE err : cannot write {0} ({1})" -f $name, $_.Exception.Message) }
+            }
+        }
+    }
+    return $changed
+}
+
+# ---- run the check once at startup, before the GUI is built ----
+if (-not $NoUpdate -and -not $script:IsGitCheckout -and $env:GCLPM_CHILD -ne '1' -and $script:Config.AutoUpdate) {
+    try {
+        if (Invoke-SelfUpdate -Silent) {
+            $env:GCLPM_CHILD = '1'
+            $child = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"{0}"' -f $script:ScriptPath)
+            )
+            Start-Sleep -Milliseconds 1800
+            if ($child -and -not $child.HasExited) {
+                exit                                  # new version is up - hand over
+            }
+            # the freshly-pulled version failed to start - keep running the code
+            # already loaded in this process so monitoring is not interrupted
+            $env:GCLPM_CHILD = $null
+            Write-Event 'UPDATE err : new version did not start - keeping the running version'
+        }
+    } catch { }
+}
+
 function Save-Config {
     try {
         $script:Config.IntervalSeconds = [int]$script:numInterval.Value
         $script:Config.TimeoutMs       = [int]$script:numTimeout.Value
         $script:Config.FailThreshold   = [int]$script:numThreshold.Value
         $script:Config.AlwaysOnTop     = [bool]$script:chkTop.Checked
+        if ($script:chkAutoUpdate) { $script:Config.AutoUpdate = [bool]$script:chkAutoUpdate.Checked }
         $script:Config.Hosts = @($script:Hosts | ForEach-Object { [pscustomobject]@{ Label = $_.Label; Target = $_.Target } })
         $script:Config | ConvertTo-Json -Depth 5 | Set-Content -Path $script:ConfigPath -Encoding UTF8
     } catch { }
@@ -342,6 +426,29 @@ $chkTop.AutoSize = $true
 $chkTop.Checked = [bool]$script:Config.AlwaysOnTop
 $chkTop.Margin = New-Object System.Windows.Forms.Padding(6, 7, 4, 0)
 
+$chkAutoUpdate = New-Object System.Windows.Forms.CheckBox
+$chkAutoUpdate.Text = 'Auto-update'
+$chkAutoUpdate.AutoSize = $true
+$chkAutoUpdate.Checked = [bool]$script:Config.AutoUpdate
+$chkAutoUpdate.Margin = New-Object System.Windows.Forms.Padding(6, 7, 4, 0)
+
+$btnUpdate = New-Object System.Windows.Forms.Button
+$btnUpdate.Text = 'Check for updates'
+$btnUpdate.Width = 120
+$btnUpdate.Margin = New-Object System.Windows.Forms.Padding(2, 4, 10, 0)
+
+# becomes visible only after a newer version has been downloaded in the background
+$btnRestartNow = New-Object System.Windows.Forms.Button
+$btnRestartNow.Text = 'RESTART to apply update'
+$btnRestartNow.Width = 170
+$btnRestartNow.Height = 30
+$btnRestartNow.Visible = $false
+$btnRestartNow.BackColor = [System.Drawing.Color]::Gold
+$btnRestartNow.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+$btnRestartNow.Margin = New-Object System.Windows.Forms.Padding(2, 3, 10, 0)
+
+if ($script:IsGitCheckout) { $chkAutoUpdate.Enabled = $false; $btnUpdate.Enabled = $false; $chkAutoUpdate.Text = 'Auto-update (dev checkout - off)' }
+
 $panelTop.Controls.AddRange(@(
     (New-Lbl 'Name:'), $txtLabel,
     (New-Lbl 'IP / host:'), $txtTarget, $btnAdd, $btnRemove,
@@ -349,7 +456,7 @@ $panelTop.Controls.AddRange(@(
     (New-Lbl 'Interval s:'), $numInterval,
     (New-Lbl 'Timeout ms:'), $numTimeout,
     (New-Lbl 'Fails->down:'), $numThreshold,
-    $chkTop
+    $chkTop, $chkAutoUpdate, $btnUpdate, $btnRestartNow
 ))
 
 # ---- Split: grid on top, log on bottom ----
@@ -474,7 +581,10 @@ function Refresh-Status {
     $oth  = $script:Hosts.Count - $up - $down
     $lblCounts.Text = ('UP: {0}    DOWN: {1}    other: {2}    |    checking every {3}s{4}' -f `
         $up, $down, $oth, [int]$script:numInterval.Value, $(if ($script:Paused) { '   [PAUSED]' } else { '' }))
-    $lblClock.Text = if ($script:LastCheck) { 'last check ' + $script:LastCheck.ToString('HH:mm:ss') } else { 'no check yet' }
+    $upd = if ($script:UpdatePending) { '  |  update ready - restart' }
+           elseif ($script:LastUpdateCheck) { '  |  upd chk ' + $script:LastUpdateCheck.ToString('HH:mm') }
+           else { '' }
+    $lblClock.Text = $(if ($script:LastCheck) { 'last check ' + $script:LastCheck.ToString('HH:mm:ss') } else { 'no check yet' }) + $upd
 }
 
 # ---------------------------------------------------------------------------
@@ -546,6 +656,41 @@ $numInterval.Add_ValueChanged({ $script:checkTimer.Interval = [int]$numInterval.
 $numTimeout.Add_ValueChanged({ Save-Config })
 $numThreshold.Add_ValueChanged({ Save-Config })
 $chkTop.Add_CheckedChanged({ $form.TopMost = $chkTop.Checked; Save-Config })
+$chkAutoUpdate.Add_CheckedChanged({ Save-Config })
+
+function Restart-Self {
+    try { Save-Config } catch { }
+    [Environment]::SetEnvironmentVariable('GCLPM_CHILD', $null)   # let the fresh instance re-check
+    Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"{0}"' -f $script:ScriptPath)
+    ) | Out-Null
+    $script:AllowClose = $true
+    $form.Close()
+}
+
+$btnRestartNow.Add_Click({ Restart-Self })
+
+$btnUpdate.Add_Click({
+    $btnUpdate.Enabled = $false
+    $old = $btnUpdate.Text
+    $btnUpdate.Text = 'Checking...'
+    try {
+        $r = Invoke-SelfUpdate
+        $script:LastUpdateCheck = Get-Date
+        if ($r) {
+            $script:UpdatePending = $true
+            $btnRestartNow.Visible = $true
+            Write-Event 'UPDATE    : new version downloaded (manual check) - restart to apply'
+            [System.Windows.Forms.MessageBox]::Show('A new version was downloaded. Click "RESTART to apply update" when ready.', 'Update ready', 'OK', 'Information') | Out-Null
+        } else {
+            Write-Event 'UPDATE    : already up to date'
+            [System.Windows.Forms.MessageBox]::Show('Already running the latest version.', 'Up to date', 'OK', 'Information') | Out-Null
+        }
+    } finally {
+        $btnUpdate.Text = $old
+        $btnUpdate.Enabled = $true
+    }
+})
 
 # ---------------------------------------------------------------------------
 #  Timers
@@ -572,29 +717,52 @@ $script:AlarmTimer.Add_Tick({
     if (-not $script:Player -and $script:AlarmPlaying) { [System.Media.SystemSounds]::Hand.Play() }
 })
 
+# background self-update check while the app is running
+$script:updateTimer = New-Object System.Windows.Forms.Timer
+$script:UpdateHoursMs = [int]([Math]::Min([Math]::Max([double]$script:Config.UpdateHours, 0.5), 168) * 3600 * 1000)
+$script:updateTimer.Interval = $script:UpdateHoursMs
+$script:updateTimer.Add_Tick({
+    try {
+        if ($script:IsGitCheckout) { return }
+        if (-not $script:chkAutoUpdate.Checked) { return }
+        if ($script:UpdatePending) { return }
+        $script:LastUpdateCheck = Get-Date
+        if (Invoke-SelfUpdate -Silent) {
+            $script:UpdatePending = $true
+            $script:btnRestartNow.Visible = $true
+            Write-Event 'UPDATE    : new version downloaded - click "RESTART to apply update"'
+        }
+    } catch { Write-Event "ERR update: $($_.Exception.Message)" }
+})
+
 # ---------------------------------------------------------------------------
 #  Wire up / start
 # ---------------------------------------------------------------------------
-$script:numInterval  = $numInterval
-$script:numTimeout   = $numTimeout
-$script:numThreshold = $numThreshold
-$script:chkTop       = $chkTop
-$script:btnAck       = $btnAck
+$script:numInterval   = $numInterval
+$script:numTimeout    = $numTimeout
+$script:numThreshold  = $numThreshold
+$script:chkTop        = $chkTop
+$script:btnAck        = $btnAck
+$script:chkAutoUpdate = $chkAutoUpdate
+$script:btnRestartNow = $btnRestartNow
+$script:Version       = Get-LocalScriptVersion
+$form.Text = "GCL Ping Monitor  -  v:$($script:Version)"
 
 $form.Add_Shown({
     Rebuild-Grid
     Refresh-Banner
     Refresh-Status
-    Write-Event ("MONITOR   : started - {0} host(s) loaded" -f $script:Hosts.Count)
+    Write-Event ("MONITOR   : started - v:{0} - {1} host(s) loaded" -f $script:Version, $script:Hosts.Count)
     $script:checkTimer.Start()
     $script:uiTimer.Start()
+    if (-not $script:IsGitCheckout) { $script:updateTimer.Start() }
     Start-CheckCycle
     if ($script:Hosts.Count -eq 0) { $txtTarget.Focus() }
 })
 
 $form.Add_FormClosing({
     try {
-        $script:checkTimer.Stop(); $script:uiTimer.Stop(); $script:AlarmTimer.Stop()
+        $script:checkTimer.Stop(); $script:uiTimer.Stop(); $script:AlarmTimer.Stop(); $script:updateTimer.Stop()
         if ($script:Player) { try { $script:Player.Stop() } catch { } }
         Save-Config
         Write-Event 'MONITOR   : stopped'
