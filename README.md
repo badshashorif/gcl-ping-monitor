@@ -86,6 +86,10 @@ Delete these two shortcuts and one folder:
 - **Enable / Disable** any host. A disabled host is not pinged, shows greyed out
   as `DISABLED`, and can never raise the alarm — use it for kit that is down for
   maintenance instead of deleting it.
+- **Loss %** column shows rolling packet loss over the last N pings (N is the
+  **Loss over** box, default 100). It is colour-graded — amber past 10%, red past
+  50% — so a host that is still *UP* but dropping packets cannot be missed.
+  Hover the cell for lost/total, lifetime counters and average latency.
 - Every enabled host is pinged on an interval (default 5s). The row is:
   - **green** = UP (shows latency)
   - **amber** = missed a ping, still checking
@@ -180,6 +184,7 @@ carry the secrets with it. Each machine is configured once.
 | Interval s | seconds between ping cycles |
 | Timeout ms | how long to wait for each reply |
 | Fails→down | consecutive failed pings before a host is marked DOWN (flap guard) |
+| Loss over | how many recent pings the Loss % is calculated from (default 100) |
 | Text | Small / Normal / Large / Extra large / TV — scales the whole window |
 | Always on top | keep the window above other apps |
 | Auto-update | pull new versions from GitHub automatically |
