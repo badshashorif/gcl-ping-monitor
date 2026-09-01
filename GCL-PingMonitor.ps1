@@ -109,10 +109,31 @@ if (-not $script:Config) {
         Hosts           = @()
     }
 }
-foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','AutoUpdate','UpdateHours','TextSize','LossWindow','SplitPercent','Hosts') {
+# A hashtable, not a switch: an overlapping/duplicated switch clause returns an
+# ARRAY here and the default silently becomes garbage. See the note further down.
+$script:Defaults = @{
+    IntervalSeconds = $IntervalSeconds
+    TimeoutMs       = $TimeoutMs
+    FailThreshold   = $FailThreshold
+    AlwaysOnTop     = $false
+    AutoUpdate      = $true
+    UpdateHours     = 6
+    TextSize        = 12
+    LossWindow      = 100
+    SplitPercent    = 72
+    Hosts           = @()
+    AlarmSound      = 'siren'    # key from $script:SoundDefs, or 'custom'
+    AlarmFile       = ''         # the .wav when AlarmSound = 'custom'
+    AlarmRepeatMs   = 1400       # how often the alarm sound is re-started
+    WinW            = 1180       # window size / position are remembered so a
+    WinH            = 780        # small "corner of the screen" window stays small
+    WinX            = -32000     # -32000 = never positioned yet -> centre
+    WinY            = -32000
+    WinMax          = $false
+}
+foreach ($p in @($script:Defaults.Keys)) {
     if ($null -eq $script:Config.$p) {
-        $def = switch ($p) { 'IntervalSeconds' {$IntervalSeconds} 'TimeoutMs' {$TimeoutMs} 'FailThreshold' {$FailThreshold} 'AlwaysOnTop' {$false} 'AutoUpdate' {$true} 'UpdateHours' {6} 'TextSize' {12} 'LossWindow' {100} 'SplitPercent' {72} 'Hosts' {@()} }
-        $script:Config | Add-Member -NotePropertyName $p -NotePropertyValue $def -Force
+        $script:Config | Add-Member -NotePropertyName $p -NotePropertyValue $script:Defaults[$p] -Force
     }
 }
 
@@ -331,6 +352,16 @@ function Save-Config {
         if ($script:MnuTop)        { $script:Config.AlwaysOnTop = [bool]$script:MnuTop.Checked }
         if ($script:MnuAutoUpdate) { $script:Config.AutoUpdate  = [bool]$script:MnuAutoUpdate.Checked }
         if ($script:TextSize)      { $script:Config.TextSize    = [int]$script:TextSize }
+        if ($script:FormReady) {
+            # RestoreBounds, not Bounds, so a maximised window still remembers the
+            # size it had before it was maximised
+            $b = if ($form.WindowState -eq 'Normal') { $form.Bounds } else { $form.RestoreBounds }
+            if ($b.Width -ge 200 -and $b.Height -ge 150) {
+                $script:Config.WinW = [int]$b.Width;  $script:Config.WinH = [int]$b.Height
+                $script:Config.WinX = [int]$b.X;      $script:Config.WinY = [int]$b.Y
+            }
+            $script:Config.WinMax = ($form.WindowState -eq 'Maximized')
+        }
         $script:Config.Hosts = @($script:Hosts | ForEach-Object {
             [pscustomobject]@{ Label = $_.Label; Target = $_.Target; Enabled = [bool]$_.Enabled }
         })
@@ -439,36 +470,62 @@ function Poll-Results {
 # ---------------------------------------------------------------------------
 #  Alarm
 # ---------------------------------------------------------------------------
-#  We generate our OWN alarm.wav (a loud two-tone siren) so the alarm never
-#  depends on the Windows sound scheme - which on a lot of machines is set to
-#  "No Sounds", which is why SystemSounds / MessageBeep can be silent.
+#  We GENERATE our own .wav tones so the alarm never depends on the Windows
+#  sound scheme - which on a lot of machines is set to "No Sounds", which is why
+#  SystemSounds / MessageBeep can be silent.
 #  The sound is (re)started on a short timer while the alarm is active, rather
 #  than PlayLooping(), because a re-triggered Play() is self-healing.
+#  Which sound is used is a setting: any built-in tone below, any Windows Media
+#  .wav, or a custom .wav of your own (Monitoring > Alarm sound...).
 
-function New-AlarmWav {
-    param([string]$Path)
+$script:SoundDefs = @(
+    [pscustomobject]@{ Key = 'siren'; Name = 'Two-tone siren  (default)'; Amp = 27000; Segments = @(
+        @{ F = 880;  Ms = 260 }, @{ F = 0; Ms = 80 }, @{ F = 1245; Ms = 260 }, @{ F = 0; Ms = 240 }) }
+    [pscustomobject]@{ Key = 'hilo'; Name = 'Ambulance hi-lo'; Amp = 27000; Segments = @(
+        @{ F = 990; Ms = 400 }, @{ F = 700; Ms = 400 }, @{ F = 0; Ms = 200 }) }
+    [pscustomobject]@{ Key = 'fastbeep'; Name = 'Fast triple beep'; Amp = 28000; Segments = @(
+        @{ F = 1000; Ms = 110 }, @{ F = 0; Ms = 70 }, @{ F = 1000; Ms = 110 }, @{ F = 0; Ms = 70 },
+        @{ F = 1000; Ms = 110 }, @{ F = 0; Ms = 400 }) }
+    [pscustomobject]@{ Key = 'pulse'; Name = 'Rapid pulse  (most urgent)'; Amp = 29000; Segments = @(
+        @{ F = 1300; Ms = 60 }, @{ F = 0; Ms = 55 }, @{ F = 1300; Ms = 60 }, @{ F = 0; Ms = 55 },
+        @{ F = 1300; Ms = 60 }, @{ F = 0; Ms = 55 }, @{ F = 1300; Ms = 60 }, @{ F = 0; Ms = 55 },
+        @{ F = 1300; Ms = 60 }, @{ F = 0; Ms = 300 }) }
+    [pscustomobject]@{ Key = 'whoop'; Name = 'Rising whoop'; Amp = 27000; Segments = @(
+        @{ F = 500; F2 = 1700; Ms = 480 }, @{ F = 0; Ms = 220 }) }
+    [pscustomobject]@{ Key = 'klaxon'; Name = 'Low klaxon  (deep)'; Amp = 28000; Segments = @(
+        @{ F = 440; Ms = 340 }, @{ F = 0; Ms = 60 }, @{ F = 330; Ms = 340 }, @{ F = 0; Ms = 260 }) }
+    [pscustomobject]@{ Key = 'chime'; Name = 'Soft chime  (quiet office)'; Amp = 17000; Segments = @(
+        @{ F = 1046; Ms = 220 }, @{ F = 1568; Ms = 380 }, @{ F = 0; Ms = 500 }) }
+)
+
+function New-ToneWav {
+    # 16 kHz / 16-bit / mono PCM written by hand - no media library needed.
+    # A segment is @{ F = <Hz>; Ms = <length> } and optionally F2 for a sweep.
+    # F = 0 is silence. Phase is accumulated so a sweep has no clicks.
+    param([string]$Path, $Segments, [int]$Amp = 27000)
     try {
-        $sr = 16000
-        $segments = @(
-            @{ F = 880;  Ms = 260 },
-            @{ F = 0;    Ms = 80  },
-            @{ F = 1245; Ms = 260 },
-            @{ F = 0;    Ms = 240 }
-        )
+        $sr  = 16000
         $mem = New-Object System.IO.MemoryStream
-        foreach ($seg in $segments) {
-            $n = [int]($sr * $seg.Ms / 1000)
+        foreach ($seg in $Segments) {
+            $n    = [int]($sr * $seg.Ms / 1000)
             $fade = [int]($sr * 0.008)
+            if ($fade -lt 1) { $fade = 1 }
+            $f1 = [double]$seg.F
+            $f2 = $f1
+            if ($seg.ContainsKey('F2')) { $f2 = [double]$seg.F2 }
+            $phase = 0.0
             for ($i = 0; $i -lt $n; $i++) {
-                $amp = 0
-                if ($seg.F -gt 0) {
+                $val = 0
+                if ($f1 -gt 0 -or $f2 -gt 0) {
+                    $f = $f1 + ($f2 - $f1) * ($i / [double]$n)
+                    $phase += 2 * [math]::PI * $f / $sr
                     $e = 1.0
                     if ($i -lt $fade) { $e = $i / $fade }
                     elseif ($i -gt ($n - $fade)) { $e = ($n - $i) / $fade }
-                    $amp = [int][math]::Round([math]::Sin(2 * [math]::PI * $seg.F * $i / $sr) * 27000 * $e)
+                    if ($e -lt 0) { $e = 0 }
+                    $val = [int][math]::Round([math]::Sin($phase) * $Amp * $e)
                 }
-                $bytes = [System.BitConverter]::GetBytes([int16]$amp)
-                $mem.Write($bytes, 0, 2)
+                $mem.Write([System.BitConverter]::GetBytes([int16]$val), 0, 2)
             }
         }
         $pcm = $mem.ToArray()
@@ -485,23 +542,51 @@ function New-AlarmWav {
     } catch { return $false }
 }
 
-$script:AlarmWavPath = Join-Path $script:AppDir 'alarm.wav'
-if (-not (Test-Path $script:AlarmWavPath)) { [void](New-AlarmWav -Path $script:AlarmWavPath) }
-if (-not (Test-Path $script:AlarmWavPath)) {
-    $script:AlarmWavPath = @(
+function Get-BuiltInSoundPath {
+    # generated once into %APPDATA% and cached there
+    param([string]$Key)
+    $def = $script:SoundDefs | Where-Object { $_.Key -eq $Key } | Select-Object -First 1
+    if (-not $def) { $def = $script:SoundDefs[0] }
+    $p = Join-Path $script:AppDir ('alarm-{0}.wav' -f $def.Key)
+    if (-not (Test-Path $p)) { [void](New-ToneWav -Path $p -Segments $def.Segments -Amp $def.Amp) }
+    $p
+}
+
+function Resolve-AlarmSound {
+    # the .wav the alarm should use right now. A custom file that has gone
+    # missing falls back to the default tone - the alarm must never go silent.
+    $key = [string]$script:Config.AlarmSound
+    if ($key -eq 'custom') {
+        $f = [string]$script:Config.AlarmFile
+        if ($f -and (Test-Path $f)) { return $f }
+        return (Get-BuiltInSoundPath 'siren')
+    }
+    Get-BuiltInSoundPath $key
+}
+
+$script:Player = $null
+function Set-AlarmPlayer {
+    param([string]$Path)
+    try { if ($script:Player) { $script:Player.Stop(); $script:Player.Dispose() } } catch { }
+    $script:Player = $null
+    $script:AlarmWavPath = $Path
+    try {
+        if ($Path -and (Test-Path $Path)) {
+            $script:Player = New-Object System.Media.SoundPlayer $Path
+            $script:Player.Load()
+        }
+    } catch { $script:Player = $null }
+}
+
+Set-AlarmPlayer (Resolve-AlarmSound)
+if (-not $script:Player) {
+    $fb = @(
         (Join-Path $env:WINDIR 'Media\Alarm01.wav'),
         (Join-Path $env:WINDIR 'Media\Ring06.wav'),
         (Join-Path $env:WINDIR 'Media\notify.wav')
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($fb) { Set-AlarmPlayer $fb }
 }
-
-$script:Player = $null
-try {
-    if ($script:AlarmWavPath -and (Test-Path $script:AlarmWavPath)) {
-        $script:Player = New-Object System.Media.SoundPlayer $script:AlarmWavPath
-        $script:Player.Load()
-    }
-} catch { $script:Player = $null }
 
 $script:AlarmActive = $false
 
@@ -753,11 +838,36 @@ function UiFont  { param([double]$Scale = 1.0, [switch]$Bold)
 $form = New-Object System.Windows.Forms.Form
 $form.Text          = 'GCL Ping Monitor'
 $form.Size          = New-Object System.Drawing.Size(1180, 780)
-$form.MinimumSize   = New-Object System.Drawing.Size(820, 520)
+# The real minimum is computed from the text size in Apply-TextSize; this is
+# only a floor so the window can be dragged genuinely small (a corner of the
+# screen), with Update-Responsive dropping columns to keep it readable.
+$form.MinimumSize   = New-Object System.Drawing.Size(300, 200)
 $form.StartPosition = 'CenterScreen'
 $form.Font          = UiFont
 $form.TopMost       = [bool]$script:Config.AlwaysOnTop
 $form.BackColor     = [System.Drawing.Color]::FromArgb(245, 246, 248)
+
+# ---- restore the last window size / position -------------------------------
+# Whatever size he leaves it at is the size it comes back at - otherwise a small
+# corner window would have to be re-shrunk after every restart or update.
+try {
+    $cw = [int]$script:Config.WinW; $ch = [int]$script:Config.WinH
+    if ($cw -ge 300 -and $ch -ge 200) { $form.Size = New-Object System.Drawing.Size($cw, $ch) }
+    $cx = [int]$script:Config.WinX; $cy = [int]$script:Config.WinY
+    if ($cx -gt -32000 -and $cy -gt -32000) {
+        # only if that spot is still on a screen - a monitor may have been unplugged
+        $pt = New-Object System.Drawing.Point(($cx + 40), ($cy + 20))
+        $onScreen = $false
+        foreach ($sc in [System.Windows.Forms.Screen]::AllScreens) {
+            if ($sc.WorkingArea.Contains($pt)) { $onScreen = $true; break }
+        }
+        if ($onScreen) {
+            $form.StartPosition = 'Manual'
+            $form.Location = New-Object System.Drawing.Point($cx, $cy)
+        }
+    }
+    if ([bool]$script:Config.WinMax) { $form.WindowState = 'Maximized' }
+} catch { }
 
 $script:SizeMap = @(9, 12, 15, 18, 22)
 $script:SizeNames = @('Small', 'Normal', 'Large', 'Extra large', 'TV')
@@ -766,6 +876,7 @@ $script:SizeNames = @('Small', 'Normal', 'Large', 'Extra large', 'TV')
 $lblBanner = New-Object System.Windows.Forms.Label
 $lblBanner.Dock      = 'Top'
 $lblBanner.TextAlign = 'MiddleCenter'
+$lblBanner.AutoEllipsis = $true          # a long "3 HOSTS DOWN - a, b, c" must not clip mid-letter
 $lblBanner.ForeColor = [System.Drawing.Color]::White
 $lblBanner.BackColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
 $lblBanner.Text      = 'Starting...'
@@ -780,6 +891,7 @@ $menu.BackColor = [System.Drawing.Color]::FromArgb(52, 58, 70)
 $menu.ForeColor = [System.Drawing.Color]::White
 $menu.Padding   = New-Object System.Windows.Forms.Padding(6, 2, 6, 2)
 $menu.RenderMode = 'Professional'
+$menu.CanOverflow = $true          # so the menu bar survives a very narrow window too
 
 function New-Mnu {
     param([string]$Text, [switch]$Checkable, [switch]$Checked)
@@ -815,12 +927,15 @@ for ($i = 0; $i -lt $script:SizeNames.Count; $i++) {
 }
 $miTop     = New-Mnu '&Always on top' -Checkable -Checked:([bool]$script:Config.AlwaysOnTop)
 $miShowLog = New-Mnu 'Show event &log' -Checkable -Checked
-[void]$mView.DropDownItems.AddRange(@($miSize, (New-Sep), $miTop, $miShowLog))
+$miCompact = New-Mnu '&Compact window  (smallest size)'
+$miNormalW = New-Mnu '&Normal window size'
+[void]$mView.DropDownItems.AddRange(@($miSize, (New-Sep), $miTop, $miShowLog, (New-Sep), $miCompact, $miNormalW))
 
 $miPause   = New-Mnu '&Pause monitoring'
 $miTest    = New-Mnu '&Test alarm sound'
+$miSound   = New-Mnu 'Alarm &sound...'
 $miMonSet  = New-Mnu '&Monitoring settings...'
-[void]$mMon.DropDownItems.AddRange(@($miPause, $miTest, (New-Sep), $miMonSet))
+[void]$mMon.DropDownItems.AddRange(@($miPause, (New-Sep), $miTest, $miSound, (New-Sep), $miMonSet))
 
 $miNotify  = New-Mnu '&Notifications...'
 $miExport  = New-Mnu '&Export hosts + settings...'
@@ -935,8 +1050,10 @@ $cmAck    = New-Mnu '&Acknowledge alarm'
 $split = New-Object System.Windows.Forms.SplitContainer
 $split.Dock = 'Fill'
 $split.Orientation = 'Horizontal'
-$split.Panel1MinSize = 120
-$split.Panel2MinSize = 80
+# kept small on purpose: a 200px-tall window still has to be able to place the
+# splitter, otherwise SplitterDistance silently refuses to move
+$split.Panel1MinSize = 46
+$split.Panel2MinSize = 34
 
 # A fixed SplitterDistance set before the control is laid out ends up wrong once
 # the form has its real size - that is how the log panel got squashed to one
@@ -962,6 +1079,9 @@ $grid.RowHeadersVisible = $false
 $grid.SelectionMode = 'FullRowSelect'
 $grid.MultiSelect = $true
 $grid.AutoSizeColumnsMode = 'Fill'
+# Fill mode already divides the width up; a horizontal scrollbar would only ever
+# mean a column has been pushed off the right edge, so forbid one outright
+$grid.ScrollBars = 'Vertical'
 $grid.EnableHeadersVisualStyles = $false
 $grid.AllowUserToOrderColumns = $true
 $grid.BackgroundColor = [System.Drawing.Color]::White
@@ -982,6 +1102,9 @@ $null = $grid.Columns.Add('cLat',    'Latency')
 $null = $grid.Columns.Add('cLoss',   'Loss %')
 $null = $grid.Columns.Add('cSince',  'Since')
 $null = $grid.Columns.Add('cDown',   'Down for')
+# Fill mode refuses to shrink a column below its MinimumWidth, and the default is
+# wide enough to push the last column off the right edge in a small window
+foreach ($c in $grid.Columns) { $c.MinimumWidth = 26 }
 $grid.Columns['cLabel'].FillWeight  = 130
 $grid.Columns['cTarget'].FillWeight = 120
 $grid.Columns['cStatus'].FillWeight = 80
@@ -1015,8 +1138,13 @@ function Apply-TextSize {
     $form.Font        = UiFont
     $menu.Font        = UiFont
     $panelTop.Font    = UiFont
-    $lblBanner.Font   = UiFont 1.75 -Bold
-    $lblBanner.Height = [int]($s * 3.4)
+
+    # the smallest the window may get is derived from the text size, not fixed -
+    # at Small it can be a little corner box, at TV it still has to fit the
+    # ACKNOWLEDGE button
+    $minW = [int][Math]::Max(320, $s * 24)
+    $minH = [int][Math]::Max(210, $s * 16)
+    try { $form.MinimumSize = New-Object System.Drawing.Size($minW, $minH) } catch { }
 
     foreach ($t in @($txtLabel, $txtTarget, $txtSearch)) {
         $t.Font = UiFont
@@ -1036,7 +1164,95 @@ function Apply-TextSize {
     $status.Font = UiFont
     $form.ResumeLayout()
     foreach ($it in $script:SizeItems) { $it.Checked = ([int]$it.Tag -eq $s) }
+    $script:RespTier = -1                 # force the responsive pass to re-apply
+    Update-Responsive
     Refresh-Grid
+}
+
+# ---------------------------------------------------------------------------
+#  Responsive layout
+# ---------------------------------------------------------------------------
+#  Everything below is measured in TEXT UNITS (multiples of the font size), not
+#  pixels, so the same rules hold at Small and at TV size. As the window gets
+#  narrower the least important columns drop out rather than every column
+#  becoming an unreadable sliver; as it gets shorter the log panel and then the
+#  banner give up their space so the host list always stays usable.
+$script:RespTier    = -1
+$script:LogAutoHidden = $false
+
+function Update-Responsive {
+    if (-not $form -or -not $form.IsHandleCreated) { return }
+    try {
+        $u = [double]$script:TextSize
+        $w = $form.ClientSize.Width
+        $h = $form.ClientSize.Height
+
+        # --- width tiers: which columns still earn their space ---
+        # dropped in order of how little they are worth in a glance: the two
+        # timestamps first, then the IP (the Name identifies the host), and only
+        # in the smallest box the latency. Name / Status / Loss % always stay.
+        $tier = 0
+        if     ($w -lt $u * 27) { $tier = 4 }
+        elseif ($w -lt $u * 34) { $tier = 3 }
+        elseif ($w -lt $u * 44) { $tier = 2 }
+        elseif ($w -lt $u * 56) { $tier = 1 }
+
+        if ($tier -ne $script:RespTier) {
+            $script:RespTier = $tier
+            $hide = @()
+            if ($tier -ge 1) { $hide += 'cSince'  }
+            if ($tier -ge 2) { $hide += 'cDown'   }
+            if ($tier -ge 3) { $hide += 'cTarget' }
+            if ($tier -ge 4) { $hide += 'cLat'    }
+            foreach ($c in $grid.Columns) { $c.Visible = ($hide -notcontains $c.Name) }
+
+            # short headers + a different share of the width once space is tight:
+            # "Latency" as a header is wider than any value it ever shows
+            if ($tier -ge 2) {
+                $grid.Columns['cTarget'].HeaderText = 'IP'
+                $grid.Columns['cLat'].HeaderText    = 'ms'
+                $grid.Columns['cLoss'].HeaderText   = 'Loss'
+                $grid.Columns['cLabel'].FillWeight  = 132
+                $grid.Columns['cTarget'].FillWeight = 96
+                $grid.Columns['cStatus'].FillWeight = 64
+                $grid.Columns['cLat'].FillWeight    = 60
+                $grid.Columns['cLoss'].FillWeight   = 58
+            } else {
+                $grid.Columns['cTarget'].HeaderText = 'IP / Host'
+                $grid.Columns['cLat'].HeaderText    = 'Latency'
+                $grid.Columns['cLoss'].HeaderText   = 'Loss %'
+                $grid.Columns['cLabel'].FillWeight  = 130
+                $grid.Columns['cTarget'].FillWeight = 120
+                $grid.Columns['cStatus'].FillWeight = 80
+                $grid.Columns['cLat'].FillWeight    = 62
+                $grid.Columns['cLoss'].FillWeight   = 62
+            }
+
+            # the banner is the biggest text on screen - it shrinks first
+            if ($tier -ge 2) {
+                $lblBanner.Font   = UiFont 1.15 -Bold
+                $lblBanner.Height = [int]($u * 2.2)
+            } else {
+                $lblBanner.Font   = UiFont 1.75 -Bold
+                $lblBanner.Height = [int]($u * 3.4)
+            }
+            # the clock is the first thing to go in the status bar - the counts
+            # (UP / DOWN / disabled) are the part that matters
+            if ($lblClock) { $lblClock.Visible = ($tier -lt 2) }
+        }
+
+        # --- height: hand the log panel's space back when there is none ---
+        $needLog = $miShowLog -and $miShowLog.Checked
+        $tooShort = $h -lt ($u * 24)
+        if ($needLog -and $tooShort -and -not $split.Panel2Collapsed) {
+            $split.Panel2Collapsed = $true
+            $script:LogAutoHidden = $true
+        } elseif ($needLog -and -not $tooShort -and $script:LogAutoHidden) {
+            $split.Panel2Collapsed = $false
+            $script:LogAutoHidden = $false
+            Apply-SplitPercent
+        }
+    } catch { }
 }
 
 # ---- Status bar ----
@@ -1166,7 +1382,11 @@ function Refresh-Grid {
         }
 
         $row.Cells['cStatus'].Value = $statusText
-        $row.Cells['cLat'].Value    = if ($h.Enabled -and $h.Status -eq 'UP' -and $null -ne $h.Latency) { "$($h.Latency) ms" } else { '' }
+        # in a narrow window the header already says "ms" - the suffix would only
+        # push a 3-digit latency out of the column
+        $row.Cells['cLat'].Value    = if ($h.Enabled -and $h.Status -eq 'UP' -and $null -ne $h.Latency) {
+            if ($script:RespTier -ge 2) { "$($h.Latency)" } else { "$($h.Latency) ms" }
+        } else { '' }
         # today needs no date - that is what keeps this column readable at TV size
         $row.Cells['cSince'].Value  = if ($h.LastChange) {
             if ($h.LastChange.Date -eq [DateTime]::Today) { $h.LastChange.ToString('HH:mm:ss') }
@@ -1251,8 +1471,14 @@ function Refresh-Status {
     $off  = $script:Hosts.Count - $active.Count
     $shown = $grid.Rows.Count
     $filter = if ($shown -ne $script:Hosts.Count) { ("    |    showing {0} of {1}" -f $shown, $script:Hosts.Count) } else { '' }
-    $lblCounts.Text = ('UP: {0}    DOWN: {1}    other: {2}    disabled: {3}    |    every {4}s{5}{6}' -f `
-        $up, $down, $oth, $off, [int]$script:Config.IntervalSeconds, $(if ($script:Paused) { '   [PAUSED]' } else { '' }), $filter)
+    if ($script:RespTier -ge 2) {
+        # a narrow window gets the short form - a clipped status bar tells nobody anything
+        $lblCounts.Text = ('UP {0}  DOWN {1}  off {2}{3}' -f `
+            $up, $down, $off, $(if ($script:Paused) { '  [PAUSED]' } else { '' }))
+    } else {
+        $lblCounts.Text = ('UP: {0}    DOWN: {1}    other: {2}    disabled: {3}    |    every {4}s{5}{6}' -f `
+            $up, $down, $oth, $off, [int]$script:Config.IntervalSeconds, $(if ($script:Paused) { '   [PAUSED]' } else { '' }), $filter)
+    }
     $upd = if ($script:UpdatePending) { '  |  update ready - restart' }
            elseif ($script:LastUpdateCheck) { '  |  upd chk ' + $script:LastUpdateCheck.ToString('HH:mm') }
            else { '' }
@@ -1641,6 +1867,193 @@ function Test-AlarmSound {
     Write-Event ("TEST      : played alarm - source: {0}" -f $src)
 }
 
+# ---- Alarm sound picker ------------------------------------------------------
+# The preview helpers live at SCRIPT scope, not nested inside the dialog
+# function: a function defined inside another function is not reliably
+# resolvable from a WinForms event handler, which fires from the message loop.
+$script:PreviewPlayer = $null
+$script:SndItems      = $null
+$script:SndList       = $null
+
+function Stop-SoundPreview {
+    try { if ($script:PreviewPlayer) { $script:PreviewPlayer.Stop(); $script:PreviewPlayer.Dispose() } } catch { }
+    $script:PreviewPlayer = $null
+}
+
+function Play-SoundPreview {
+    if (-not $script:SndList -or $script:SndList.SelectedIndex -lt 0) { return }
+    $sel  = $script:SndItems[$script:SndList.SelectedIndex]
+    $path = if ($sel.Key -eq 'custom') { $sel.File } else { Get-BuiltInSoundPath $sel.Key }
+    Stop-SoundPreview
+    try {
+        if ($path -and (Test-Path $path)) {
+            $script:PreviewPlayer = New-Object System.Media.SoundPlayer $path
+            $script:PreviewPlayer.Load()
+            $script:PreviewPlayer.Play()
+        }
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            ("That file could not be played:`r`n{0}`r`n`r`nIt must be an uncompressed .wav (PCM) - mp3 will not work." -f $_.Exception.Message),
+            'Alarm sound', 'OK', 'Warning') | Out-Null
+    }
+}
+
+function Sync-SoundList {
+    $script:SndList.Items.Clear()
+    foreach ($it in $script:SndItems) { [void]$script:SndList.Items.Add($it.Text) }
+}
+
+function Show-AlarmSoundDialog {
+    $s = $script:TextSize
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Alarm sound'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $dlg.Font = UiFont
+    $dlg.ClientSize = New-Object System.Drawing.Size([int]($s * 38), [int]($s * 30))
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = 'Sound played while a host is down:'
+    $lbl.AutoSize = $true
+    $lbl.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 0.9))
+    $dlg.Controls.Add($lbl)
+
+    # one flat list: built-in tones, then whatever Windows ships in \Media, then
+    # any custom .wav already chosen. Tag-free - a parallel array holds the data.
+    $items = New-Object System.Collections.ArrayList
+    foreach ($d in $script:SoundDefs) {
+        [void]$items.Add([pscustomobject]@{ Text = $d.Name; Key = $d.Key; File = '' })
+    }
+    try {
+        Get-ChildItem (Join-Path $env:WINDIR 'Media') -Filter '*.wav' -ErrorAction Stop |
+            Sort-Object Name | ForEach-Object {
+                [void]$items.Add([pscustomobject]@{
+                    Text = ('Windows:  {0}' -f $_.BaseName); Key = 'custom'; File = $_.FullName })
+            }
+    } catch { }
+
+    $list = New-Object System.Windows.Forms.ListBox
+    $list.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 2.6))
+    $list.Size = New-Object System.Drawing.Size([int]($s * 35.6), [int]($s * 18))
+    $list.IntegralHeight = $false
+    $dlg.Controls.Add($list)
+
+    # a custom file that is not one of the Windows ones gets its own row
+    $cf = [string]$script:Config.AlarmFile
+    if ([string]$script:Config.AlarmSound -eq 'custom' -and $cf) {
+        $known = @($items | Where-Object { $_.File -eq $cf })
+        if ($known.Count -eq 0) {
+            [void]$items.Add([pscustomobject]@{ Text = ('My file:  {0}' -f (Split-Path $cf -Leaf)); Key = 'custom'; File = $cf })
+        }
+    }
+
+    $script:SndItems = $items
+    $script:SndList  = $list
+    Sync-SoundList
+
+    # select whatever is configured right now
+    $curKey  = [string]$script:Config.AlarmSound
+    $curFile = [string]$script:Config.AlarmFile
+    $list.SelectedIndex = 0
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        if ($curKey -eq 'custom') {
+            if ($items[$i].Key -eq 'custom' -and $items[$i].File -eq $curFile) { $list.SelectedIndex = $i; break }
+        } elseif ($items[$i].Key -eq $curKey) { $list.SelectedIndex = $i; break }
+    }
+
+    $btnPlay = New-Object System.Windows.Forms.Button
+    $btnPlay.Text = 'Play'
+    $btnPlay.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 21.2))
+    $btnPlay.Size = New-Object System.Drawing.Size([int]($s * 6.5), [int]($s * 2.6))
+    $btnStop = New-Object System.Windows.Forms.Button
+    $btnStop.Text = 'Stop'
+    $btnStop.Location = New-Object System.Drawing.Point([int]($s * 8.2), [int]($s * 21.2))
+    $btnStop.Size = New-Object System.Drawing.Size([int]($s * 6.5), [int]($s * 2.6))
+    $btnBrowse = New-Object System.Windows.Forms.Button
+    $btnBrowse.Text = 'Use my own .wav...'
+    $btnBrowse.Location = New-Object System.Drawing.Point([int]($s * 15.2), [int]($s * 21.2))
+    $btnBrowse.Size = New-Object System.Drawing.Size([int]($s * 21.6), [int]($s * 2.6))
+    $dlg.Controls.AddRange(@($btnPlay, $btnStop, $btnBrowse))
+
+    $lblRep = New-Object System.Windows.Forms.Label
+    $lblRep.Text = 'Repeat every'
+    $lblRep.AutoSize = $true
+    $lblRep.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 24.9))
+    $nRep = New-Object System.Windows.Forms.NumericUpDown
+    $nRep.DecimalPlaces = 1; $nRep.Increment = 0.5
+    $nRep.Minimum = 0.5; $nRep.Maximum = 60
+    $nRep.Location = New-Object System.Drawing.Point([int]($s * 10), [int]($s * 24.5))
+    $nRep.Width = [int]($s * 5)
+    $repSec = [Math]::Round(([double][int]$script:Config.AlarmRepeatMs) / 1000.0, 1)
+    if ($repSec -lt 0.5) { $repSec = 1.4 }; if ($repSec -gt 60) { $repSec = 60 }
+    $nRep.Value = [decimal]$repSec
+    $lblRep2 = New-Object System.Windows.Forms.Label
+    $lblRep2.Text = 'seconds between repeats'
+    $lblRep2.AutoSize = $true
+    $lblRep2.ForeColor = [System.Drawing.Color]::FromArgb(110, 114, 120)
+    $lblRep2.Location = New-Object System.Drawing.Point([int]($s * 15.6), [int]($s * 24.9))
+    $dlg.Controls.AddRange(@($lblRep, $nRep, $lblRep2))
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'Save'; $ok.DialogResult = 'OK'
+    $ok.Location = New-Object System.Drawing.Point([int]($s * 21.2), [int]($s * 27))
+    $ok.Size = New-Object System.Drawing.Size([int]($s * 7.5), [int]($s * 2.6))
+    $cn = New-Object System.Windows.Forms.Button
+    $cn.Text = 'Cancel'; $cn.DialogResult = 'Cancel'
+    $cn.Location = New-Object System.Drawing.Point([int]($s * 29.2), [int]($s * 27))
+    $cn.Size = New-Object System.Drawing.Size([int]($s * 7.5), [int]($s * 2.6))
+    $dlg.Controls.AddRange(@($ok, $cn))
+    $dlg.AcceptButton = $ok; $dlg.CancelButton = $cn
+
+    $btnPlay.Add_Click({ Play-SoundPreview })
+    $btnStop.Add_Click({ Stop-SoundPreview })
+    $list.Add_DoubleClick({ Play-SoundPreview })
+    # everything this handler touches is script-scope on purpose - see the note
+    # above Stop-SoundPreview
+    $btnBrowse.Add_Click({
+        $of = New-Object System.Windows.Forms.OpenFileDialog
+        $of.Title  = 'Choose an alarm sound'
+        $of.Filter = 'Wave sound (*.wav)|*.wav|All files (*.*)|*.*'
+        $of.InitialDirectory = (Join-Path $env:WINDIR 'Media')
+        if ($of.ShowDialog($script:SndList.FindForm()) -ne 'OK') { return }
+        $f = $of.FileName
+        $hit = -1
+        for ($i = 0; $i -lt $script:SndItems.Count; $i++) {
+            if ($script:SndItems[$i].File -eq $f) { $hit = $i; break }
+        }
+        if ($hit -lt 0) {
+            [void]$script:SndItems.Add([pscustomobject]@{
+                Text = ('My file:  {0}' -f (Split-Path $f -Leaf)); Key = 'custom'; File = $f })
+            Sync-SoundList
+            $hit = $script:SndItems.Count - 1
+        }
+        $script:SndList.SelectedIndex = $hit
+        Play-SoundPreview
+    })
+
+    $res = $dlg.ShowDialog($form)
+    Stop-SoundPreview
+    $items = $script:SndItems          # the Browse button may have added a row
+    if ($res -eq 'OK' -and $list.SelectedIndex -ge 0) {
+        $sel = $items[$list.SelectedIndex]
+        $script:Config.AlarmSound    = $sel.Key
+        $script:Config.AlarmFile     = [string]$sel.File
+        $script:Config.AlarmRepeatMs = [int]([double]$nRep.Value * 1000)
+
+        # a live alarm must not be left playing the old sound
+        $wasOn = $script:AlarmActive
+        Stop-Alarm
+        Set-AlarmPlayer (Resolve-AlarmSound)
+        $script:AlarmTimer.Interval = [Math]::Max([int]$script:Config.AlarmRepeatMs, 500)
+        if ($wasOn) { Play-Alarm }
+        Save-Config
+        Write-Event ('ALARM     : sound set to "{0}" ({1}), repeat every {2}s' -f `
+            $sel.Text, (Split-Path $script:AlarmWavPath -Leaf), $nRep.Value)
+    }
+    $dlg.Dispose()
+}
+
 $split.Add_SplitterMoved({
     if ($split.Height -gt 0 -and $split.Panel2Collapsed -eq $false) {
         $script:Config.SplitPercent = [int](100.0 * $split.SplitterDistance / $split.Height)
@@ -1771,7 +2184,9 @@ function Import-Settings {
     if ($ans -eq 'Cancel') { return }
 
     if ($ans -eq 'Yes') {
-        foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','AutoUpdate','UpdateHours','TextSize','LossWindow','SplitPercent') {
+        # window size/position are deliberately NOT imported - a backup from
+        # another PC would drop the window on a monitor that may not exist here
+        foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','AutoUpdate','UpdateHours','TextSize','LossWindow','SplitPercent','AlarmSound','AlarmFile','AlarmRepeatMs') {
             if ($null -ne $cfg.$p) { $script:Config.$p = $cfg.$p }
         }
         if ($cfg.Notify) { $script:Config.Notify = $cfg.Notify }
@@ -1788,6 +2203,9 @@ function Import-Settings {
         $form.TopMost = [bool]$script:Config.AlwaysOnTop
         $script:checkTimer.Interval = [Math]::Max([int]$script:Config.IntervalSeconds, 2) * 1000
         $script:notifyTimer.Interval = [Math]::Max([int]$script:Config.Notify.BatchSeconds, 5) * 1000
+        Stop-Alarm
+        Set-AlarmPlayer (Resolve-AlarmSound)
+        $script:AlarmTimer.Interval = [Math]::Min([Math]::Max([int]$script:Config.AlarmRepeatMs, 500), 60000)
         Apply-TextSize ([int]$script:Config.TextSize)
         Write-Event ('BACKUP    : imported {0} host(s) + settings (replaced) from {1}' -f $added, $dlg.FileName)
     }
@@ -1867,11 +2285,26 @@ foreach ($it in $script:SizeItems) {
 $miTop.Add_Click({ $form.TopMost = $miTop.Checked; Save-Config })
 $miShowLog.Add_Click({
     $split.Panel2Collapsed = -not $miShowLog.Checked
-    if ($miShowLog.Checked) { Apply-SplitPercent }
+    $script:LogAutoHidden = $false
+    if ($miShowLog.Checked) { Apply-SplitPercent; Update-Responsive }
+})
+$miCompact.Add_Click({
+    # snap straight to the smallest useful size for this text size
+    $form.WindowState = 'Normal'
+    $form.Size = New-Object System.Drawing.Size($form.MinimumSize.Width, $form.MinimumSize.Height)
+    Update-Responsive; Save-Config
+})
+$miNormalW.Add_Click({
+    $form.WindowState = 'Normal'
+    $w = [int][Math]::Max($form.MinimumSize.Width,  $script:TextSize * 82)
+    $h = [int][Math]::Max($form.MinimumSize.Height, $script:TextSize * 56)
+    $form.Size = New-Object System.Drawing.Size($w, $h)
+    Update-Responsive; Save-Config
 })
 
 $miPause.Add_Click({ Toggle-Pause })
 $miTest.Add_Click({ Test-AlarmSound })
+$miSound.Add_Click({ Show-AlarmSoundDialog })
 $miMonSet.Add_Click({ Show-MonitoringSettings })
 
 $miAuto.Add_Click({ Save-Config })
@@ -1917,7 +2350,7 @@ $script:uiTimer.Add_Tick({
 })
 
 $script:AlarmTimer = New-Object System.Windows.Forms.Timer
-$script:AlarmTimer.Interval = 1400
+$script:AlarmTimer.Interval = [Math]::Min([Math]::Max([int]$script:Config.AlarmRepeatMs, 500), 60000)
 $script:AlarmTimer.Add_Tick({
     if ($script:AlarmActive) {
         Play-Alarm
@@ -1978,10 +2411,15 @@ function Show-MainWindow {
     } catch { }
 }
 
+$form.Add_Resize({ Update-Responsive })
+$form.Add_ResizeEnd({ Update-Responsive; Save-Config })
+
 $form.Add_Shown({
+    $script:FormReady = $true
     Show-MainWindow
     Apply-TextSize $script:TextSize
     Apply-SplitPercent
+    Update-Responsive
     Rebuild-Grid
     Refresh-Banner
     Refresh-Status
