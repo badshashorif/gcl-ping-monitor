@@ -401,7 +401,10 @@ try {
 $script:AlarmActive = $false
 
 function Get-AlarmHosts {
-    @($script:Hosts | Where-Object { $_.Status -eq 'DOWN' -and -not $_.Acked })
+    # NOTE: the leading comma is load-bearing. Without it PowerShell unrolls a
+    # single-element array on return, .Count comes back $null, and the alarm
+    # never fires for the (very common) case of exactly ONE host being down.
+    ,@($script:Hosts | Where-Object { $_.Status -eq 'DOWN' -and -not $_.Acked })
 }
 
 function Play-Alarm {
@@ -410,13 +413,14 @@ function Play-Alarm {
 }
 
 function Update-Alarm {
-    $active = (Get-AlarmHosts).Count -gt 0
+    $down   = @(Get-AlarmHosts)
+    $active = $down.Count -gt 0
     if ($script:btnAck) { $script:btnAck.Enabled = $active }
     if ($active -eq $script:AlarmActive) { return }
     $script:AlarmActive = $active
     if ($active) {
         $src = if ($script:Player) { Split-Path $script:AlarmWavPath -Leaf } else { 'system sound' }
-        Write-Event ("ALARM     : ON  ({0} down, sound={1})" -f (Get-AlarmHosts).Count, $src)
+        Write-Event ("ALARM     : ON  ({0} host(s) down, sound={1})" -f $down.Count, $src)
         Play-Alarm
     } else {
         Write-Event 'ALARM     : off'
@@ -723,7 +727,7 @@ $btnRemove.Add_Click({
 })
 
 $btnAck.Add_Click({
-    $down = Get-AlarmHosts
+    $down = @(Get-AlarmHosts)
     if ($down.Count -eq 0) { return }
     foreach ($h in $down) { $h.Acked = $true }
     Write-Event ("ACK       : alarm acknowledged ({0} host(s) still down)" -f $down.Count)
