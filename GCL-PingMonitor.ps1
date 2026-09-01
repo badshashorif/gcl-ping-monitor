@@ -400,12 +400,12 @@ try {
 
 $script:AlarmActive = $false
 
-function Get-AlarmHosts {
-    # NOTE: the leading comma is load-bearing. Without it PowerShell unrolls a
-    # single-element array on return, .Count comes back $null, and the alarm
-    # never fires for the (very common) case of exactly ONE host being down.
-    ,@($script:Hosts | Where-Object { $_.Status -eq 'DOWN' -and -not $_.Acked })
-}
+# NOTE: do NOT wrap this filter in a function. Returning an array from a
+# PowerShell function is a minefield: a 1-element result gets unrolled to a
+# scalar (.Count -> $null, alarm never fires for a single down host), and the
+# usual ",@(...)" workaround makes an EMPTY result come back as Count 1 once
+# the caller re-wraps it (alarm fires when nothing is down). Assigning
+# "@( ... | Where-Object ... )" inline is correct for 0, 1 and N.
 
 function Play-Alarm {
     try { if ($script:Player) { $script:Player.Play(); return } } catch { }
@@ -413,7 +413,7 @@ function Play-Alarm {
 }
 
 function Update-Alarm {
-    $down   = @(Get-AlarmHosts)
+    $down   = @($script:Hosts | Where-Object { $_.Status -eq 'DOWN' -and -not $_.Acked })
     $active = $down.Count -gt 0
     if ($script:btnAck) { $script:btnAck.Enabled = $active }
     if ($active -eq $script:AlarmActive) { return }
@@ -727,7 +727,7 @@ $btnRemove.Add_Click({
 })
 
 $btnAck.Add_Click({
-    $down = @(Get-AlarmHosts)
+    $down = @($script:Hosts | Where-Object { $_.Status -eq 'DOWN' -and -not $_.Acked })
     if ($down.Count -eq 0) { return }
     foreach ($h in $down) { $h.Acked = $true }
     Write-Event ("ACK       : alarm acknowledged ({0} host(s) still down)" -f $down.Count)
