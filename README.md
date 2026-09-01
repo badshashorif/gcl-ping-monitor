@@ -81,17 +81,32 @@ Delete these two shortcuts and one folder:
 
 ## What it does
 
-- Add / remove hosts (IP or hostname) right in the window — the list is saved automatically.
-- Every host is pinged on an interval (default 5s). The row is:
+- **Add / edit / remove** hosts right in the window — the list is saved
+  automatically. Edit with the **Edit** button or by **double-clicking a row**.
+- **Enable / Disable** any host. A disabled host is not pinged, shows greyed out
+  as `DISABLED`, and can never raise the alarm — use it for kit that is down for
+  maintenance instead of deleting it.
+- Every enabled host is pinged on an interval (default 5s). The row is:
   - **green** = UP (shows latency)
-  - **yellow** = missed a ping, still checking
-  - **red** = DOWN (after N consecutive fails, default 2)
-- While any **un-acknowledged** host is down, a looping alarm sound plays and the
-  top banner turns red.
-- **Acknowledge alarm** silences the sound. If a *different* host then goes down,
-  the alarm re-arms by itself. When a host recovers its ack resets too.
-- Every state change (DOWN / RECOVERED / ACK / add / remove) is written to the
-  event log, and shown in the black panel at the bottom.
+  - **amber** = missed a ping, still checking
+  - **solid red** = DOWN (after N consecutive fails, default 2)
+  - **pale red** = DOWN but acknowledged
+  - **grey** = disabled
+- **DOWN hosts automatically sort to the top** — un-acknowledged first — so
+  whatever needs attention is always on screen without scrolling.
+- **Search** box filters the list live by name or IP, for when there are a lot
+  of hosts. `Esc` or the `x` button clears it.
+- While any un-acknowledged host is down: the alarm sounds, the top banner turns
+  red, and the taskbar button flashes.
+- **ACKNOWLEDGE ALARM** silences it immediately. If a *different* host then goes
+  down the alarm re-arms by itself; a host recovering resets its ack too.
+- **Text** selector (Small → TV) scales the whole window — fonts, rows, buttons
+  — for a big wall monitor read from across the room. It is remembered.
+- Only **one copy** can run at a time. Launching it again just brings the
+  existing window to the front (two copies would each have their own alarm, so
+  acknowledging one would leave the other sounding).
+- Every state change (DOWN / RECOVERED / ACK / ADD / EDIT / DISABLE / …) is
+  written to the event log and shown in the dark panel at the bottom.
 
 ## Auto-update
 
@@ -121,11 +136,15 @@ Requirement: the tool's folder must be user-writable (Desktop / Documents — no
 | Interval s | seconds between ping cycles |
 | Timeout ms | how long to wait for each reply |
 | Fails→down | consecutive failed pings before a host is marked DOWN (flap guard) |
+| Text | Small / Normal / Large / Extra large / TV — scales the whole window |
 | Always on top | keep the window above other apps |
 | Auto-update | pull new versions from GitHub automatically |
 | Pause / Resume | stop / start pinging without closing |
 | Test sound | play the alarm once |
 | Check for updates | force a GitHub version check right now |
+| Edit | change the name or IP of the selected host (or double-click it) |
+| Disable / Enable | toggle monitoring for the selected host(s) |
+| Search | filter the list by name or IP |
 
 ## Files
 
