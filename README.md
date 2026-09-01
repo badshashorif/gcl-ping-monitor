@@ -177,23 +177,43 @@ Behaviour:
 Windows user on that machine, so copying `config.json` to another PC does not
 carry the secrets with it. Each machine is configured once.
 
-## Settings (top toolbar)
+## Where things live
 
-| Field | Meaning |
-|-------|---------|
-| Interval s | seconds between ping cycles |
-| Timeout ms | how long to wait for each reply |
-| Fails→down | consecutive failed pings before a host is marked DOWN (flap guard) |
-| Loss over | how many recent pings the Loss % is calculated from (default 100) |
-| Text | Small / Normal / Large / Extra large / TV — scales the whole window |
-| Always on top | keep the window above other apps |
-| Auto-update | pull new versions from GitHub automatically |
-| Pause / Resume | stop / start pinging without closing |
-| Test sound | play the alarm once |
-| Check for updates | force a GitHub version check right now |
-| Edit | change the name or IP of the selected host (or double-click it) |
-| Disable / Enable | toggle monitoring for the selected host(s) |
-| Search | filter the list by name or IP |
+The **toolbar** carries only what gets used during a shift — add a host, search,
+**ACKNOWLEDGE**, Pause. It is a real toolbar with overflow: anything that does
+not fit the window moves into a `»` dropdown instead of wrapping or scrolling,
+so it stays one clean line at any window size and any text size. ACKNOWLEDGE and
+Pause are pinned and never hide.
+
+Everything set once and forgotten lives in the **menu bar**:
+
+| Menu | Contains |
+|---|---|
+| **Hosts** | Add, Edit, Disable/Enable, Remove, Exit |
+| **View** | Text size (Small → TV), Always on top, Show event log |
+| **Monitoring** | Pause/Resume, Test alarm sound, **Monitoring settings…** (interval, timeout, fails→down, loss window) |
+| **Settings** | **Notifications…**, **Export / Import hosts + settings**, Auto-update, Check for updates now |
+| **Help** | About, Open data folder, Open project page |
+
+**Right-click any row** for Edit / Disable-Enable / Remove / Acknowledge.
+
+## Backup and recovery
+
+**Settings → Export hosts + settings…** writes one `.json` holding every host and
+every setting. **Settings → Import hosts + settings…** reads it back and asks:
+
+- **Yes** — replace everything (hosts *and* settings)
+- **No** — only add hosts that are not already in the list (safe merge)
+- **Cancel** — do nothing
+
+Use it to move a host list to a new PC, or to keep a backup before a rebuild.
+The importer also accepts a plain `config.json` copied from
+`%APPDATA%\GCL-PingMonitor\`.
+
+> Notification passwords and tokens are DPAPI-encrypted, so they restore only on
+> the **same Windows user on the same machine**. Moving the file to another PC
+> carries the hosts and settings but not the secrets — re-enter those in
+> Notifications there. That is deliberate.
 
 ## Files
 
