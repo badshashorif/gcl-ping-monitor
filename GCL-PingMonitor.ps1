@@ -53,10 +53,35 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
 
 try {
-    Add-Type -Namespace Win32 -Name Flash -MemberDefinition @'
+    Add-Type -Namespace Win32 -Name Native -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool FlashWindow(IntPtr hwnd, bool bInvert);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hwnd, int nCmdShow);
 '@
 } catch { }
+
+# ---------------------------------------------------------------------------
+#  Single instance only
+# ---------------------------------------------------------------------------
+#  Two copies running at once means acknowledging the alarm in one window
+#  leaves the other one still sounding - which looks exactly like a broken
+#  Acknowledge button. Only one instance is ever allowed.
+$script:Mutex = New-Object System.Threading.Mutex($false, 'Global\GCL-PingMonitor-SingleInstance')
+$script:HaveMutex = $false
+try { $script:HaveMutex = $script:Mutex.WaitOne(0, $false) } catch { $script:HaveMutex = $true }
+if (-not $script:HaveMutex) {
+    # bring the window that is already running to the front, then quit quietly
+    try {
+        $other = Get-Process -Name 'powershell' -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -like 'GCL Ping Monitor*' } |
+                 Select-Object -First 1
+        if ($other) {
+            [void][Win32.Native]::ShowWindowAsync($other.MainWindowHandle, 9)   # SW_RESTORE
+            [void][Win32.Native]::SetForegroundWindow($other.MainWindowHandle)
+        }
+    } catch { }
+    exit
+}
 
 # ---------------------------------------------------------------------------
 #  Paths / config
@@ -78,12 +103,13 @@ if (-not $script:Config) {
         AlwaysOnTop     = $false
         AutoUpdate      = $true
         UpdateHours     = 6
+        TextSize        = 12
         Hosts           = @()
     }
 }
-foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','AutoUpdate','UpdateHours','Hosts') {
+foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','AutoUpdate','UpdateHours','TextSize','Hosts') {
     if ($null -eq $script:Config.$p) {
-        $def = switch ($p) { 'IntervalSeconds' {$IntervalSeconds} 'TimeoutMs' {$TimeoutMs} 'FailThreshold' {$FailThreshold} 'AlwaysOnTop' {$false} 'AutoUpdate' {$true} 'UpdateHours' {6} 'Hosts' {@()} }
+        $def = switch ($p) { 'IntervalSeconds' {$IntervalSeconds} 'TimeoutMs' {$TimeoutMs} 'FailThreshold' {$FailThreshold} 'AlwaysOnTop' {$false} 'AutoUpdate' {$true} 'UpdateHours' {6} 'TextSize' {12} 'Hosts' {@()} }
         $script:Config | Add-Member -NotePropertyName $p -NotePropertyValue $def -Force
     }
 }
@@ -98,11 +124,12 @@ $script:LastCheck    = $null
 $script:AlarmActive  = $false
 
 function New-HostState {
-    param($Label, $Target)
+    param($Label, $Target, $Enabled = $true)
     [pscustomobject]@{
         Label      = $Label
         Target     = $Target
-        Status     = 'INIT'      # INIT | UP | WARN | DOWN
+        Enabled    = [bool]$Enabled
+        Status     = 'INIT'      # INIT | UP | WARN | DOWN | OFF
         Latency    = $null
         LastChange = $null
         DownSince  = $null
@@ -111,11 +138,17 @@ function New-HostState {
         Task       = $null
         Ping       = $null
         SyncError  = $null
+        StyleKey   = ''          # cached row style so we only restyle on change
     }
 }
 
 foreach ($c in @($script:Config.Hosts)) {
-    if ($c -and $c.Target) { $script:Hosts.Add((New-HostState -Label ([string]$c.Label) -Target ([string]$c.Target))) }
+    if ($c -and $c.Target) {
+        $en = if ($null -eq $c.Enabled) { $true } else { [bool]$c.Enabled }
+        $h  = New-HostState -Label ([string]$c.Label) -Target ([string]$c.Target) -Enabled $en
+        if (-not $en) { $h.Status = 'OFF' }
+        $script:Hosts.Add($h)
+    }
 }
 
 function Format-Duration {
@@ -234,7 +267,10 @@ function Save-Config {
         $script:Config.FailThreshold   = [int]$script:numThreshold.Value
         $script:Config.AlwaysOnTop     = [bool]$script:chkTop.Checked
         if ($script:chkAutoUpdate) { $script:Config.AutoUpdate = [bool]$script:chkAutoUpdate.Checked }
-        $script:Config.Hosts = @($script:Hosts | ForEach-Object { [pscustomobject]@{ Label = $_.Label; Target = $_.Target } })
+        if ($script:TextSize)      { $script:Config.TextSize   = [int]$script:TextSize }
+        $script:Config.Hosts = @($script:Hosts | ForEach-Object {
+            [pscustomobject]@{ Label = $_.Label; Target = $_.Target; Enabled = [bool]$_.Enabled }
+        })
         $script:Config | ConvertTo-Json -Depth 5 | Set-Content -Path $script:ConfigPath -Encoding UTF8
     } catch { }
 }
@@ -249,6 +285,7 @@ function Start-CheckCycle {
     $timeout = [int]$script:Config.TimeoutMs
     foreach ($h in $script:Hosts) {
         $h.SyncError = $null
+        if (-not $h.Enabled) { $h.Task = $null; $h.Ping = $null; continue }
         try {
             $p = New-Object System.Net.NetworkInformation.Ping
             $h.Ping = $p
@@ -304,6 +341,7 @@ function Poll-Results {
     if (-not $script:CycleRunning) { return }
     $pending = $false
     foreach ($h in $script:Hosts) {
+        if (-not $h.Enabled) { continue }
         if ($null -ne $h.SyncError) {
             Process-Result $h $false $null
             $h.SyncError = $null
@@ -412,8 +450,14 @@ function Play-Alarm {
     try { [System.Media.SystemSounds]::Hand.Play() } catch { }
 }
 
+function Stop-Alarm {
+    # MUST be called when the alarm turns off. Play() is asynchronous - without
+    # an explicit Stop() the last-started sound keeps going after Acknowledge.
+    try { if ($script:Player) { $script:Player.Stop() } } catch { }
+}
+
 function Update-Alarm {
-    $down   = @($script:Hosts | Where-Object { $_.Status -eq 'DOWN' -and -not $_.Acked })
+    $down   = @($script:Hosts | Where-Object { $_.Enabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
     $active = $down.Count -gt 0
     if ($script:btnAck) { $script:btnAck.Enabled = $active }
     if ($active -eq $script:AlarmActive) { return }
@@ -423,6 +467,7 @@ function Update-Alarm {
         Write-Event ("ALARM     : ON  ({0} host(s) down, sound={1})" -f $down.Count, $src)
         Play-Alarm
     } else {
+        Stop-Alarm
         Write-Event 'ALARM     : off'
     }
 }
@@ -430,20 +475,25 @@ function Update-Alarm {
 # ---------------------------------------------------------------------------
 #  UI
 # ---------------------------------------------------------------------------
+$script:TextSize = [int][Math]::Min([Math]::Max([int]$script:Config.TextSize, 9), 22)
+function UiFont  { param([double]$Scale = 1.0, [switch]$Bold)
+    New-Object System.Drawing.Font('Segoe UI', [single]($script:TextSize * $Scale),
+        $(if ($Bold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }))
+}
+
 $form = New-Object System.Windows.Forms.Form
 $form.Text          = 'GCL Ping Monitor'
-$form.Size          = New-Object System.Drawing.Size(940, 640)
-$form.MinimumSize   = New-Object System.Drawing.Size(760, 480)
+$form.Size          = New-Object System.Drawing.Size(1180, 780)
+$form.MinimumSize   = New-Object System.Drawing.Size(820, 520)
 $form.StartPosition = 'CenterScreen'
-$form.Font          = New-Object System.Drawing.Font('Segoe UI', 9)
+$form.Font          = UiFont
 $form.TopMost       = [bool]$script:Config.AlwaysOnTop
+$form.BackColor     = [System.Drawing.Color]::FromArgb(245, 246, 248)
 
-# ---- Banner ----
+# ---- Banner: the thing you read from across the room ----
 $lblBanner = New-Object System.Windows.Forms.Label
 $lblBanner.Dock      = 'Top'
-$lblBanner.Height    = 44
 $lblBanner.TextAlign = 'MiddleCenter'
-$lblBanner.Font      = New-Object System.Drawing.Font('Segoe UI', 13, [System.Drawing.FontStyle]::Bold)
 $lblBanner.ForeColor = [System.Drawing.Color]::White
 $lblBanner.BackColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
 $lblBanner.Text      = 'Starting...'
@@ -451,109 +501,110 @@ $form.Controls.Add($lblBanner)
 
 # ---- Toolbar ----
 $panelTop = New-Object System.Windows.Forms.FlowLayoutPanel
-$panelTop.Dock          = 'Top'
-$panelTop.Height        = 78
-$panelTop.Padding       = New-Object System.Windows.Forms.Padding(8, 6, 8, 4)
-$panelTop.WrapContents   = $true
-$panelTop.AutoScroll     = $true
+$panelTop.Dock         = 'Top'
+$panelTop.Padding      = New-Object System.Windows.Forms.Padding(8, 6, 8, 6)
+$panelTop.WrapContents = $true
+$panelTop.AutoScroll   = $true
+$panelTop.BackColor    = [System.Drawing.Color]::FromArgb(238, 240, 244)
 $form.Controls.Add($panelTop)
 
+$script:UiLabels = New-Object System.Collections.Generic.List[object]
 function New-Lbl($text) {
     $l = New-Object System.Windows.Forms.Label
     $l.Text = $text; $l.AutoSize = $true
-    $l.Margin = New-Object System.Windows.Forms.Padding(6, 8, 2, 0)
+    $l.Margin = New-Object System.Windows.Forms.Padding(8, 9, 2, 0)
+    $script:UiLabels.Add($l)
     $l
 }
+function New-Btn($text, $w, [switch]$Strong) {
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $text
+    $b.AutoSize = $false
+    $b.Width  = $w
+    $b.Margin = New-Object System.Windows.Forms.Padding(3, 3, 8, 3)
+    $b.FlatStyle = 'System'
+    if ($Strong) { $b.Font = UiFont -Bold }
+    $b
+}
 
-$txtLabel = New-Object System.Windows.Forms.TextBox
-$txtLabel.Width = 130
-$txtLabel.Margin = New-Object System.Windows.Forms.Padding(2, 5, 4, 0)
-# placeholder-ish
-$txtLabel.Text = ''
+$txtLabel  = New-Object System.Windows.Forms.TextBox
+$txtLabel.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
 
 $txtTarget = New-Object System.Windows.Forms.TextBox
-$txtTarget.Width = 150
-$txtTarget.Margin = New-Object System.Windows.Forms.Padding(2, 5, 4, 0)
+$txtTarget.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
 
-$btnAdd = New-Object System.Windows.Forms.Button
-$btnAdd.Text = 'Add host'
-$btnAdd.Width = 78
-$btnAdd.Margin = New-Object System.Windows.Forms.Padding(2, 4, 10, 0)
+$btnAdd    = New-Btn 'Add'              70
+$btnEdit   = New-Btn 'Edit'             70
+$btnToggle = New-Btn 'Disable / Enable' 150
+$btnRemove = New-Btn 'Remove'           90
 
-$btnRemove = New-Object System.Windows.Forms.Button
-$btnRemove.Text = 'Remove selected'
-$btnRemove.Width = 120
-$btnRemove.Margin = New-Object System.Windows.Forms.Padding(2, 4, 10, 0)
+$txtSearch = New-Object System.Windows.Forms.TextBox
+$txtSearch.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
 
-$btnAck = New-Object System.Windows.Forms.Button
-$btnAck.Text = 'Acknowledge alarm'
-$btnAck.Width = 140
-$btnAck.Height = 30
+$btnClearSearch = New-Btn 'x' 34
+
+$btnAck  = New-Btn 'ACKNOWLEDGE ALARM' 210 -Strong
 $btnAck.Enabled = $false
-$btnAck.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-$btnAck.Margin = New-Object System.Windows.Forms.Padding(2, 3, 10, 0)
 
-$btnPause = New-Object System.Windows.Forms.Button
-$btnPause.Text = 'Pause'
-$btnPause.Width = 70
-$btnPause.Margin = New-Object System.Windows.Forms.Padding(2, 4, 10, 0)
-
-$btnTest = New-Object System.Windows.Forms.Button
-$btnTest.Text = 'Test sound'
-$btnTest.Width = 80
-$btnTest.Margin = New-Object System.Windows.Forms.Padding(2, 4, 10, 0)
+$btnPause = New-Btn 'Pause'      90
+$btnTest  = New-Btn 'Test sound' 110
 
 $numInterval = New-Object System.Windows.Forms.NumericUpDown
-$numInterval.Minimum = 2; $numInterval.Maximum = 3600; $numInterval.Width = 55
+$numInterval.Minimum = 2; $numInterval.Maximum = 3600
 $numInterval.Value = [Math]::Min([Math]::Max([int]$script:Config.IntervalSeconds,2),3600)
-$numInterval.Margin = New-Object System.Windows.Forms.Padding(2, 5, 4, 0)
+$numInterval.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
 
 $numTimeout = New-Object System.Windows.Forms.NumericUpDown
-$numTimeout.Minimum = 200; $numTimeout.Maximum = 10000; $numTimeout.Increment = 100; $numTimeout.Width = 65
+$numTimeout.Minimum = 200; $numTimeout.Maximum = 10000; $numTimeout.Increment = 100
 $numTimeout.Value = [Math]::Min([Math]::Max([int]$script:Config.TimeoutMs,200),10000)
-$numTimeout.Margin = New-Object System.Windows.Forms.Padding(2, 5, 4, 0)
+$numTimeout.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
 
 $numThreshold = New-Object System.Windows.Forms.NumericUpDown
-$numThreshold.Minimum = 1; $numThreshold.Maximum = 10; $numThreshold.Width = 45
+$numThreshold.Minimum = 1; $numThreshold.Maximum = 10
 $numThreshold.Value = [Math]::Min([Math]::Max([int]$script:Config.FailThreshold,1),10)
-$numThreshold.Margin = New-Object System.Windows.Forms.Padding(2, 5, 4, 0)
+$numThreshold.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
+
+$cboSize = New-Object System.Windows.Forms.ComboBox
+$cboSize.DropDownStyle = 'DropDownList'
+$cboSize.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
+[void]$cboSize.Items.AddRange(@('Small', 'Normal', 'Large', 'Extra large', 'TV'))
+# NOTE: not a switch - a PowerShell switch runs EVERY matching clause, so
+# overlapping "-le" conditions would return an array, not an index.
+$script:SizeMap = @(9, 12, 15, 18, 22)
+$idx = 1
+for ($i = 0; $i -lt $script:SizeMap.Count; $i++) { if ($script:TextSize -le $script:SizeMap[$i]) { $idx = $i; break } }
+if ($script:TextSize -gt $script:SizeMap[-1]) { $idx = $script:SizeMap.Count - 1 }
+$cboSize.SelectedIndex = $idx
 
 $chkTop = New-Object System.Windows.Forms.CheckBox
-$chkTop.Text = 'Always on top'
-$chkTop.AutoSize = $true
+$chkTop.Text = 'Always on top'; $chkTop.AutoSize = $true
 $chkTop.Checked = [bool]$script:Config.AlwaysOnTop
-$chkTop.Margin = New-Object System.Windows.Forms.Padding(6, 7, 4, 0)
+$chkTop.Margin = New-Object System.Windows.Forms.Padding(10, 8, 6, 0)
 
 $chkAutoUpdate = New-Object System.Windows.Forms.CheckBox
-$chkAutoUpdate.Text = 'Auto-update'
-$chkAutoUpdate.AutoSize = $true
+$chkAutoUpdate.Text = 'Auto-update'; $chkAutoUpdate.AutoSize = $true
 $chkAutoUpdate.Checked = [bool]$script:Config.AutoUpdate
-$chkAutoUpdate.Margin = New-Object System.Windows.Forms.Padding(6, 7, 4, 0)
+$chkAutoUpdate.Margin = New-Object System.Windows.Forms.Padding(10, 8, 6, 0)
 
-$btnUpdate = New-Object System.Windows.Forms.Button
-$btnUpdate.Text = 'Check for updates'
-$btnUpdate.Width = 120
-$btnUpdate.Margin = New-Object System.Windows.Forms.Padding(2, 4, 10, 0)
+$btnUpdate = New-Btn 'Check for updates' 160
 
 # becomes visible only after a newer version has been downloaded in the background
-$btnRestartNow = New-Object System.Windows.Forms.Button
-$btnRestartNow.Text = 'RESTART to apply update'
-$btnRestartNow.Width = 170
-$btnRestartNow.Height = 30
-$btnRestartNow.Visible = $false
+$btnRestartNow = New-Btn 'RESTART to apply update' 230 -Strong
+$btnRestartNow.Visible   = $false
 $btnRestartNow.BackColor = [System.Drawing.Color]::Gold
-$btnRestartNow.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-$btnRestartNow.Margin = New-Object System.Windows.Forms.Padding(2, 3, 10, 0)
 
 if ($script:IsGitCheckout) { $chkAutoUpdate.Enabled = $false; $btnUpdate.Enabled = $false; $chkAutoUpdate.Text = 'Auto-update (dev checkout - off)' }
 
 $panelTop.Controls.AddRange(@(
     (New-Lbl 'Name:'), $txtLabel,
-    (New-Lbl 'IP / host:'), $txtTarget, $btnAdd, $btnRemove,
+    (New-Lbl 'IP / host:'), $txtTarget,
+    $btnAdd, $btnEdit, $btnToggle, $btnRemove,
+    (New-Lbl 'Search:'), $txtSearch, $btnClearSearch,
     $btnAck, $btnPause, $btnTest,
     (New-Lbl 'Interval s:'), $numInterval,
     (New-Lbl 'Timeout ms:'), $numTimeout,
     (New-Lbl 'Fails->down:'), $numThreshold,
+    (New-Lbl 'Text:'), $cboSize,
     $chkTop, $chkAutoUpdate, $btnUpdate, $btnRestartNow
 ))
 
@@ -576,17 +627,27 @@ $grid.SelectionMode = 'FullRowSelect'
 $grid.MultiSelect = $true
 $grid.AutoSizeColumnsMode = 'Fill'
 $grid.EnableHeadersVisualStyles = $false
-$grid.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 $grid.AllowUserToOrderColumns = $true
 $grid.BackgroundColor = [System.Drawing.Color]::White
-$grid.RowTemplate.Height = 26
+$grid.GridColor = [System.Drawing.Color]::FromArgb(210, 214, 220)
+$grid.BorderStyle = 'None'
+$grid.CellBorderStyle = 'SingleHorizontal'
+$grid.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(52, 58, 70)
+$grid.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::White
+$grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(52, 58, 70)
+$grid.ColumnHeadersDefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(6, 4, 4, 4)
+$grid.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(6, 2, 4, 2)
+$grid.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(0, 90, 158)
+$grid.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::White
 $null = $grid.Columns.Add('cLabel',  'Name')
 $null = $grid.Columns.Add('cTarget', 'IP / Host')
 $null = $grid.Columns.Add('cStatus', 'Status')
 $null = $grid.Columns.Add('cLat',    'Latency')
 $null = $grid.Columns.Add('cSince',  'Since')
 $null = $grid.Columns.Add('cDown',   'Down for')
-$grid.Columns['cStatus'].FillWeight = 70
+$grid.Columns['cLabel'].FillWeight  = 130
+$grid.Columns['cTarget'].FillWeight = 120
+$grid.Columns['cStatus'].FillWeight = 80
 $grid.Columns['cLat'].FillWeight    = 60
 $grid.Columns['cSince'].FillWeight  = 90
 $grid.Columns['cDown'].FillWeight   = 70
@@ -597,11 +658,50 @@ $txtLog.Multiline = $true
 $txtLog.ReadOnly = $true
 $txtLog.ScrollBars = 'Vertical'
 $txtLog.Dock = 'Fill'
-$txtLog.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
-$txtLog.ForeColor = [System.Drawing.Color]::Gainsboro
-$txtLog.Font = New-Object System.Drawing.Font('Consolas', 9)
+$txtLog.BackColor = [System.Drawing.Color]::FromArgb(28, 30, 34)
+$txtLog.ForeColor = [System.Drawing.Color]::FromArgb(215, 225, 235)
+$txtLog.BorderStyle = 'None'
 $script:txtLog = $txtLog
 $split.Panel2.Controls.Add($txtLog)
+
+# ---------------------------------------------------------------------------
+#  Text size - one place that resizes everything for big / far-away monitors
+# ---------------------------------------------------------------------------
+function Apply-TextSize {
+    param([int]$Size)
+    $script:TextSize = [int][Math]::Min([Math]::Max($Size, 9), 22)
+    $s = $script:TextSize
+
+    $form.SuspendLayout()
+    $form.Font        = UiFont
+    $lblBanner.Font   = UiFont 1.75 -Bold
+    $lblBanner.Height = [int]($s * 3.4)
+    $panelTop.Height  = [int]($s * 8.0)
+
+    $txtLabel.Width  = [int]($s * 13)
+    $txtTarget.Width = [int]($s * 14)
+    $txtSearch.Width = [int]($s * 14)
+    foreach ($n in @($numInterval, $numTimeout, $numThreshold)) { $n.Width = [int]($s * 6.5) }
+    $cboSize.Width = [int]($s * 11)
+
+    $btnAck.Font        = UiFont -Bold
+    $btnRestartNow.Font = UiFont -Bold
+    foreach ($b in @($btnAdd, $btnEdit, $btnToggle, $btnRemove, $btnClearSearch, $btnAck,
+                     $btnPause, $btnTest, $btnUpdate, $btnRestartNow)) {
+        $b.Height = [int]($s * 2.6)
+    }
+
+    $grid.ColumnHeadersDefaultCellStyle.Font = UiFont 1.0 -Bold
+    $grid.ColumnHeadersHeight = [int]($s * 2.8)
+    $grid.DefaultCellStyle.Font = UiFont
+    $grid.RowTemplate.Height    = [int]($s * 2.5)
+    foreach ($r in $grid.Rows) { $r.Height = [int]($s * 2.5) }
+
+    $txtLog.Font = New-Object System.Drawing.Font('Consolas', [single][Math]::Max($s - 2, 8))
+    $status.Font = UiFont
+    $form.ResumeLayout()
+    Refresh-Grid
+}
 
 # ---- Status bar ----
 $status = New-Object System.Windows.Forms.StatusStrip
@@ -615,52 +715,140 @@ $form.Controls.Add($status)
 # ---------------------------------------------------------------------------
 #  Grid refresh
 # ---------------------------------------------------------------------------
-function Rebuild-Grid {
-    $grid.Rows.Clear()
-    foreach ($h in $script:Hosts) {
-        $i = $grid.Rows.Add(@($h.Label, $h.Target, $h.Status, '', '', ''))
-        $grid.Rows[$i].Tag = $h
+# Row palette - DOWN is deliberately loud so it reads from across the room
+$colDownBg   = [System.Drawing.Color]::FromArgb(211, 47, 47)      # solid red
+$colDownFg   = [System.Drawing.Color]::White
+$colAckBg    = [System.Drawing.Color]::FromArgb(255, 214, 214)    # acknowledged - calmer
+$colAckFg    = [System.Drawing.Color]::FromArgb(140, 20, 20)
+$colWarnBg   = [System.Drawing.Color]::FromArgb(255, 224, 130)
+$colWarnFg   = [System.Drawing.Color]::FromArgb(110, 70, 0)
+$colUpBg     = [System.Drawing.Color]::FromArgb(232, 245, 233)
+$colUpFg     = [System.Drawing.Color]::FromArgb(27, 94, 32)
+$colOffBg    = [System.Drawing.Color]::FromArgb(228, 230, 234)
+$colOffFg    = [System.Drawing.Color]::FromArgb(130, 134, 140)
+$colInitBg   = [System.Drawing.Color]::FromArgb(245, 246, 248)
+$colInitFg   = [System.Drawing.Color]::FromArgb(90, 94, 100)
+
+# Display order: un-acknowledged DOWN first, then acknowledged DOWN, then the
+# ones going bad, then unknown, then healthy, then disabled. So whatever needs
+# attention is always at the top of the screen without anyone scrolling.
+function Get-HostRank {
+    param($h)
+    if (-not $h.Enabled) { return 5 }
+    switch ($h.Status) {
+        'DOWN' { if ($h.Acked) { 1 } else { 0 } }
+        'WARN' { 2 }
+        'INIT' { 3 }
+        'UP'   { 4 }
+        default { 3 }
     }
+}
+
+# Fills $script:Visible instead of returning an array. Returning arrays from a
+# PowerShell function is unreliable (0 elements and 1 element both misbehave),
+# so the visible list is published through a script variable.
+$script:Visible = @()
+
+function Update-VisibleHosts {
+    $q = ''
+    if ($script:txtSearch) { $q = $script:txtSearch.Text.Trim() }
+    if ($q) {
+        $filtered = @($script:Hosts | Where-Object { $_.Label -like "*$q*" -or $_.Target -like "*$q*" })
+    } else {
+        $filtered = @($script:Hosts | Where-Object { $true })
+    }
+    # stable bucket sort - no Sort-Object, so ties keep their entry order
+    $out = New-Object System.Collections.ArrayList
+    foreach ($rank in 0..5) {
+        foreach ($h in $filtered) { if ((Get-HostRank $h) -eq $rank) { [void]$out.Add($h) } }
+    }
+    $script:Visible = [object[]]$out.ToArray()
+}
+
+function Rebuild-Grid {
+    $selected = @($grid.SelectedRows | ForEach-Object { $_.Tag } | Where-Object { $_ })
+    $scroll   = $grid.FirstDisplayedScrollingRowIndex
+    Update-VisibleHosts
+    $grid.SuspendLayout()
+    $grid.Rows.Clear()
+    foreach ($h in $script:Visible) {
+        $i = $grid.Rows.Add(@($h.Label, $h.Target, '', '', '', ''))
+        $grid.Rows[$i].Tag = $h
+        $h.StyleKey = ''                       # force a restyle on the new row
+    }
+    $grid.ClearSelection()
+    foreach ($row in $grid.Rows) {
+        if ($selected -contains $row.Tag) { $row.Selected = $true }
+    }
+    if ($scroll -ge 0 -and $scroll -lt $grid.Rows.Count) { $grid.FirstDisplayedScrollingRowIndex = $scroll }
+    $grid.ResumeLayout()
     Refresh-Grid
 }
 
-$colDown  = [System.Drawing.Color]::FromArgb(255, 200, 200)
-$colUp    = [System.Drawing.Color]::FromArgb(210, 240, 210)
-$colWarn  = [System.Drawing.Color]::FromArgb(255, 235, 170)
-$colInit  = [System.Drawing.Color]::FromArgb(238, 238, 238)
-
 function Refresh-Grid {
+    # re-sort / re-filter only when the visible sequence actually changed,
+    # otherwise the grid would flicker and lose selection every 400 ms
+    Update-VisibleHosts
+    $want = $script:Visible
+    $have = @($grid.Rows | ForEach-Object { $_.Tag })
+    $same = $want.Count -eq $have.Count
+    if ($same) {
+        for ($i = 0; $i -lt $want.Count; $i++) {
+            if (-not [object]::ReferenceEquals($want[$i], $have[$i])) { $same = $false; break }
+        }
+    }
+    if (-not $same) { Rebuild-Grid; return }
+
     foreach ($row in $grid.Rows) {
         $h = $row.Tag
         if (-not $h) { continue }
         $row.Cells['cLabel'].Value  = $h.Label
         $row.Cells['cTarget'].Value = $h.Target
-        $statusText = switch ($h.Status) {
-            'UP'   { 'UP' }
-            'DOWN' { if ($h.Acked) { 'DOWN (ack)' } else { 'DOWN' } }
-            'WARN' { 'checking...' }
-            default { '-' }
+
+        if (-not $h.Enabled) {
+            $statusText = 'DISABLED'
+            $bg = $colOffBg; $fg = $colOffFg; $bold = $false
+        } else {
+            switch ($h.Status) {
+                'UP'   { $statusText = 'UP';           $bg = $colUpBg;   $fg = $colUpFg;   $bold = $false }
+                'WARN' { $statusText = 'checking...';  $bg = $colWarnBg; $fg = $colWarnFg; $bold = $false }
+                'DOWN' {
+                    if ($h.Acked) { $statusText = 'DOWN (ack)'; $bg = $colAckBg;  $fg = $colAckFg;  $bold = $true }
+                    else          { $statusText = 'DOWN';       $bg = $colDownBg; $fg = $colDownFg; $bold = $true }
+                }
+                default { $statusText = '-';           $bg = $colInitBg; $fg = $colInitFg; $bold = $false }
+            }
         }
+
         $row.Cells['cStatus'].Value = $statusText
-        $row.Cells['cLat'].Value    = if ($h.Status -eq 'UP' -and $null -ne $h.Latency) { "$($h.Latency) ms" } else { '' }
+        $row.Cells['cLat'].Value    = if ($h.Enabled -and $h.Status -eq 'UP' -and $null -ne $h.Latency) { "$($h.Latency) ms" } else { '' }
         $row.Cells['cSince'].Value  = if ($h.LastChange) { $h.LastChange.ToString('MM-dd HH:mm:ss') } else { '' }
-        $row.Cells['cDown'].Value   = if ($h.Status -eq 'DOWN' -and $h.DownSince) { Format-Duration ((Get-Date) - $h.DownSince) } else { '' }
-        $c = switch ($h.Status) { 'DOWN' { $colDown } 'UP' { $colUp } 'WARN' { $colWarn } default { $colInit } }
-        if ($row.DefaultCellStyle.BackColor -ne $c) { $row.DefaultCellStyle.BackColor = $c }
+        $row.Cells['cDown'].Value   = if ($h.Enabled -and $h.Status -eq 'DOWN' -and $h.DownSince) { Format-Duration ((Get-Date) - $h.DownSince) } else { '' }
+
+        $key = "$statusText|$($script:TextSize)"
+        if ($h.StyleKey -ne $key) {
+            $h.StyleKey = $key
+            $row.DefaultCellStyle.BackColor = $bg
+            $row.DefaultCellStyle.ForeColor = $fg
+            $row.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::White
+            $row.DefaultCellStyle.Font = if ($bold) { UiFont 1.0 -Bold } else { UiFont }
+            $row.Height = [int]($script:TextSize * 2.5)
+        }
     }
 }
 
 function Refresh-Banner {
-    $down = @($script:Hosts | Where-Object { $_.Status -eq 'DOWN' })
-    $unacked = @($down | Where-Object { -not $_.Acked })
+    $active  = @($script:Hosts | Where-Object { $_.Enabled })
+    $down    = @($active | Where-Object { $_.Status -eq 'DOWN' })
+    $unacked = @($down   | Where-Object { -not $_.Acked })
     if ($down.Count -gt 0) {
-        $names = ($down | Select-Object -First 6 | ForEach-Object { $_.Label }) -join ', '
-        if ($down.Count -gt 6) { $names += ' ...' }
-        $lblBanner.Text = ('{0} HOST(S) DOWN  -  {1}' -f $down.Count, $names)
-        $lblBanner.BackColor = if ($unacked.Count -gt 0) { [System.Drawing.Color]::FromArgb(200, 30, 30) } else { [System.Drawing.Color]::FromArgb(180, 120, 0) }
+        $names = ($down | Select-Object -First 6 | ForEach-Object { $_.Label }) -join ',  '
+        if ($down.Count -gt 6) { $names += '  ...' }
+        $lblBanner.Text = ('{0} HOST{1} DOWN   -   {2}' -f $down.Count, $(if ($down.Count -eq 1) { '' } else { 'S' }), $names)
+        $lblBanner.BackColor = if ($unacked.Count -gt 0) { [System.Drawing.Color]::FromArgb(200, 30, 30) } else { [System.Drawing.Color]::FromArgb(184, 118, 0) }
     }
-    elseif ($script:Hosts.Count -eq 0) {
-        $lblBanner.Text = 'No hosts yet - add an IP or hostname above'
+    elseif ($active.Count -eq 0) {
+        $lblBanner.Text = if ($script:Hosts.Count -eq 0) { 'No hosts yet - add an IP or hostname above' } else { 'All hosts are disabled' }
         $lblBanner.BackColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
     }
     elseif ($script:Paused) {
@@ -668,17 +856,21 @@ function Refresh-Banner {
         $lblBanner.BackColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
     }
     else {
-        $lblBanner.Text = ('All {0} host(s) UP' -f $script:Hosts.Count)
+        $lblBanner.Text = ('ALL {0} HOST{1} UP' -f $active.Count, $(if ($active.Count -eq 1) { '' } else { 'S' }))
         $lblBanner.BackColor = [System.Drawing.Color]::FromArgb(40, 140, 60)
     }
 }
 
 function Refresh-Status {
-    $up   = @($script:Hosts | Where-Object { $_.Status -eq 'UP' }).Count
-    $down = @($script:Hosts | Where-Object { $_.Status -eq 'DOWN' }).Count
-    $oth  = $script:Hosts.Count - $up - $down
-    $lblCounts.Text = ('UP: {0}    DOWN: {1}    other: {2}    |    checking every {3}s{4}' -f `
-        $up, $down, $oth, [int]$script:numInterval.Value, $(if ($script:Paused) { '   [PAUSED]' } else { '' }))
+    $active = @($script:Hosts | Where-Object { $_.Enabled })
+    $up   = @($active | Where-Object { $_.Status -eq 'UP' }).Count
+    $down = @($active | Where-Object { $_.Status -eq 'DOWN' }).Count
+    $oth  = $active.Count - $up - $down
+    $off  = $script:Hosts.Count - $active.Count
+    $shown = $grid.Rows.Count
+    $filter = if ($shown -ne $script:Hosts.Count) { ("    |    showing {0} of {1}" -f $shown, $script:Hosts.Count) } else { '' }
+    $lblCounts.Text = ('UP: {0}    DOWN: {1}    other: {2}    disabled: {3}    |    every {4}s{5}{6}' -f `
+        $up, $down, $oth, $off, [int]$script:numInterval.Value, $(if ($script:Paused) { '   [PAUSED]' } else { '' }), $filter)
     $upd = if ($script:UpdatePending) { '  |  update ready - restart' }
            elseif ($script:LastUpdateCheck) { '  |  upd chk ' + $script:LastUpdateCheck.ToString('HH:mm') }
            else { '' }
@@ -711,6 +903,129 @@ $btnAdd.Add_Click({ Add-Host })
 $txtTarget.Add_KeyDown({ if ($_.KeyCode -eq 'Enter') { $_.SuppressKeyPress = $true; Add-Host } })
 $txtLabel.Add_KeyDown({ if ($_.KeyCode -eq 'Enter') { $_.SuppressKeyPress = $true; $txtTarget.Focus() } })
 
+# ---- Edit / modify a host ----------------------------------------------------
+function Show-HostDialog {
+    param([string]$Name, [string]$Target)
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Edit host'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $dlg.Font = UiFont
+    $s = $script:TextSize
+    $dlg.ClientSize = New-Object System.Drawing.Size([int]($s * 34), [int]($s * 11))
+
+    $l1 = New-Object System.Windows.Forms.Label
+    $l1.Text = 'Name'; $l1.AutoSize = $true
+    $l1.Location = New-Object System.Drawing.Point([int]($s*1.2), [int]($s*1.2))
+    $t1 = New-Object System.Windows.Forms.TextBox
+    $t1.Text = $Name
+    $t1.Location = New-Object System.Drawing.Point([int]($s*8), [int]($s*1.0))
+    $t1.Width = [int]($s * 24)
+
+    $l2 = New-Object System.Windows.Forms.Label
+    $l2.Text = 'IP / host'; $l2.AutoSize = $true
+    $l2.Location = New-Object System.Drawing.Point([int]($s*1.2), [int]($s*4.2))
+    $t2 = New-Object System.Windows.Forms.TextBox
+    $t2.Text = $Target
+    $t2.Location = New-Object System.Drawing.Point([int]($s*8), [int]($s*4.0))
+    $t2.Width = [int]($s * 24)
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'Save'; $ok.DialogResult = 'OK'
+    $ok.Location = New-Object System.Drawing.Point([int]($s*17), [int]($s*7.4))
+    $ok.Size = New-Object System.Drawing.Size([int]($s*7), [int]($s*2.6))
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'; $cancel.DialogResult = 'Cancel'
+    $cancel.Location = New-Object System.Drawing.Point([int]($s*25), [int]($s*7.4))
+    $cancel.Size = New-Object System.Drawing.Size([int]($s*7), [int]($s*2.6))
+
+    $dlg.Controls.AddRange(@($l1, $t1, $l2, $t2, $ok, $cancel))
+    $dlg.AcceptButton = $ok
+    $dlg.CancelButton = $cancel
+    if ($dlg.ShowDialog($form) -ne 'OK') { $dlg.Dispose(); return $null }
+    $res = [pscustomobject]@{ Label = $t1.Text.Trim(); Target = $t2.Text.Trim() }
+    $dlg.Dispose()
+    $res
+}
+
+function Edit-SelectedHost {
+    $sel = @($grid.SelectedRows | ForEach-Object { $_.Tag } | Where-Object { $_ })
+    if ($sel.Count -ne 1) {
+        [System.Windows.Forms.MessageBox]::Show('Select exactly one host to edit.', 'Edit host', 'OK', 'Information') | Out-Null
+        return
+    }
+    $h = $sel[0]
+    $r = Show-HostDialog -Name $h.Label -Target $h.Target
+    if (-not $r) { return }
+    if (-not $r.Target) {
+        [System.Windows.Forms.MessageBox]::Show('IP / host cannot be empty.', 'Edit host', 'OK', 'Warning') | Out-Null
+        return
+    }
+    if (-not $r.Label) { $r.Label = $r.Target }
+    $clash = @($script:Hosts | Where-Object { $_.Target -eq $r.Target -and -not [object]::ReferenceEquals($_, $h) })
+    if ($clash.Count -gt 0) {
+        [System.Windows.Forms.MessageBox]::Show("'$($r.Target)' is already in the list.", 'Duplicate', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $oldLabel = $h.Label; $oldTarget = $h.Target
+    $targetChanged = ($h.Target -ne $r.Target)
+    $h.Label  = $r.Label
+    $h.Target = $r.Target
+    if ($targetChanged) {
+        # different address - the old up/down history no longer applies
+        $h.Status = if ($h.Enabled) { 'INIT' } else { 'OFF' }
+        $h.Latency = $null; $h.DownSince = $null; $h.LastChange = $null
+        $h.Acked = $false; $h.FailCount = 0; $h.Task = $null; $h.Ping = $null
+    }
+    $h.StyleKey = ''
+    Write-Event ("EDITED    : {0} [{1}]  ->  {2} [{3}]" -f $oldLabel, $oldTarget, $h.Label, $h.Target)
+    Save-Config
+    Rebuild-Grid
+    Update-Alarm
+    Refresh-Banner
+    $script:CycleRunning = $false
+    Start-CheckCycle
+}
+
+$btnEdit.Add_Click({ Edit-SelectedHost })
+$grid.Add_CellDoubleClick({ if ($_.RowIndex -ge 0) { Edit-SelectedHost } })
+
+# ---- Enable / disable --------------------------------------------------------
+$btnToggle.Add_Click({
+    $sel = @($grid.SelectedRows | ForEach-Object { $_.Tag } | Where-Object { $_ })
+    if ($sel.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('Select one or more hosts first.', 'Enable / disable', 'OK', 'Information') | Out-Null
+        return
+    }
+    foreach ($h in $sel) {
+        $h.Enabled = -not $h.Enabled
+        $h.StyleKey = ''
+        if ($h.Enabled) {
+            $h.Status = 'INIT'; $h.FailCount = 0; $h.Acked = $false
+            $h.DownSince = $null; $h.Latency = $null; $h.LastChange = Get-Date
+            Write-Event ("ENABLED   : {0} [{1}]" -f $h.Label, $h.Target)
+        } else {
+            $h.Status = 'OFF'; $h.FailCount = 0; $h.Acked = $false
+            $h.DownSince = $null; $h.Latency = $null; $h.LastChange = Get-Date
+            $h.Task = $null; $h.Ping = $null
+            Write-Event ("DISABLED  : {0} [{1}] - not monitored, no alarm" -f $h.Label, $h.Target)
+        }
+    }
+    Save-Config
+    Rebuild-Grid
+    Update-Alarm
+    Refresh-Banner
+    $script:CycleRunning = $false
+    Start-CheckCycle
+})
+
+# ---- Search ------------------------------------------------------------------
+$txtSearch.Add_TextChanged({ Refresh-Grid; Refresh-Status })
+$txtSearch.Add_KeyDown({ if ($_.KeyCode -eq 'Escape') { $_.SuppressKeyPress = $true; $txtSearch.Clear() } })
+$btnClearSearch.Add_Click({ $txtSearch.Clear(); $txtSearch.Focus() })
+
 $btnRemove.Add_Click({
     $sel = @($grid.SelectedRows | ForEach-Object { $_.Tag } | Where-Object { $_ })
     if ($sel.Count -eq 0) { return }
@@ -727,9 +1042,9 @@ $btnRemove.Add_Click({
 })
 
 $btnAck.Add_Click({
-    $down = @($script:Hosts | Where-Object { $_.Status -eq 'DOWN' -and -not $_.Acked })
+    $down = @($script:Hosts | Where-Object { $_.Enabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
     if ($down.Count -eq 0) { return }
-    foreach ($h in $down) { $h.Acked = $true }
+    foreach ($h in $down) { $h.Acked = $true; $h.StyleKey = '' }
     Write-Event ("ACK       : alarm acknowledged ({0} host(s) still down)" -f $down.Count)
     Update-Alarm
     Refresh-Grid
@@ -756,6 +1071,12 @@ $numTimeout.Add_ValueChanged({ Save-Config })
 $numThreshold.Add_ValueChanged({ Save-Config })
 $chkTop.Add_CheckedChanged({ $form.TopMost = $chkTop.Checked; Save-Config })
 $chkAutoUpdate.Add_CheckedChanged({ Save-Config })
+$cboSize.Add_SelectedIndexChanged({
+    Apply-TextSize $script:SizeMap[$cboSize.SelectedIndex]
+    Save-Config
+    Refresh-Banner
+    Refresh-Status
+})
 
 function Restart-Self {
     try { Save-Config } catch { }
@@ -816,7 +1137,7 @@ $script:AlarmTimer.Add_Tick({
     if ($script:AlarmActive) {
         Play-Alarm
         try {
-            if (-not $form.ContainsFocus) { [Win32.Flash]::FlashWindow($form.Handle, $true) }
+            if (-not $form.ContainsFocus) { [Win32.Native]::FlashWindow($form.Handle, $true) }
         } catch { }
     }
 })
@@ -849,10 +1170,12 @@ $script:chkTop        = $chkTop
 $script:btnAck        = $btnAck
 $script:chkAutoUpdate = $chkAutoUpdate
 $script:btnRestartNow = $btnRestartNow
+$script:txtSearch     = $txtSearch
 $script:Version       = Get-LocalScriptVersion
 $form.Text = "GCL Ping Monitor  -  v:$($script:Version)"
 
 $form.Add_Shown({
+    Apply-TextSize $script:TextSize
     Rebuild-Grid
     Refresh-Banner
     Refresh-Status
@@ -868,10 +1191,11 @@ $form.Add_Shown({
 $form.Add_FormClosing({
     try {
         $script:checkTimer.Stop(); $script:uiTimer.Stop(); $script:AlarmTimer.Stop(); $script:updateTimer.Stop()
-        if ($script:Player) { try { $script:Player.Stop() } catch { } }
+        Stop-Alarm
         Save-Config
         Write-Event 'MONITOR   : stopped'
     } catch { }
+    try { if ($script:HaveMutex -and $script:Mutex) { $script:Mutex.ReleaseMutex(); $script:Mutex.Dispose() } } catch { }
 })
 
 [void][System.Windows.Forms.Application]::Run($form)
