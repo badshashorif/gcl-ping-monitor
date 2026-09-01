@@ -114,6 +114,32 @@ foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','Auto
     }
 }
 
+# ---- notification settings (email / telegram / sms) -------------------------
+function Set-Default {
+    param($Obj, [string]$Name, $Value)
+    if ($null -eq $Obj.$Name) { $Obj | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force }
+}
+if ($null -eq $script:Config.Notify) {
+    $script:Config | Add-Member -NotePropertyName Notify -NotePropertyValue ([pscustomobject]@{}) -Force
+}
+$n = $script:Config.Notify
+Set-Default $n 'OnDown'       $true
+Set-Default $n 'OnRecover'    $true
+Set-Default $n 'BatchSeconds' 20
+Set-Default $n 'MaxPerHour'   20
+Set-Default $n 'Email'    ([pscustomobject]@{})
+Set-Default $n 'Telegram' ([pscustomobject]@{})
+Set-Default $n 'Sms'      ([pscustomobject]@{})
+Set-Default $n.Email 'Enabled' $false; Set-Default $n.Email 'SmtpServer' ''; Set-Default $n.Email 'Port' 587
+Set-Default $n.Email 'UseSsl'  $true;  Set-Default $n.Email 'User' '';       Set-Default $n.Email 'PassEnc' ''
+Set-Default $n.Email 'From' '';        Set-Default $n.Email 'To' ''
+Set-Default $n.Telegram 'Enabled' $false; Set-Default $n.Telegram 'TokenEnc' ''; Set-Default $n.Telegram 'ChatId' ''
+Set-Default $n.Sms 'Enabled' $false;   Set-Default $n.Sms 'Numbers' ''
+Set-Default $n.Sms 'UrlTemplate' 'https://YOUR-SMS-GATEWAY/api/sendsms?api_key={apikey}&msisdn={phone}&message={message}'
+Set-Default $n.Sms 'Method' 'GET';     Set-Default $n.Sms 'BodyTemplate' ''
+Set-Default $n.Sms 'ContentType' 'application/x-www-form-urlencoded'
+Set-Default $n.Sms 'ApiKeyEnc' ''
+
 # ---------------------------------------------------------------------------
 #  Runtime state
 # ---------------------------------------------------------------------------
@@ -312,6 +338,7 @@ function Process-Result {
             if ($prev -eq 'DOWN') {
                 $dur = if ($h.DownSince) { Format-Duration ((Get-Date) - $h.DownSince) } else { '?' }
                 Write-Event ("RECOVERED : {0} [{1}] - was down {2}" -f $h.Label, $h.Target, $dur)
+                Add-Notification -Kind 'UP' -Host_ $h
             } elseif ($prev -eq 'INIT') {
                 Write-Event ("OK        : {0} [{1}] - reachable" -f $h.Label, $h.Target)
             }
@@ -330,6 +357,7 @@ function Process-Result {
                 $h.DownSince  = Get-Date
                 $h.Acked      = $false
                 Write-Event ("DOWN      : {0} [{1}] - no reply" -f $h.Label, $h.Target)
+                Add-Notification -Kind 'DOWN' -Host_ $h
             } else {
                 $h.Status = 'WARN'
             }
@@ -448,6 +476,198 @@ $script:AlarmActive = $false
 function Play-Alarm {
     try { if ($script:Player) { $script:Player.Play(); return } } catch { }
     try { [System.Media.SystemSounds]::Hand.Play() } catch { }
+}
+
+# ---------------------------------------------------------------------------
+#  Notifications - email / telegram / sms
+# ---------------------------------------------------------------------------
+#  * Secrets (SMTP password, bot token, SMS api key) are stored DPAPI-encrypted,
+#    so config.json never holds a readable password. DPAPI is tied to this
+#    Windows user on this machine - copying config.json elsewhere gives nothing.
+#  * Events are batched for a few seconds and sent as ONE message, so a link
+#    failure taking 30 hosts down does not fire 30 SMS.
+#  * Sending happens in a background runspace; the UI never blocks on SMTP.
+
+$script:NotifyQueue = New-Object System.Collections.ArrayList
+$script:NotifySent  = New-Object System.Collections.ArrayList   # timestamps, for the hourly cap
+
+function Protect-Secret {
+    param([string]$Plain)
+    if ([string]::IsNullOrEmpty($Plain)) { return '' }
+    try { ConvertTo-SecureString $Plain -AsPlainText -Force | ConvertFrom-SecureString } catch { '' }
+}
+
+function Unprotect-Secret {
+    param([string]$Enc)
+    if ([string]::IsNullOrEmpty($Enc)) { return '' }
+    try {
+        $ss = ConvertTo-SecureString $Enc -ErrorAction Stop
+        $b  = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ss)
+        try   { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b) }
+        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
+    } catch { '' }
+}
+
+function Test-NotifyEnabled {
+    $n = $script:Config.Notify
+    ($n.Email.Enabled -or $n.Telegram.Enabled -or $n.Sms.Enabled)
+}
+
+function Add-Notification {
+    param([ValidateSet('DOWN','UP')][string]$Kind, $Host_)
+    $n = $script:Config.Notify
+    if (-not (Test-NotifyEnabled)) { return }
+    if ($Kind -eq 'DOWN' -and -not $n.OnDown)    { return }
+    if ($Kind -eq 'UP'   -and -not $n.OnRecover) { return }
+    [void]$script:NotifyQueue.Add([pscustomobject]@{
+        Kind = $Kind; Label = $Host_.Label; Target = $Host_.Target; Time = Get-Date
+    })
+}
+
+$script:NotifySender = {
+    param($LogPath, $Subject, $BodyLong, $BodyShort, $Cfg)
+    function Log($m) {
+        for ($i = 0; $i -lt 5; $i++) {
+            try { Add-Content -Path $LogPath -Value ('{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m) -Encoding UTF8; return }
+            catch { Start-Sleep -Milliseconds 120 }
+        }
+    }
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls } catch { }
+
+    if ($Cfg.EmailEnabled) {
+        try {
+            $msg = New-Object System.Net.Mail.MailMessage
+            $msg.From = New-Object System.Net.Mail.MailAddress($Cfg.EmailFrom)
+            $any = $false
+            foreach ($to in ($Cfg.EmailTo -split '[;,]')) { if ($to.Trim()) { $msg.To.Add($to.Trim()); $any = $true } }
+            if (-not $any) { throw 'no recipient address' }
+            $msg.Subject = $Subject
+            $msg.Body    = $BodyLong
+            $cli = New-Object System.Net.Mail.SmtpClient($Cfg.EmailServer, [int]$Cfg.EmailPort)
+            $cli.EnableSsl = [bool]$Cfg.EmailSsl
+            $cli.Timeout   = 25000
+            if ($Cfg.EmailUser) {
+                $cli.UseDefaultCredentials = $false
+                $cli.Credential = New-Object System.Net.NetworkCredential($Cfg.EmailUser, $Cfg.EmailPass)
+            }
+            $cli.Send($msg)
+            $msg.Dispose(); $cli.Dispose()
+            Log ('NOTIFY    : email sent to {0}' -f $Cfg.EmailTo)
+        } catch { Log ('NOTIFY err: email - {0}' -f $_.Exception.Message) }
+    }
+
+    if ($Cfg.TgEnabled) {
+        try {
+            $uri  = 'https://api.telegram.org/bot{0}/sendMessage' -f $Cfg.TgToken
+            $body = @{ chat_id = $Cfg.TgChat; text = $BodyLong; disable_web_page_preview = 'true' }
+            $null = Invoke-WebRequest -Uri $uri -Method Post -Body $body -UseBasicParsing -TimeoutSec 25
+            Log ('NOTIFY    : telegram sent to chat {0}' -f $Cfg.TgChat)
+        } catch { Log ('NOTIFY err: telegram - {0}' -f $_.Exception.Message) }
+    }
+
+    if ($Cfg.SmsEnabled) {
+        foreach ($raw in ($Cfg.SmsNumbers -split '[;,]')) {
+            $num = $raw.Trim()
+            if (-not $num) { continue }
+            try {
+                $url = $Cfg.SmsUrl.Replace('{apikey}',  [Uri]::EscapeDataString([string]$Cfg.SmsKey)).
+                                   Replace('{phone}',   [Uri]::EscapeDataString($num)).
+                                   Replace('{message}', [Uri]::EscapeDataString($BodyShort))
+                if ($Cfg.SmsMethod -eq 'POST') {
+                    $b = $Cfg.SmsBody.Replace('{apikey}', [string]$Cfg.SmsKey).Replace('{phone}', $num).Replace('{message}', $BodyShort)
+                    $null = Invoke-WebRequest -Uri $url -Method Post -Body $b -ContentType $Cfg.SmsContentType -UseBasicParsing -TimeoutSec 25
+                } else {
+                    $null = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 25
+                }
+                Log ('NOTIFY    : sms sent to {0}' -f $num)
+            } catch { Log ('NOTIFY err: sms {0} - {1}' -f $num, $_.Exception.Message) }
+        }
+    }
+}
+
+function Send-Notification {
+    param([string]$Subject, [string]$BodyLong, [string]$BodyShort)
+    $n = $script:Config.Notify
+    $cfg = @{
+        EmailEnabled = [bool]$n.Email.Enabled
+        EmailServer  = [string]$n.Email.SmtpServer
+        EmailPort    = [int]$n.Email.Port
+        EmailSsl     = [bool]$n.Email.UseSsl
+        EmailUser    = [string]$n.Email.User
+        EmailPass    = (Unprotect-Secret ([string]$n.Email.PassEnc))
+        EmailFrom    = [string]$n.Email.From
+        EmailTo      = [string]$n.Email.To
+        TgEnabled    = [bool]$n.Telegram.Enabled
+        TgToken      = (Unprotect-Secret ([string]$n.Telegram.TokenEnc))
+        TgChat       = [string]$n.Telegram.ChatId
+        SmsEnabled   = [bool]$n.Sms.Enabled
+        SmsNumbers   = [string]$n.Sms.Numbers
+        SmsUrl       = [string]$n.Sms.UrlTemplate
+        SmsMethod    = [string]$n.Sms.Method
+        SmsBody      = [string]$n.Sms.BodyTemplate
+        SmsContentType = [string]$n.Sms.ContentType
+        SmsKey       = (Unprotect-Secret ([string]$n.Sms.ApiKeyEnc))
+    }
+    try {
+        $ps = [PowerShell]::Create()
+        [void]$ps.AddScript($script:NotifySender)
+        [void]$ps.AddArgument($script:LogPath)
+        [void]$ps.AddArgument($Subject)
+        [void]$ps.AddArgument($BodyLong)
+        [void]$ps.AddArgument($BodyShort)
+        [void]$ps.AddArgument($cfg)
+        [void]$ps.BeginInvoke()
+    } catch {
+        Write-Event ("NOTIFY err: could not start sender - {0}" -f $_.Exception.Message)
+    }
+}
+
+function Send-QueuedNotifications {
+    if ($script:NotifyQueue.Count -eq 0) { return }
+    $items = @($script:NotifyQueue.ToArray())
+    $script:NotifyQueue.Clear()
+    if (-not (Test-NotifyEnabled)) { return }
+
+    # hourly cap so an outage storm can't burn the SMS balance
+    $cut = (Get-Date).AddHours(-1)
+    $keep = @($script:NotifySent | Where-Object { $_ -gt $cut })
+    $script:NotifySent.Clear()
+    foreach ($t in $keep) { [void]$script:NotifySent.Add($t) }
+    if ($script:NotifySent.Count -ge [int]$script:Config.Notify.MaxPerHour) {
+        Write-Event ('NOTIFY err: hourly limit ({0}) reached - message suppressed' -f $script:Config.Notify.MaxPerHour)
+        return
+    }
+    [void]$script:NotifySent.Add((Get-Date))
+
+    $downs = @($items | Where-Object { $_.Kind -eq 'DOWN' })
+    $ups   = @($items | Where-Object { $_.Kind -eq 'UP' })
+    $where = $env:COMPUTERNAME
+    $subject = if ($downs.Count -gt 0) { 'GCL Ping Monitor: {0} DOWN' -f $downs.Count }
+               else                    { 'GCL Ping Monitor: {0} recovered' -f $ups.Count }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine(('GCL Ping Monitor  ({0})' -f $where))
+    [void]$sb.AppendLine((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    if ($downs.Count -gt 0) {
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine(('DOWN ({0}):' -f $downs.Count))
+        foreach ($d in $downs) { [void]$sb.AppendLine(('  {0}  [{1}]' -f $d.Label, $d.Target)) }
+    }
+    if ($ups.Count -gt 0) {
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine(('RECOVERED ({0}):' -f $ups.Count))
+        foreach ($u in $ups) { [void]$sb.AppendLine(('  {0}  [{1}]' -f $u.Label, $u.Target)) }
+    }
+    $long = $sb.ToString()
+
+    $parts = @()
+    if ($downs.Count -gt 0) { $parts += ('DOWN: ' + (($downs | ForEach-Object { $_.Label }) -join ', ')) }
+    if ($ups.Count   -gt 0) { $parts += ('UP: '   + (($ups   | ForEach-Object { $_.Label }) -join ', ')) }
+    $short = ('[{0}] ' -f $where) + ($parts -join ' | ')
+    if ($short.Length -gt 300) { $short = $short.Substring(0, 297) + '...' }
+
+    Write-Event ('NOTIFY    : sending ({0} down, {1} up)' -f $downs.Count, $ups.Count)
+    Send-Notification -Subject $subject -BodyLong $long -BodyShort $short
 }
 
 function Stop-Alarm {
@@ -586,6 +806,7 @@ $chkAutoUpdate.Text = 'Auto-update'; $chkAutoUpdate.AutoSize = $true
 $chkAutoUpdate.Checked = [bool]$script:Config.AutoUpdate
 $chkAutoUpdate.Margin = New-Object System.Windows.Forms.Padding(10, 8, 6, 0)
 
+$btnNotify = New-Btn 'Notifications...' 150
 $btnUpdate = New-Btn 'Check for updates' 160
 
 # becomes visible only after a newer version has been downloaded in the background
@@ -605,7 +826,7 @@ $panelTop.Controls.AddRange(@(
     (New-Lbl 'Timeout ms:'), $numTimeout,
     (New-Lbl 'Fails->down:'), $numThreshold,
     (New-Lbl 'Text:'), $cboSize,
-    $chkTop, $chkAutoUpdate, $btnUpdate, $btnRestartNow
+    $chkTop, $chkAutoUpdate, $btnNotify, $btnUpdate, $btnRestartNow
 ))
 
 # ---- Split: grid on top, log on bottom ----
@@ -687,7 +908,7 @@ function Apply-TextSize {
     $btnAck.Font        = UiFont -Bold
     $btnRestartNow.Font = UiFont -Bold
     foreach ($b in @($btnAdd, $btnEdit, $btnToggle, $btnRemove, $btnClearSearch, $btnAck,
-                     $btnPause, $btnTest, $btnUpdate, $btnRestartNow)) {
+                     $btnPause, $btnTest, $btnNotify, $btnUpdate, $btnRestartNow)) {
         $b.Height = [int]($s * 2.6)
     }
 
@@ -990,6 +1211,196 @@ function Edit-SelectedHost {
 }
 
 $btnEdit.Add_Click({ Edit-SelectedHost })
+
+# ---- Notification settings dialog -------------------------------------------
+$btnNotify.Add_Click({
+    $n = $script:Config.Notify
+    $s = $script:TextSize
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Notifications - email / Telegram / SMS'
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $dlg.Font = UiFont
+    $dlg.ClientSize = New-Object System.Drawing.Size([int]($s * 52), [int]($s * 40))
+
+    $tabs = New-Object System.Windows.Forms.TabControl
+    $tabs.Location = New-Object System.Drawing.Point(10, 10)
+    $tabs.Size = New-Object System.Drawing.Size([int]($s * 52 - 20), [int]($s * 36))
+    $dlg.Controls.Add($tabs)
+
+    $rowY = 0
+    function NRow { param($page, $label, $ctrl, $w = 30)
+        $l = New-Object System.Windows.Forms.Label
+        $l.Text = $label; $l.AutoSize = $true
+        $l.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]($script:rowY + $s*0.4))
+        $ctrl.Location = New-Object System.Drawing.Point([int]($s*13), [int]$script:rowY)
+        $ctrl.Width = [int]($s * $w)
+        $page.Controls.AddRange(@($l, $ctrl))
+        $script:rowY += [int]($s * 2.9)
+    }
+    function NChk { param($page, $text, $checked)
+        $c = New-Object System.Windows.Forms.CheckBox
+        $c.Text = $text; $c.AutoSize = $true; $c.Checked = [bool]$checked
+        $c.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]$script:rowY)
+        $page.Controls.Add($c)
+        $script:rowY += [int]($s * 2.9)
+        $c
+    }
+    function NTxt { param($val, [switch]$Pass)
+        $t = New-Object System.Windows.Forms.TextBox
+        $t.Text = [string]$val
+        if ($Pass) { $t.UseSystemPasswordChar = $true }
+        $t
+    }
+
+    # ---------- General ----------
+    $pGen = New-Object System.Windows.Forms.TabPage; $pGen.Text = 'General'; $pGen.BackColor = 'White'
+    $script:rowY = [int]($s * 1.2)
+    $gDown  = NChk $pGen 'Notify when a host goes DOWN'      $n.OnDown
+    $gUp    = NChk $pGen 'Notify when a host RECOVERS'       $n.OnRecover
+    $gBatch = New-Object System.Windows.Forms.NumericUpDown; $gBatch.Minimum=5; $gBatch.Maximum=300; $gBatch.Value=[Math]::Min([Math]::Max([int]$n.BatchSeconds,5),300)
+    NRow $pGen 'Batch (sec)' $gBatch 8
+    $gMax = New-Object System.Windows.Forms.NumericUpDown; $gMax.Minimum=1; $gMax.Maximum=500; $gMax.Value=[Math]::Min([Math]::Max([int]$n.MaxPerHour,1),500)
+    NRow $pGen 'Max msgs/hour' $gMax 8
+    $gInfo = New-Object System.Windows.Forms.Label
+    $gInfo.Text = "Events inside the batch window are combined into ONE message," + [Environment]::NewLine +
+                  "so a link failure taking many hosts down does not fire many SMS." + [Environment]::NewLine + [Environment]::NewLine +
+                  "Passwords, bot tokens and API keys are stored encrypted (DPAPI)" + [Environment]::NewLine +
+                  "and can only be read back by this Windows user on this machine."
+    $gInfo.AutoSize = $true
+    $gInfo.ForeColor = [System.Drawing.Color]::FromArgb(90,94,100)
+    $gInfo.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]($script:rowY + $s))
+    $pGen.Controls.Add($gInfo)
+    $tabs.TabPages.Add($pGen)
+
+    # ---------- Email ----------
+    $pMail = New-Object System.Windows.Forms.TabPage; $pMail.Text = 'Email'; $pMail.BackColor = 'White'
+    $script:rowY = [int]($s * 1.2)
+    $mEn   = NChk $pMail 'Send email notifications' $n.Email.Enabled
+    $mSrv  = NTxt $n.Email.SmtpServer;        NRow $pMail 'SMTP server' $mSrv
+    $mPort = New-Object System.Windows.Forms.NumericUpDown; $mPort.Minimum=1; $mPort.Maximum=65535; $mPort.Value=[Math]::Min([Math]::Max([int]$n.Email.Port,1),65535)
+    NRow $pMail 'Port' $mPort 8
+    $mSsl  = NChk $pMail 'Use SSL / TLS' $n.Email.UseSsl
+    $mUser = NTxt $n.Email.User;              NRow $pMail 'Username' $mUser
+    $mPass = NTxt '' -Pass;                   NRow $pMail 'Password' $mPass
+    if ($n.Email.PassEnc) { $mPass.Text = '********' }
+    $mFrom = NTxt $n.Email.From;              NRow $pMail 'From' $mFrom
+    $mTo   = NTxt $n.Email.To;                NRow $pMail 'To (comma sep)' $mTo
+    $tabs.TabPages.Add($pMail)
+
+    # ---------- Telegram ----------
+    $pTg = New-Object System.Windows.Forms.TabPage; $pTg.Text = 'Telegram'; $pTg.BackColor = 'White'
+    $script:rowY = [int]($s * 1.2)
+    $tEn   = NChk $pTg 'Send Telegram notifications' $n.Telegram.Enabled
+    $tTok  = NTxt '' -Pass;                   NRow $pTg 'Bot token' $tTok
+    if ($n.Telegram.TokenEnc) { $tTok.Text = '********' }
+    $tChat = NTxt $n.Telegram.ChatId;         NRow $pTg 'Chat ID' $tChat
+    $tInfo = New-Object System.Windows.Forms.Label
+    $tInfo.Text = "1. Talk to @BotFather in Telegram, /newbot, copy the token." + [Environment]::NewLine +
+                  "2. Add the bot to your group (or message it directly)." + [Environment]::NewLine +
+                  "3. Open  https://api.telegram.org/bot<TOKEN>/getUpdates" + [Environment]::NewLine +
+                  "   and copy the chat id (group ids start with -100)."
+    $tInfo.AutoSize = $true
+    $tInfo.ForeColor = [System.Drawing.Color]::FromArgb(90,94,100)
+    $tInfo.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]($script:rowY + $s))
+    $pTg.Controls.Add($tInfo)
+    $tabs.TabPages.Add($pTg)
+
+    # ---------- SMS ----------
+    $pSms = New-Object System.Windows.Forms.TabPage; $pSms.Text = 'SMS'; $pSms.BackColor = 'White'
+    $script:rowY = [int]($s * 1.2)
+    $sEn  = NChk $pSms 'Send SMS notifications' $n.Sms.Enabled
+    $sNum = NTxt $n.Sms.Numbers;               NRow $pSms 'Numbers (comma)' $sNum
+    $sUrl = NTxt $n.Sms.UrlTemplate;           NRow $pSms 'Gateway URL' $sUrl 34
+    $sKey = NTxt '' -Pass;                     NRow $pSms 'API key' $sKey
+    if ($n.Sms.ApiKeyEnc) { $sKey.Text = '********' }
+    $sMet = New-Object System.Windows.Forms.ComboBox; $sMet.DropDownStyle='DropDownList'
+    [void]$sMet.Items.AddRange(@('GET','POST'))
+    $sMet.SelectedIndex = $(if ("$($n.Sms.Method)".ToUpper() -eq 'POST') { 1 } else { 0 })
+    NRow $pSms 'Method' $sMet 10
+    $sBody = NTxt $n.Sms.BodyTemplate;         NRow $pSms 'POST body' $sBody 34
+    $sInfo = New-Object System.Windows.Forms.Label
+    $sInfo.Text = "Works with any HTTP SMS gateway. Placeholders you can use in the" + [Environment]::NewLine +
+                  "URL and POST body:   {apikey}   {phone}   {message}" + [Environment]::NewLine + [Environment]::NewLine +
+                  "Example (GET):" + [Environment]::NewLine +
+                  "  https://api.example.com/send?api_key={apikey}&to={phone}&msg={message}"
+    $sInfo.AutoSize = $true
+    $sInfo.ForeColor = [System.Drawing.Color]::FromArgb(90,94,100)
+    $sInfo.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]($script:rowY + $s))
+    $pSms.Controls.Add($sInfo)
+    $tabs.TabPages.Add($pSms)
+
+    # ---------- buttons ----------
+    $bTest = New-Object System.Windows.Forms.Button
+    $bTest.Text = 'Send test'
+    $bTest.Location = New-Object System.Drawing.Point(10, [int]($s * 36.6))
+    $bTest.Size = New-Object System.Drawing.Size([int]($s*9), [int]($s*2.6))
+    $bOk = New-Object System.Windows.Forms.Button
+    $bOk.Text = 'Save'; $bOk.DialogResult = 'OK'
+    $bOk.Location = New-Object System.Drawing.Point([int]($s*35), [int]($s * 36.6))
+    $bOk.Size = New-Object System.Drawing.Size([int]($s*7.5), [int]($s*2.6))
+    $bCancel = New-Object System.Windows.Forms.Button
+    $bCancel.Text = 'Cancel'; $bCancel.DialogResult = 'Cancel'
+    $bCancel.Location = New-Object System.Drawing.Point([int]($s*43), [int]($s * 36.6))
+    $bCancel.Size = New-Object System.Drawing.Size([int]($s*7.5), [int]($s*2.6))
+    $dlg.Controls.AddRange(@($bTest, $bOk, $bCancel))
+    $dlg.AcceptButton = $bOk
+    $dlg.CancelButton = $bCancel
+
+    # writes the dialog back into $script:Config.Notify
+    $apply = {
+        $n.OnDown       = [bool]$gDown.Checked
+        $n.OnRecover    = [bool]$gUp.Checked
+        $n.BatchSeconds = [int]$gBatch.Value
+        $n.MaxPerHour   = [int]$gMax.Value
+
+        $n.Email.Enabled    = [bool]$mEn.Checked
+        $n.Email.SmtpServer = $mSrv.Text.Trim()
+        $n.Email.Port       = [int]$mPort.Value
+        $n.Email.UseSsl     = [bool]$mSsl.Checked
+        $n.Email.User       = $mUser.Text.Trim()
+        if ($mPass.Text -ne '********') { $n.Email.PassEnc = Protect-Secret $mPass.Text }
+        $n.Email.From       = $mFrom.Text.Trim()
+        $n.Email.To         = $mTo.Text.Trim()
+
+        $n.Telegram.Enabled = [bool]$tEn.Checked
+        if ($tTok.Text -ne '********') { $n.Telegram.TokenEnc = Protect-Secret $tTok.Text.Trim() }
+        $n.Telegram.ChatId  = $tChat.Text.Trim()
+
+        $n.Sms.Enabled      = [bool]$sEn.Checked
+        $n.Sms.Numbers      = $sNum.Text.Trim()
+        $n.Sms.UrlTemplate  = $sUrl.Text.Trim()
+        if ($sKey.Text -ne '********') { $n.Sms.ApiKeyEnc = Protect-Secret $sKey.Text.Trim() }
+        $n.Sms.Method       = [string]$sMet.SelectedItem
+        $n.Sms.BodyTemplate = $sBody.Text
+    }
+
+    $bTest.Add_Click({
+        & $apply
+        if (-not (Test-NotifyEnabled)) {
+            [System.Windows.Forms.MessageBox]::Show('Enable at least one channel first.', 'Send test', 'OK', 'Information') | Out-Null
+            return
+        }
+        Send-Notification -Subject 'GCL Ping Monitor - test' `
+            -BodyLong  ("This is a test from GCL Ping Monitor on {0}.`r`n{1}" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) `
+            -BodyShort ("[{0}] GCL Ping Monitor test message" -f $env:COMPUTERNAME)
+        Write-Event 'NOTIFY    : test message queued'
+        [System.Windows.Forms.MessageBox]::Show("Test sent. Watch the log panel for 'NOTIFY : ... sent' or an error.", 'Send test', 'OK', 'Information') | Out-Null
+    })
+
+    if ($dlg.ShowDialog($form) -eq 'OK') {
+        & $apply
+        Save-Config
+        $script:notifyTimer.Interval = [Math]::Max([int]$n.BatchSeconds, 5) * 1000
+        $on = @()
+        if ($n.Email.Enabled)    { $on += 'email' }
+        if ($n.Telegram.Enabled) { $on += 'telegram' }
+        if ($n.Sms.Enabled)      { $on += 'sms' }
+        Write-Event ('NOTIFY    : settings saved - channels: {0}' -f $(if ($on.Count) { $on -join ', ' } else { 'none' }))
+    }
+    $dlg.Dispose()
+})
 $grid.Add_CellDoubleClick({ if ($_.RowIndex -ge 0) { Edit-SelectedHost } })
 
 # ---- Enable / disable --------------------------------------------------------
@@ -1142,6 +1553,12 @@ $script:AlarmTimer.Add_Tick({
     }
 })
 
+$script:notifyTimer = New-Object System.Windows.Forms.Timer
+$script:notifyTimer.Interval = [Math]::Max([int]$script:Config.Notify.BatchSeconds, 5) * 1000
+$script:notifyTimer.Add_Tick({
+    try { Send-QueuedNotifications } catch { Write-Event "ERR notify: $($_.Exception.Message)" }
+})
+
 # background self-update check while the app is running
 $script:updateTimer = New-Object System.Windows.Forms.Timer
 $script:UpdateHoursMs = [int]([Math]::Min([Math]::Max([double]$script:Config.UpdateHours, 0.5), 168) * 3600 * 1000)
@@ -1183,6 +1600,7 @@ $form.Add_Shown({
     $script:checkTimer.Start()
     $script:uiTimer.Start()
     $script:AlarmTimer.Start()
+    $script:notifyTimer.Start()
     if (-not $script:IsGitCheckout) { $script:updateTimer.Start() }
     Start-CheckCycle
     if ($script:Hosts.Count -eq 0) { $txtTarget.Focus() }
@@ -1190,7 +1608,9 @@ $form.Add_Shown({
 
 $form.Add_FormClosing({
     try {
-        $script:checkTimer.Stop(); $script:uiTimer.Stop(); $script:AlarmTimer.Stop(); $script:updateTimer.Stop()
+        $script:checkTimer.Stop(); $script:uiTimer.Stop(); $script:AlarmTimer.Stop()
+        $script:updateTimer.Stop(); $script:notifyTimer.Stop()
+        try { Send-QueuedNotifications } catch { }
         Stop-Alarm
         Save-Config
         Write-Event 'MONITOR   : stopped'
