@@ -238,17 +238,25 @@ Behaviour:
 🔴🔴 "niketon pop" Down
 Severity: Critical
 Timestamp: 2026-09-01 14:14:16
+IP / Host: 10.10.10.1
 
 🟢🟢 "niketon pop" Up
 Severity: Normal
 Timestamp: 2026-09-01 14:15:24
+IP / Host: 10.10.10.1
 Downtime: 1m 8s
+
+Monitored from: NOC-DESK-1 (192.168.120.108)
 ```
 
-Email and Telegram get this; the email subject is
-`[CRITICAL] "niketon pop" Down`. SMS and the offline command get a plain-ASCII
-one-liner instead — emoji push a phone into UCS-2 and halve how much fits in one
-SMS.
+**Monitored from** is the PC that raised the alert — its name and the IP of the
+interface it actually routes out of — so with the tool on several desks you can
+tell at a glance which one is reporting. It also goes on the end of the email
+subject: `[CRITICAL] "niketon pop" Down - NOC-DESK-1`.
+
+Email and Telegram get this. SMS and the offline command get a plain-ASCII
+one-liner instead (`[NOC-DESK-1] "niketon pop" Down - 14:14:16`) — emoji push a
+phone into UCS-2 and halve how much fits in one SMS.
 
 ### Email security: 465 and 587 are not the same
 

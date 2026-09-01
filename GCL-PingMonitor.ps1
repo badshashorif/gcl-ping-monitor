@@ -679,6 +679,39 @@ function Add-Notification {
     })
 }
 
+# Which PC the alert came from. Resolved once - a DNS lookup per message would
+# be a pointless stall, and this cannot change while the tool is running.
+$script:MonitorName = $env:COMPUTERNAME
+$script:MonitorIp   = ''
+try {
+    # Ask the routing table which interface would be used to leave the machine.
+    # A UDP "connect" sends no packet, it only binds the local end - which is why
+    # this picks the real NIC instead of a VirtualBox/Hyper-V/VPN adapter, as
+    # Dns.GetHostAddresses() so often does.
+    $sock = New-Object System.Net.Sockets.Socket(
+        [System.Net.Sockets.AddressFamily]::InterNetwork,
+        [System.Net.Sockets.SocketType]::Dgram,
+        [System.Net.Sockets.ProtocolType]::Udp)
+    try {
+        $sock.Connect('8.8.8.8', 65530)
+        $script:MonitorIp = $sock.LocalEndPoint.Address.ToString()
+    } finally { $sock.Close() }
+} catch { }
+if (-not $script:MonitorIp) {
+    try {
+        $addr = @([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+            Where-Object { $_.AddressFamily -eq 'InterNetwork' -and
+                           -not $_.ToString().StartsWith('169.254') -and
+                           -not $_.ToString().StartsWith('127.') })
+        if ($addr.Count -gt 0) { $script:MonitorIp = $addr[0].ToString() }
+    } catch { }
+}
+
+function Get-MonitorLabel {
+    if ($script:MonitorIp) { '{0} ({1})' -f $script:MonitorName, $script:MonitorIp }
+    else                   { [string]$script:MonitorName }
+}
+
 function Format-NotifyBody {
     # The message people actually read, one block per event:
     #
@@ -702,10 +735,13 @@ function Format-NotifyBody {
         $sev    = $(if ($isDown) { 'Critical' } else { 'Normal' })
         $b = '{0} "{1}" {2}{3}Severity: {4}{3}Timestamp: {5}' -f `
             $icon, $e.Label, $state, $nl, $sev, $e.Time.ToString('yyyy-MM-dd HH:mm:ss')
+        if ($e.Target) { $b += ('{0}IP / Host: {1}' -f $nl, $e.Target) }
         if (-not $isDown -and $e.DownFor) { $b += ('{0}Downtime: {1}' -f $nl, $e.DownFor) }
         $blocks += $b
     }
-    ($blocks -join ($nl + $nl))
+    # which desk PC raised this - once at the end, not on every block, so a
+    # 30-host outage does not repeat it 30 times
+    ($blocks -join ($nl + $nl)) + $nl + $nl + ('Monitored from: {0}' -f (Get-MonitorLabel))
 }
 
 function Expand-CmdTemplate {
@@ -1035,7 +1071,8 @@ function Send-QueuedNotifications {
     $ups   = @($items | Where-Object { $_.Kind -eq 'UP' })
     $where = $env:COMPUTERNAME
     # one event is the normal case, so the subject names the host rather than
-    # counting it
+    # counting it. The monitoring PC goes on the end so the inbox list alone
+    # says which desk raised it.
     $subject = if ($items.Count -eq 1) {
         '{0} "{1}" {2}' -f $(if ($downs.Count) { '[CRITICAL]' } else { '[OK]' }), $items[0].Label,
                             $(if ($downs.Count) { 'Down' } else { 'Up' })
@@ -1046,6 +1083,7 @@ function Send-QueuedNotifications {
     } else {
         '[OK] {0} host(s) Up' -f $ups.Count
     }
+    $subject = '{0} - {1}' -f $subject, $script:MonitorName
 
     $long = Format-NotifyBody $items
 
@@ -2198,9 +2236,8 @@ $miNotify.Add_Click({
         $fake = @([pscustomobject]@{
             Kind = 'DOWN'; Label = 'TEST-HOST'; Target = '0.0.0.0'; Time = Get-Date; DownFor = ''
         })
-        Send-Notification -Subject '[TEST] GCL Ping Monitor' `
-            -BodyLong  ((Format-NotifyBody $fake) + [Environment]::NewLine + [Environment]::NewLine +
-                        ('(test message from {0})' -f $env:COMPUTERNAME)) `
+        Send-Notification -Subject ('[TEST] GCL Ping Monitor - {0}' -f $script:MonitorName) `
+            -BodyLong  (Format-NotifyBody $fake) `
             -BodyShort ('[{0}] GCL Ping Monitor test message' -f $env:COMPUTERNAME) `
             -Events @(@{ Kind = 'DOWN'; Label = 'TEST-HOST'; Target = '0.0.0.0' })
         Write-Event 'NOTIFY    : test message queued'
