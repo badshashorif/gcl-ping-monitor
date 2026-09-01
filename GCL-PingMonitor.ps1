@@ -326,13 +326,11 @@ if (-not $NoUpdate -and -not $script:IsGitCheckout -and $script:Config.AutoUpdat
 
 function Save-Config {
     try {
-        $script:Config.IntervalSeconds = [int]$script:numInterval.Value
-        $script:Config.TimeoutMs       = [int]$script:numTimeout.Value
-        $script:Config.FailThreshold   = [int]$script:numThreshold.Value
-        $script:Config.AlwaysOnTop     = [bool]$script:chkTop.Checked
-        if ($script:chkAutoUpdate) { $script:Config.AutoUpdate = [bool]$script:chkAutoUpdate.Checked }
-        if ($script:TextSize)      { $script:Config.TextSize   = [int]$script:TextSize }
-        if ($script:numLoss)       { $script:Config.LossWindow = [int]$script:numLoss.Value }
+        # interval / timeout / threshold / loss window are written straight into
+        # $script:Config by the settings dialog, so there is nothing to read back
+        if ($script:MnuTop)        { $script:Config.AlwaysOnTop = [bool]$script:MnuTop.Checked }
+        if ($script:MnuAutoUpdate) { $script:Config.AutoUpdate  = [bool]$script:MnuAutoUpdate.Checked }
+        if ($script:TextSize)      { $script:Config.TextSize    = [int]$script:TextSize }
         $script:Config.Hosts = @($script:Hosts | ForEach-Object {
             [pscustomobject]@{ Label = $_.Label; Target = $_.Target; Enabled = [bool]$_.Enabled }
         })
@@ -720,7 +718,17 @@ function Stop-Alarm {
 function Update-Alarm {
     $down   = @($script:Hosts | Where-Object { $_.Enabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
     $active = $down.Count -gt 0
-    if ($script:btnAck) { $script:btnAck.Enabled = $active }
+    if ($script:btnAck) {
+        $script:btnAck.Enabled = $active
+        # the button itself goes red while it has something to acknowledge
+        if ($active) {
+            $script:btnAck.BackColor = [System.Drawing.Color]::FromArgb(200, 30, 30)
+            $script:btnAck.ForeColor = [System.Drawing.Color]::White
+        } else {
+            $script:btnAck.BackColor = [System.Drawing.Color]::Transparent
+            $script:btnAck.ForeColor = [System.Drawing.SystemColors]::ControlText
+        }
+    }
     if ($active -eq $script:AlarmActive) { return }
     $script:AlarmActive = $active
     if ($active) {
@@ -751,6 +759,9 @@ $form.Font          = UiFont
 $form.TopMost       = [bool]$script:Config.AlwaysOnTop
 $form.BackColor     = [System.Drawing.Color]::FromArgb(245, 246, 248)
 
+$script:SizeMap = @(9, 12, 15, 18, 22)
+$script:SizeNames = @('Small', 'Normal', 'Large', 'Extra large', 'TV')
+
 # ---- Banner: the thing you read from across the room ----
 $lblBanner = New-Object System.Windows.Forms.Label
 $lblBanner.Dock      = 'Top'
@@ -758,123 +769,167 @@ $lblBanner.TextAlign = 'MiddleCenter'
 $lblBanner.ForeColor = [System.Drawing.Color]::White
 $lblBanner.BackColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
 $lblBanner.Text      = 'Starting...'
-$form.Controls.Add($lblBanner)
 
-# ---- Toolbar ----
-$panelTop = New-Object System.Windows.Forms.FlowLayoutPanel
-$panelTop.Dock         = 'Top'
-$panelTop.Padding      = New-Object System.Windows.Forms.Padding(8, 6, 8, 6)
-$panelTop.WrapContents = $true
-$panelTop.AutoScroll   = $true
-$panelTop.BackColor    = [System.Drawing.Color]::FromArgb(238, 240, 244)
-$form.Controls.Add($panelTop)
+# ---- Menu bar ---------------------------------------------------------------
+# Everything that is set once and forgotten lives here, so the toolbar only
+# carries what the support desk touches during a shift. That is what keeps the
+# toolbar on one line instead of wrapping into a scrollbar at small text sizes.
+$menu = New-Object System.Windows.Forms.MenuStrip
+$menu.Dock      = 'Top'
+$menu.BackColor = [System.Drawing.Color]::FromArgb(52, 58, 70)
+$menu.ForeColor = [System.Drawing.Color]::White
+$menu.Padding   = New-Object System.Windows.Forms.Padding(6, 2, 6, 2)
+$menu.RenderMode = 'Professional'
+
+function New-Mnu {
+    param([string]$Text, [switch]$Checkable, [switch]$Checked)
+    $i = New-Object System.Windows.Forms.ToolStripMenuItem
+    $i.Text = $Text
+    $i.ForeColor = [System.Drawing.Color]::FromArgb(30, 33, 38)
+    if ($Checkable) { $i.CheckOnClick = $true; $i.Checked = [bool]$Checked }
+    $i
+}
+function New-Sep { New-Object System.Windows.Forms.ToolStripSeparator }
+
+$mFile   = New-Mnu '&Hosts'
+$mView   = New-Mnu '&View'
+$mMon    = New-Mnu '&Monitoring'
+$mSet    = New-Mnu '&Settings'
+$mHelp   = New-Mnu 'Hel&p'
+foreach ($t in @($mFile, $mView, $mMon, $mSet, $mHelp)) { $t.ForeColor = [System.Drawing.Color]::White }
+
+$miAdd     = New-Mnu '&Add host'
+$miEdit    = New-Mnu '&Edit selected...'
+$miToggle  = New-Mnu '&Disable / Enable selected'
+$miRemove  = New-Mnu '&Remove selected'
+$miExit    = New-Mnu 'E&xit'
+[void]$mFile.DropDownItems.AddRange(@($miAdd, $miEdit, $miToggle, $miRemove, (New-Sep), $miExit))
+
+$miSize    = New-Mnu '&Text size'
+$script:SizeItems = @()
+for ($i = 0; $i -lt $script:SizeNames.Count; $i++) {
+    $it = New-Mnu $script:SizeNames[$i]
+    $it.Tag = $script:SizeMap[$i]
+    [void]$miSize.DropDownItems.Add($it)
+    $script:SizeItems += $it
+}
+$miTop     = New-Mnu '&Always on top' -Checkable -Checked:([bool]$script:Config.AlwaysOnTop)
+$miShowLog = New-Mnu 'Show event &log' -Checkable -Checked
+[void]$mView.DropDownItems.AddRange(@($miSize, (New-Sep), $miTop, $miShowLog))
+
+$miPause   = New-Mnu '&Pause monitoring'
+$miTest    = New-Mnu '&Test alarm sound'
+$miMonSet  = New-Mnu '&Monitoring settings...'
+[void]$mMon.DropDownItems.AddRange(@($miPause, $miTest, (New-Sep), $miMonSet))
+
+$miNotify  = New-Mnu '&Notifications...'
+$miExport  = New-Mnu '&Export hosts + settings...'
+$miImport  = New-Mnu '&Import hosts + settings...'
+$miAuto    = New-Mnu 'Auto-&update' -Checkable -Checked:([bool]$script:Config.AutoUpdate)
+$miUpdate  = New-Mnu '&Check for updates now'
+[void]$mSet.DropDownItems.AddRange(@($miNotify, (New-Sep), $miExport, $miImport, (New-Sep), $miAuto, $miUpdate))
+
+$miAbout   = New-Mnu '&About'
+$miFolder  = New-Mnu 'Open &data folder'
+$miRepo    = New-Mnu 'Open &project page'
+[void]$mHelp.DropDownItems.AddRange(@($miAbout, (New-Sep), $miFolder, $miRepo))
+
+[void]$menu.Items.AddRange(@($mFile, $mView, $mMon, $mSet, $mHelp))
+$form.MainMenuStrip = $menu
+
+if ($script:IsGitCheckout) {
+    $miAuto.Enabled = $false; $miUpdate.Enabled = $false
+    $miAuto.Text = 'Auto-update (dev checkout - off)'
+}
+
+# ---- Toolbar: only what gets used during a shift -----------------------------
+# A ToolStrip (not a panel of buttons) because it has real overflow built in:
+# whatever does not fit the window width moves into a ">>" dropdown instead of
+# wrapping onto a second line or growing a scrollbar. That is the responsive bit.
+$panelTop = New-Object System.Windows.Forms.ToolStrip
+$panelTop.Dock        = 'Top'
+$panelTop.GripStyle   = 'Hidden'
+$panelTop.CanOverflow = $true
+$panelTop.LayoutStyle = 'HorizontalStackWithOverflow'
+$panelTop.Padding     = New-Object System.Windows.Forms.Padding(6, 4, 6, 4)
+$panelTop.BackColor   = [System.Drawing.Color]::FromArgb(238, 240, 244)
+$panelTop.RenderMode  = 'System'
 
 $script:UiLabels = New-Object System.Collections.Generic.List[object]
 function New-Lbl($text) {
-    $l = New-Object System.Windows.Forms.Label
-    $l.Text = $text; $l.AutoSize = $true
-    $l.Margin = New-Object System.Windows.Forms.Padding(8, 9, 2, 0)
+    $l = New-Object System.Windows.Forms.ToolStripLabel
+    $l.Text = $text
+    $l.Margin = New-Object System.Windows.Forms.Padding(8, 1, 2, 1)
     $script:UiLabels.Add($l)
     $l
 }
-function New-Btn($text, $w, [switch]$Strong) {
-    $b = New-Object System.Windows.Forms.Button
+$script:UiButtons = New-Object System.Collections.Generic.List[object]
+function New-Btn($text, [switch]$Strong) {
+    $b = New-Object System.Windows.Forms.ToolStripButton
     $b.Text = $text
-    $b.AutoSize = $false
-    $b.Width  = $w
-    $b.Margin = New-Object System.Windows.Forms.Padding(3, 3, 8, 3)
-    $b.FlatStyle = 'System'
+    $b.DisplayStyle = 'Text'
+    $b.AutoSize = $true
+    $b.Margin = New-Object System.Windows.Forms.Padding(3, 1, 6, 1)
+    $b.Padding = New-Object System.Windows.Forms.Padding(8, 3, 8, 3)
     if ($Strong) { $b.Font = UiFont -Bold }
+    $script:UiButtons.Add($b)
     $b
 }
+function New-Txt($chars) {
+    $t = New-Object System.Windows.Forms.ToolStripTextBox
+    $t.Margin = New-Object System.Windows.Forms.Padding(2, 1, 6, 1)
+    $t.BorderStyle = 'FixedSingle'
+    $t.Tag = $chars                       # width in characters, resized by text size
+    $t
+}
+function New-TSep {
+    $s = New-Object System.Windows.Forms.ToolStripSeparator
+    $s.Margin = New-Object System.Windows.Forms.Padding(6, 0, 6, 0)
+    $s
+}
 
-$txtLabel  = New-Object System.Windows.Forms.TextBox
-$txtLabel.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
+$txtLabel  = New-Txt 13
+$txtTarget = New-Txt 14
+$btnAdd    = New-Btn 'Add'
 
-$txtTarget = New-Object System.Windows.Forms.TextBox
-$txtTarget.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
+$txtSearch      = New-Txt 14
+$btnClearSearch = New-Btn 'x'
 
-$btnAdd    = New-Btn 'Add'              70
-$btnEdit   = New-Btn 'Edit'             70
-$btnToggle = New-Btn 'Disable / Enable' 150
-$btnRemove = New-Btn 'Remove'           90
-
-$txtSearch = New-Object System.Windows.Forms.TextBox
-$txtSearch.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
-
-$btnClearSearch = New-Btn 'x' 34
-
-$btnAck  = New-Btn 'ACKNOWLEDGE ALARM' 210 -Strong
+$btnAck  = New-Btn 'ACKNOWLEDGE' -Strong
 $btnAck.Enabled = $false
+$btnAck.ToolTipText = 'Silence the alarm (a NEW host going down re-arms it)'
 
-$btnPause = New-Btn 'Pause'      90
-$btnTest  = New-Btn 'Test sound' 110
-
-$numInterval = New-Object System.Windows.Forms.NumericUpDown
-$numInterval.Minimum = 2; $numInterval.Maximum = 3600
-$numInterval.Value = [Math]::Min([Math]::Max([int]$script:Config.IntervalSeconds,2),3600)
-$numInterval.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
-
-$numTimeout = New-Object System.Windows.Forms.NumericUpDown
-$numTimeout.Minimum = 200; $numTimeout.Maximum = 10000; $numTimeout.Increment = 100
-$numTimeout.Value = [Math]::Min([Math]::Max([int]$script:Config.TimeoutMs,200),10000)
-$numTimeout.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
-
-$numThreshold = New-Object System.Windows.Forms.NumericUpDown
-$numThreshold.Minimum = 1; $numThreshold.Maximum = 10
-$numThreshold.Value = [Math]::Min([Math]::Max([int]$script:Config.FailThreshold,1),10)
-$numThreshold.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
-
-$numLoss = New-Object System.Windows.Forms.NumericUpDown
-$numLoss.Minimum = 5; $numLoss.Maximum = 5000; $numLoss.Increment = 10
-$numLoss.Value = [Math]::Min([Math]::Max([int]$script:Config.LossWindow,5),5000)
-$numLoss.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
-
-$cboSize = New-Object System.Windows.Forms.ComboBox
-$cboSize.DropDownStyle = 'DropDownList'
-$cboSize.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
-[void]$cboSize.Items.AddRange(@('Small', 'Normal', 'Large', 'Extra large', 'TV'))
-# NOTE: not a switch - a PowerShell switch runs EVERY matching clause, so
-# overlapping "-le" conditions would return an array, not an index.
-$script:SizeMap = @(9, 12, 15, 18, 22)
-$idx = 1
-for ($i = 0; $i -lt $script:SizeMap.Count; $i++) { if ($script:TextSize -le $script:SizeMap[$i]) { $idx = $i; break } }
-if ($script:TextSize -gt $script:SizeMap[-1]) { $idx = $script:SizeMap.Count - 1 }
-$cboSize.SelectedIndex = $idx
-
-$chkTop = New-Object System.Windows.Forms.CheckBox
-$chkTop.Text = 'Always on top'; $chkTop.AutoSize = $true
-$chkTop.Checked = [bool]$script:Config.AlwaysOnTop
-$chkTop.Margin = New-Object System.Windows.Forms.Padding(10, 8, 6, 0)
-
-$chkAutoUpdate = New-Object System.Windows.Forms.CheckBox
-$chkAutoUpdate.Text = 'Auto-update'; $chkAutoUpdate.AutoSize = $true
-$chkAutoUpdate.Checked = [bool]$script:Config.AutoUpdate
-$chkAutoUpdate.Margin = New-Object System.Windows.Forms.Padding(10, 8, 6, 0)
-
-$btnNotify = New-Btn 'Notifications...' 150
-$btnUpdate = New-Btn 'Check for updates' 160
+$btnPause = New-Btn 'Pause'
 
 # becomes visible only after a newer version has been downloaded in the background
-$btnRestartNow = New-Btn 'RESTART to apply update' 230 -Strong
+$btnRestartNow = New-Btn 'RESTART to apply update' -Strong
 $btnRestartNow.Visible   = $false
 $btnRestartNow.BackColor = [System.Drawing.Color]::Gold
 
-if ($script:IsGitCheckout) { $chkAutoUpdate.Enabled = $false; $btnUpdate.Enabled = $false; $chkAutoUpdate.Text = 'Auto-update (dev checkout - off)' }
+# these must never disappear into the ">>" overflow, however narrow the window:
+# acknowledging an alarm you cannot see the button for is the whole problem
+$btnAck.Overflow        = 'Never'
+$btnPause.Overflow      = 'Never'
+$btnRestartNow.Overflow = 'Never'
 
-$panelTop.Controls.AddRange(@(
+[void]$panelTop.Items.AddRange(@(
     (New-Lbl 'Name:'), $txtLabel,
-    (New-Lbl 'IP / host:'), $txtTarget,
-    $btnAdd, $btnEdit, $btnToggle, $btnRemove,
+    (New-Lbl 'IP / host:'), $txtTarget, $btnAdd,
+    (New-TSep),
     (New-Lbl 'Search:'), $txtSearch, $btnClearSearch,
-    $btnAck, $btnPause, $btnTest,
-    (New-Lbl 'Interval s:'), $numInterval,
-    (New-Lbl 'Timeout ms:'), $numTimeout,
-    (New-Lbl 'Fails->down:'), $numThreshold,
-    (New-Lbl 'Loss over:'), $numLoss,
-    (New-Lbl 'Text:'), $cboSize,
-    $chkTop, $chkAutoUpdate, $btnNotify, $btnUpdate, $btnRestartNow
+    (New-TSep),
+    $btnAck, $btnPause, $btnRestartNow
 ))
+
+# Edit / Disable / Remove live on the right-click menu and the Hosts menu -
+# keeping them off the toolbar is what lets it stay on a single line.
+$ctx = New-Object System.Windows.Forms.ContextMenuStrip
+$ctx.Font = UiFont
+$cmEdit   = New-Mnu '&Edit host...'
+$cmToggle = New-Mnu '&Disable / Enable'
+$cmRemove = New-Mnu '&Remove'
+$cmAck    = New-Mnu '&Acknowledge alarm'
+[void]$ctx.Items.AddRange(@($cmEdit, $cmToggle, $cmRemove, (New-Sep), $cmAck))
 
 # ---- Split: grid on top, log on bottom ----
 $split = New-Object System.Windows.Forms.SplitContainer
@@ -882,8 +937,6 @@ $split.Dock = 'Fill'
 $split.Orientation = 'Horizontal'
 $split.Panel1MinSize = 120
 $split.Panel2MinSize = 80
-$form.Controls.Add($split)
-$split.BringToFront()
 
 # A fixed SplitterDistance set before the control is laid out ends up wrong once
 # the form has its real size - that is how the log panel got squashed to one
@@ -936,6 +989,7 @@ $grid.Columns['cLat'].FillWeight    = 62
 $grid.Columns['cLoss'].FillWeight   = 62
 $grid.Columns['cSince'].FillWeight  = 90
 $grid.Columns['cDown'].FillWeight   = 70
+$grid.ContextMenuStrip = $ctx
 $split.Panel1.Controls.Add($grid)
 
 $txtLog = New-Object System.Windows.Forms.TextBox
@@ -959,23 +1013,18 @@ function Apply-TextSize {
 
     $form.SuspendLayout()
     $form.Font        = UiFont
+    $menu.Font        = UiFont
+    $panelTop.Font    = UiFont
     $lblBanner.Font   = UiFont 1.75 -Bold
     $lblBanner.Height = [int]($s * 3.4)
-    $panelTop.Height  = [int]($s * 8.0)
 
-    $txtLabel.Width  = [int]($s * 13)
-    $txtTarget.Width = [int]($s * 14)
-    $txtSearch.Width = [int]($s * 14)
-    foreach ($n in @($numInterval, $numTimeout, $numThreshold)) { $n.Width = [int]($s * 6.5) }
-    $numLoss.Width = [int]($s * 7.5)
-    $cboSize.Width = [int]($s * 11)
-
+    foreach ($t in @($txtLabel, $txtTarget, $txtSearch)) {
+        $t.Font = UiFont
+        $t.Size = New-Object System.Drawing.Size([int]($s * [double]$t.Tag), [int]($s * 2.0))
+    }
     $btnAck.Font        = UiFont -Bold
     $btnRestartNow.Font = UiFont -Bold
-    foreach ($b in @($btnAdd, $btnEdit, $btnToggle, $btnRemove, $btnClearSearch, $btnAck,
-                     $btnPause, $btnTest, $btnNotify, $btnUpdate, $btnRestartNow)) {
-        $b.Height = [int]($s * 2.6)
-    }
+    $panelTop.PerformLayout()
 
     $grid.ColumnHeadersDefaultCellStyle.Font = UiFont 1.0 -Bold
     $grid.ColumnHeadersHeight = [int]($s * 2.8)
@@ -986,6 +1035,7 @@ function Apply-TextSize {
     $txtLog.Font = New-Object System.Drawing.Font('Consolas', [single][Math]::Max($s - 2, 8))
     $status.Font = UiFont
     $form.ResumeLayout()
+    foreach ($it in $script:SizeItems) { $it.Checked = ([int]$it.Tag -eq $s) }
     Refresh-Grid
 }
 
@@ -996,7 +1046,16 @@ $lblCounts.Spring = $true
 $lblCounts.TextAlign = 'MiddleLeft'
 $lblClock = New-Object System.Windows.Forms.ToolStripStatusLabel
 $status.Items.AddRange(@($lblCounts, $lblClock))
-$form.Controls.Add($status)
+
+# ---- Dock order matters -----------------------------------------------------
+# Docking is applied from the HIGHEST z-index (last added) to the lowest, and
+# the lowest-index control gets whatever space is left. So add the Fill control
+# FIRST and the outermost edges LAST:  menu | toolbar | banner | grid | status
+$form.Controls.Add($split)      # Fill  - added first, gets the remainder
+$form.Controls.Add($lblBanner)  # Top
+$form.Controls.Add($panelTop)   # Top   - above the banner
+$form.Controls.Add($menu)       # Top   - very top
+$form.Controls.Add($status)     # Bottom
 
 # ---------------------------------------------------------------------------
 #  Grid refresh
@@ -1108,7 +1167,11 @@ function Refresh-Grid {
 
         $row.Cells['cStatus'].Value = $statusText
         $row.Cells['cLat'].Value    = if ($h.Enabled -and $h.Status -eq 'UP' -and $null -ne $h.Latency) { "$($h.Latency) ms" } else { '' }
-        $row.Cells['cSince'].Value  = if ($h.LastChange) { $h.LastChange.ToString('MM-dd HH:mm:ss') } else { '' }
+        # today needs no date - that is what keeps this column readable at TV size
+        $row.Cells['cSince'].Value  = if ($h.LastChange) {
+            if ($h.LastChange.Date -eq [DateTime]::Today) { $h.LastChange.ToString('HH:mm:ss') }
+            else { $h.LastChange.ToString('MM-dd HH:mm') }
+        } else { '' }
         $row.Cells['cDown'].Value   = if ($h.Enabled -and $h.Status -eq 'DOWN' -and $h.DownSince) { Format-Duration ((Get-Date) - $h.DownSince) } else { '' }
 
         $loss = Get-LossPercent $h
@@ -1189,7 +1252,7 @@ function Refresh-Status {
     $shown = $grid.Rows.Count
     $filter = if ($shown -ne $script:Hosts.Count) { ("    |    showing {0} of {1}" -f $shown, $script:Hosts.Count) } else { '' }
     $lblCounts.Text = ('UP: {0}    DOWN: {1}    other: {2}    disabled: {3}    |    every {4}s{5}{6}' -f `
-        $up, $down, $oth, $off, [int]$script:numInterval.Value, $(if ($script:Paused) { '   [PAUSED]' } else { '' }), $filter)
+        $up, $down, $oth, $off, [int]$script:Config.IntervalSeconds, $(if ($script:Paused) { '   [PAUSED]' } else { '' }), $filter)
     $upd = if ($script:UpdatePending) { '  |  update ready - restart' }
            elseif ($script:LastUpdateCheck) { '  |  upd chk ' + $script:LastUpdateCheck.ToString('HH:mm') }
            else { '' }
@@ -1309,10 +1372,72 @@ function Edit-SelectedHost {
     Start-CheckCycle
 }
 
-$btnEdit.Add_Click({ Edit-SelectedHost })
+function Get-SelectedHosts {
+    @($grid.SelectedRows | ForEach-Object { $_.Tag } | Where-Object { $_ })
+}
+
+function Toggle-SelectedHosts {
+    $sel = Get-SelectedHosts
+    if ($sel.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('Select one or more hosts first.', 'Enable / disable', 'OK', 'Information') | Out-Null
+        return
+    }
+    foreach ($h in $sel) {
+        $h.Enabled = -not $h.Enabled
+        $h.StyleKey = ''
+        $h.FailCount = 0; $h.Acked = $false
+        $h.DownSince = $null; $h.Latency = $null; $h.LastChange = Get-Date
+        if ($h.Enabled) {
+            $h.Status = 'INIT'
+            Reset-HostStats $h            # loss % from before the outage is meaningless
+            Write-Event ("ENABLED   : {0} [{1}]" -f $h.Label, $h.Target)
+        } else {
+            $h.Status = 'OFF'
+            $h.Task = $null; $h.Ping = $null
+            Write-Event ("DISABLED  : {0} [{1}] - not monitored, no alarm" -f $h.Label, $h.Target)
+        }
+    }
+    Save-Config; Rebuild-Grid; Update-Alarm; Refresh-Banner
+    $script:CycleRunning = $false
+    Start-CheckCycle
+}
+
+function Remove-SelectedHosts {
+    $sel = Get-SelectedHosts
+    if ($sel.Count -eq 0) { return }
+    $msg = if ($sel.Count -eq 1) { "Remove '$($sel[0].Label)'?" } else { "Remove $($sel.Count) hosts?" }
+    if ([System.Windows.Forms.MessageBox]::Show($msg, 'Confirm', 'YesNo', 'Question') -ne 'Yes') { return }
+    foreach ($h in $sel) {
+        $script:Hosts.Remove($h) | Out-Null
+        Write-Event ("REMOVED   : {0} [{1}]" -f $h.Label, $h.Target)
+    }
+    Save-Config; Rebuild-Grid; Update-Alarm; Refresh-Banner
+}
+
+function Confirm-Alarm {
+    $down = @($script:Hosts | Where-Object { $_.Enabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
+    if ($down.Count -eq 0) { return }
+    foreach ($h in $down) { $h.Acked = $true; $h.StyleKey = '' }
+    Write-Event ("ACK       : alarm acknowledged ({0} host(s) still down)" -f $down.Count)
+    Update-Alarm; Refresh-Grid; Refresh-Banner
+}
+
+function Toggle-Pause {
+    $script:Paused = -not $script:Paused
+    $btnPause.Text = if ($script:Paused) { 'Resume' } else { 'Pause' }
+    $miPause.Text  = if ($script:Paused) { '&Resume monitoring' } else { '&Pause monitoring' }
+    Write-Event ('MONITOR   : {0}' -f $(if ($script:Paused) { 'paused' } else { 'resumed' }))
+    if (-not $script:Paused) { Start-CheckCycle }
+    Refresh-Banner; Refresh-Status
+}
+
+$cmEdit.Add_Click({ Edit-SelectedHost })
+$cmToggle.Add_Click({ Toggle-SelectedHosts })
+$cmRemove.Add_Click({ Remove-SelectedHosts })
+$cmAck.Add_Click({ Confirm-Alarm })
 
 # ---- Notification settings dialog -------------------------------------------
-$btnNotify.Add_Click({
+$miNotify.Add_Click({
     $n = $script:Config.Notify
     $s = $script:TextSize
     $dlg = New-Object System.Windows.Forms.Form
@@ -1502,103 +1627,261 @@ $btnNotify.Add_Click({
 })
 $grid.Add_CellDoubleClick({ if ($_.RowIndex -ge 0) { Edit-SelectedHost } })
 
-# ---- Enable / disable --------------------------------------------------------
-$btnToggle.Add_Click({
-    $sel = @($grid.SelectedRows | ForEach-Object { $_.Tag } | Where-Object { $_ })
-    if ($sel.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show('Select one or more hosts first.', 'Enable / disable', 'OK', 'Information') | Out-Null
-        return
-    }
-    foreach ($h in $sel) {
-        $h.Enabled = -not $h.Enabled
-        $h.StyleKey = ''
-        if ($h.Enabled) {
-            $h.Status = 'INIT'; $h.FailCount = 0; $h.Acked = $false
-            $h.DownSince = $null; $h.Latency = $null; $h.LastChange = Get-Date
-            Reset-HostStats $h            # loss % from before the outage is meaningless
-            Write-Event ("ENABLED   : {0} [{1}]" -f $h.Label, $h.Target)
-        } else {
-            $h.Status = 'OFF'; $h.FailCount = 0; $h.Acked = $false
-            $h.DownSince = $null; $h.Latency = $null; $h.LastChange = Get-Date
-            $h.Task = $null; $h.Ping = $null
-            Write-Event ("DISABLED  : {0} [{1}] - not monitored, no alarm" -f $h.Label, $h.Target)
-        }
-    }
-    Save-Config
-    Rebuild-Grid
-    Update-Alarm
-    Refresh-Banner
-    $script:CycleRunning = $false
-    Start-CheckCycle
-})
-
 # ---- Search ------------------------------------------------------------------
 $txtSearch.Add_TextChanged({ Refresh-Grid; Refresh-Status })
 $txtSearch.Add_KeyDown({ if ($_.KeyCode -eq 'Escape') { $_.SuppressKeyPress = $true; $txtSearch.Clear() } })
 $btnClearSearch.Add_Click({ $txtSearch.Clear(); $txtSearch.Focus() })
 
-$btnRemove.Add_Click({
-    $sel = @($grid.SelectedRows | ForEach-Object { $_.Tag } | Where-Object { $_ })
-    if ($sel.Count -eq 0) { return }
-    $msg = if ($sel.Count -eq 1) { "Remove '$($sel[0].Label)'?" } else { "Remove $($sel.Count) hosts?" }
-    if ([System.Windows.Forms.MessageBox]::Show($msg, 'Confirm', 'YesNo', 'Question') -ne 'Yes') { return }
-    foreach ($h in $sel) {
-        $script:Hosts.Remove($h) | Out-Null
-        Write-Event ("REMOVED   : {0} [{1}]" -f $h.Label, $h.Target)
-    }
-    Save-Config
-    Rebuild-Grid
-    Update-Alarm
-    Refresh-Banner
-})
+$btnAck.Add_Click({ Confirm-Alarm })
+$btnPause.Add_Click({ Toggle-Pause })
 
-$btnAck.Add_Click({
-    $down = @($script:Hosts | Where-Object { $_.Enabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
-    if ($down.Count -eq 0) { return }
-    foreach ($h in $down) { $h.Acked = $true; $h.StyleKey = '' }
-    Write-Event ("ACK       : alarm acknowledged ({0} host(s) still down)" -f $down.Count)
-    Update-Alarm
-    Refresh-Grid
-    Refresh-Banner
-})
-
-$btnPause.Add_Click({
-    $script:Paused = -not $script:Paused
-    $btnPause.Text = if ($script:Paused) { 'Resume' } else { 'Pause' }
-    Write-Event ('MONITOR   : {0}' -f $(if ($script:Paused) { 'paused' } else { 'resumed' }))
-    if (-not $script:Paused) { Start-CheckCycle }
-    Refresh-Banner
-    Refresh-Status
-})
-
-$btnTest.Add_Click({
+function Test-AlarmSound {
     Play-Alarm
     $src = if ($script:Player) { Split-Path $script:AlarmWavPath -Leaf } else { 'system sound (Windows sounds may be off!)' }
     Write-Event ("TEST      : played alarm - source: {0}" -f $src)
-})
+}
 
-$numInterval.Add_ValueChanged({ $script:checkTimer.Interval = [int]$numInterval.Value * 1000; Save-Config; Refresh-Status })
-$numTimeout.Add_ValueChanged({ Save-Config })
-$numThreshold.Add_ValueChanged({ Save-Config })
-$numLoss.Add_ValueChanged({
-    $script:Config.LossWindow = [int]$numLoss.Value
-    foreach ($h in $script:Hosts) { $h.StyleKey = '' }
-    Save-Config
-})
 $split.Add_SplitterMoved({
-    if ($split.Height -gt 0) {
+    if ($split.Height -gt 0 -and $split.Panel2Collapsed -eq $false) {
         $script:Config.SplitPercent = [int](100.0 * $split.SplitterDistance / $split.Height)
         Save-Config
     }
 })
-$chkTop.Add_CheckedChanged({ $form.TopMost = $chkTop.Checked; Save-Config })
-$chkAutoUpdate.Add_CheckedChanged({ Save-Config })
-$cboSize.Add_SelectedIndexChanged({
-    Apply-TextSize $script:SizeMap[$cboSize.SelectedIndex]
+
+# ---- Monitoring settings dialog ---------------------------------------------
+function Show-MonitoringSettings {
+    $s = $script:TextSize
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Monitoring settings'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $dlg.Font = UiFont
+    $dlg.ClientSize = New-Object System.Drawing.Size([int]($s * 40), [int]($s * 21))
+
+    $y = [int]($s * 1.2)
+    function Row { param($text, $ctrl, $hint)
+        $l = New-Object System.Windows.Forms.Label
+        $l.Text = $text; $l.AutoSize = $true
+        $l.Location = New-Object System.Drawing.Point([int]($script:TextSize*1.2), [int]($script:dY + $script:TextSize*0.4))
+        $ctrl.Location = New-Object System.Drawing.Point([int]($script:TextSize*14), [int]$script:dY)
+        $ctrl.Width = [int]($script:TextSize * 8)
+        $h = New-Object System.Windows.Forms.Label
+        $h.Text = $hint; $h.AutoSize = $true
+        $h.ForeColor = [System.Drawing.Color]::FromArgb(110,114,120)
+        $h.Location = New-Object System.Drawing.Point([int]($script:TextSize*23), [int]($script:dY + $script:TextSize*0.4))
+        $dlg.Controls.AddRange(@($l, $ctrl, $h))
+        $script:dY += [int]($script:TextSize * 3.2)
+    }
+    $script:dY = $y
+
+    $nI = New-Object System.Windows.Forms.NumericUpDown; $nI.Minimum=2; $nI.Maximum=3600
+    $nI.Value = [Math]::Min([Math]::Max([int]$script:Config.IntervalSeconds,2),3600)
+    Row 'Interval (sec)' $nI 'how often every host is pinged'
+
+    $nT = New-Object System.Windows.Forms.NumericUpDown; $nT.Minimum=200; $nT.Maximum=10000; $nT.Increment=100
+    $nT.Value = [Math]::Min([Math]::Max([int]$script:Config.TimeoutMs,200),10000)
+    Row 'Timeout (ms)' $nT 'how long to wait for a reply'
+
+    $nF = New-Object System.Windows.Forms.NumericUpDown; $nF.Minimum=1; $nF.Maximum=10
+    $nF.Value = [Math]::Min([Math]::Max([int]$script:Config.FailThreshold,1),10)
+    Row 'Fails -> DOWN' $nF 'flap guard before raising the alarm'
+
+    $nL = New-Object System.Windows.Forms.NumericUpDown; $nL.Minimum=5; $nL.Maximum=5000; $nL.Increment=10
+    $nL.Value = [Math]::Min([Math]::Max([int]$script:Config.LossWindow,5),5000)
+    Row 'Loss over (pings)' $nL 'window the Loss % is measured across'
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'Save'; $ok.DialogResult = 'OK'
+    $ok.Location = New-Object System.Drawing.Point([int]($s*23), [int]($s*17.2))
+    $ok.Size = New-Object System.Drawing.Size([int]($s*7.5), [int]($s*2.6))
+    $cn = New-Object System.Windows.Forms.Button
+    $cn.Text = 'Cancel'; $cn.DialogResult = 'Cancel'
+    $cn.Location = New-Object System.Drawing.Point([int]($s*31), [int]($s*17.2))
+    $cn.Size = New-Object System.Drawing.Size([int]($s*7.5), [int]($s*2.6))
+    $dlg.Controls.AddRange(@($ok, $cn))
+    $dlg.AcceptButton = $ok; $dlg.CancelButton = $cn
+
+    if ($dlg.ShowDialog($form) -eq 'OK') {
+        $script:Config.IntervalSeconds = [int]$nI.Value
+        $script:Config.TimeoutMs       = [int]$nT.Value
+        $script:Config.FailThreshold   = [int]$nF.Value
+        $script:Config.LossWindow      = [int]$nL.Value
+        $script:checkTimer.Interval    = [int]$nI.Value * 1000
+        foreach ($h in $script:Hosts) { $h.StyleKey = '' }
+        Save-Config
+        Refresh-Status
+        Write-Event ('MONITOR   : settings - every {0}s, timeout {1}ms, {2} fails to DOWN, loss over {3}' -f `
+            $nI.Value, $nT.Value, $nF.Value, $nL.Value)
+    }
+    $dlg.Dispose()
+}
+
+# ---- Export / import (backup & recovery) ------------------------------------
+function Export-Settings {
     Save-Config
-    Refresh-Banner
-    Refresh-Status
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Title    = 'Export hosts and settings'
+    $dlg.Filter   = 'GCL Ping Monitor backup (*.json)|*.json|All files (*.*)|*.*'
+    $dlg.FileName = 'gcl-ping-monitor-backup-{0}-{1}.json' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd-HHmm')
+    if ($dlg.ShowDialog($form) -ne 'OK') { return }
+    try {
+        $payload = [pscustomobject]@{
+            _app        = 'GCL Ping Monitor'
+            _exportedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            _exportedOn = $env:COMPUTERNAME
+            _exportedBy = $env:USERNAME
+            _note       = 'Notification passwords/tokens are DPAPI-encrypted. They restore only on the SAME Windows user and machine; on any other PC re-enter them in Notifications.'
+            config      = $script:Config
+        }
+        $payload | ConvertTo-Json -Depth 8 | Set-Content -Path $dlg.FileName -Encoding UTF8
+        Write-Event ('BACKUP    : exported {0} host(s) to {1}' -f $script:Hosts.Count, $dlg.FileName)
+        [System.Windows.Forms.MessageBox]::Show(
+            ("Exported {0} host(s) and all settings to:`r`n`r`n{1}" -f $script:Hosts.Count, $dlg.FileName),
+            'Export complete', 'OK', 'Information') | Out-Null
+    } catch {
+        Write-Event ('BACKUP err: export - {0}' -f $_.Exception.Message)
+        [System.Windows.Forms.MessageBox]::Show(("Export failed:`r`n{0}" -f $_.Exception.Message), 'Export', 'OK', 'Error') | Out-Null
+    }
+}
+
+function Import-Settings {
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title  = 'Import hosts and settings'
+    $dlg.Filter = 'GCL Ping Monitor backup (*.json)|*.json|All files (*.*)|*.*'
+    if ($dlg.ShowDialog($form) -ne 'OK') { return }
+
+    try { $raw = Get-Content $dlg.FileName -Raw -ErrorAction Stop | ConvertFrom-Json }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show(("That file is not valid JSON:`r`n{0}" -f $_.Exception.Message), 'Import', 'OK', 'Error') | Out-Null
+        return
+    }
+
+    # accept both a full backup file and a bare config.json
+    $cfg = if ($raw.config) { $raw.config } else { $raw }
+    $incoming = @($cfg.Hosts | Where-Object { $_ -and $_.Target })
+    if ($incoming.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('No hosts found in that file.', 'Import', 'OK', 'Warning') | Out-Null
+        return
+    }
+
+    $ans = [System.Windows.Forms.MessageBox]::Show(
+        ("Found {0} host(s) in the file.`r`n`r`nYES  - replace everything (hosts AND settings)`r`nNO   - only add hosts that are not already in the list`r`nCANCEL - do nothing" -f $incoming.Count),
+        'Import', 'YesNoCancel', 'Question')
+    if ($ans -eq 'Cancel') { return }
+
+    if ($ans -eq 'Yes') {
+        foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','AutoUpdate','UpdateHours','TextSize','LossWindow','SplitPercent') {
+            if ($null -ne $cfg.$p) { $script:Config.$p = $cfg.$p }
+        }
+        if ($cfg.Notify) { $script:Config.Notify = $cfg.Notify }
+        $script:Hosts.Clear()
+        foreach ($c in $incoming) {
+            $en = if ($null -eq $c.Enabled) { $true } else { [bool]$c.Enabled }
+            $h  = New-HostState -Label ([string]$c.Label) -Target ([string]$c.Target) -Enabled $en
+            if (-not $en) { $h.Status = 'OFF' }
+            $script:Hosts.Add($h)
+        }
+        $added = $incoming.Count
+        $script:MnuTop.Checked        = [bool]$script:Config.AlwaysOnTop
+        $script:MnuAutoUpdate.Checked = [bool]$script:Config.AutoUpdate
+        $form.TopMost = [bool]$script:Config.AlwaysOnTop
+        $script:checkTimer.Interval = [Math]::Max([int]$script:Config.IntervalSeconds, 2) * 1000
+        $script:notifyTimer.Interval = [Math]::Max([int]$script:Config.Notify.BatchSeconds, 5) * 1000
+        Apply-TextSize ([int]$script:Config.TextSize)
+        Write-Event ('BACKUP    : imported {0} host(s) + settings (replaced) from {1}' -f $added, $dlg.FileName)
+    }
+    else {
+        $added = 0
+        foreach ($c in $incoming) {
+            $t = [string]$c.Target
+            if (@($script:Hosts | Where-Object { $_.Target -eq $t }).Count -gt 0) { continue }
+            $en = if ($null -eq $c.Enabled) { $true } else { [bool]$c.Enabled }
+            $h  = New-HostState -Label ([string]$c.Label) -Target $t -Enabled $en
+            if (-not $en) { $h.Status = 'OFF' }
+            $script:Hosts.Add($h)
+            $added++
+        }
+        Write-Event ('BACKUP    : imported {0} new host(s) from {1} ({2} already present)' -f $added, $dlg.FileName, ($incoming.Count - $added))
+    }
+
+    Save-Config; Rebuild-Grid; Update-Alarm; Refresh-Banner; Refresh-Status
+    $script:CycleRunning = $false
+    Start-CheckCycle
+    [System.Windows.Forms.MessageBox]::Show(("Imported {0} host(s)." -f $added), 'Import complete', 'OK', 'Information') | Out-Null
+}
+
+# ---- About -------------------------------------------------------------------
+function Show-About {
+    $s = $script:TextSize
+    $ver = $script:Version
+    $chan = if ($script:IsGitCheckout) { 'dev checkout (auto-update off)' } else { 'auto-update from GitHub' }
+    $msg = @"
+GCL Ping Monitor
+version  $ver
+
+A ping monitor with an audible alarm for the support desk.
+
+Installed  : $($script:ScriptDir)
+Data       : $($script:AppDir)
+Updates    : $chan
+Project    : https://github.com/$($script:Repo)
+
+PowerShell $($PSVersionTable.PSVersion)  on  $([Environment]::OSVersion.VersionString)
+
+Built for Grameen Cybernet / WeTechi. MIT licensed.
+"@
+    [System.Windows.Forms.MessageBox]::Show($msg, 'About GCL Ping Monitor', 'OK', 'Information') | Out-Null
+}
+
+function Invoke-UpdateCheck {
+    $miUpdate.Enabled = $false
+    try {
+        $r = Invoke-SelfUpdate
+        $script:LastUpdateCheck = Get-Date
+        if ($r) {
+            $script:UpdatePending = $true
+            $btnRestartNow.Visible = $true
+            Write-Event 'UPDATE    : new version downloaded (manual check) - restart to apply'
+            [System.Windows.Forms.MessageBox]::Show('A new version was downloaded. Click "RESTART to apply update" when ready.', 'Update ready', 'OK', 'Information') | Out-Null
+        } else {
+            Write-Event 'UPDATE    : already up to date'
+            [System.Windows.Forms.MessageBox]::Show('Already running the latest version.', 'Up to date', 'OK', 'Information') | Out-Null
+        }
+    } finally { $miUpdate.Enabled = $true }
+}
+
+# ---- Menu wiring -------------------------------------------------------------
+$miAdd.Add_Click({ $txtLabel.Focus() })
+$miEdit.Add_Click({ Edit-SelectedHost })
+$miToggle.Add_Click({ Toggle-SelectedHosts })
+$miRemove.Add_Click({ Remove-SelectedHosts })
+$miExit.Add_Click({ $form.Close() })
+
+foreach ($it in $script:SizeItems) {
+    $it.Add_Click({
+        Apply-TextSize ([int]$this.Tag)
+        Save-Config; Refresh-Banner; Refresh-Status
+    })
+}
+$miTop.Add_Click({ $form.TopMost = $miTop.Checked; Save-Config })
+$miShowLog.Add_Click({
+    $split.Panel2Collapsed = -not $miShowLog.Checked
+    if ($miShowLog.Checked) { Apply-SplitPercent }
 })
+
+$miPause.Add_Click({ Toggle-Pause })
+$miTest.Add_Click({ Test-AlarmSound })
+$miMonSet.Add_Click({ Show-MonitoringSettings })
+
+$miAuto.Add_Click({ Save-Config })
+$miUpdate.Add_Click({ Invoke-UpdateCheck })
+$miExport.Add_Click({ Export-Settings })
+$miImport.Add_Click({ Import-Settings })
+
+$miAbout.Add_Click({ Show-About })
+$miFolder.Add_Click({ try { Start-Process explorer.exe $script:AppDir } catch { } })
+$miRepo.Add_Click({ try { Start-Process ("https://github.com/{0}" -f $script:Repo) } catch { } })
 
 function Restart-Self {
     try { Save-Config } catch { }
@@ -1612,33 +1895,11 @@ function Restart-Self {
 
 $btnRestartNow.Add_Click({ Restart-Self })
 
-$btnUpdate.Add_Click({
-    $btnUpdate.Enabled = $false
-    $old = $btnUpdate.Text
-    $btnUpdate.Text = 'Checking...'
-    try {
-        $r = Invoke-SelfUpdate
-        $script:LastUpdateCheck = Get-Date
-        if ($r) {
-            $script:UpdatePending = $true
-            $btnRestartNow.Visible = $true
-            Write-Event 'UPDATE    : new version downloaded (manual check) - restart to apply'
-            [System.Windows.Forms.MessageBox]::Show('A new version was downloaded. Click "RESTART to apply update" when ready.', 'Update ready', 'OK', 'Information') | Out-Null
-        } else {
-            Write-Event 'UPDATE    : already up to date'
-            [System.Windows.Forms.MessageBox]::Show('Already running the latest version.', 'Up to date', 'OK', 'Information') | Out-Null
-        }
-    } finally {
-        $btnUpdate.Text = $old
-        $btnUpdate.Enabled = $true
-    }
-})
-
 # ---------------------------------------------------------------------------
 #  Timers
 # ---------------------------------------------------------------------------
 $script:checkTimer = New-Object System.Windows.Forms.Timer
-$script:checkTimer.Interval = [Math]::Max([int]$numInterval.Value,2) * 1000
+$script:checkTimer.Interval = [Math]::Max([int]$script:Config.IntervalSeconds,2) * 1000
 $script:checkTimer.Add_Tick({ try { Start-CheckCycle } catch { Write-Event "ERR check: $($_.Exception.Message)" } })
 
 $script:uiTimer = New-Object System.Windows.Forms.Timer
@@ -1679,7 +1940,7 @@ $script:updateTimer.Interval = $script:UpdateHoursMs
 $script:updateTimer.Add_Tick({
     try {
         if ($script:IsGitCheckout) { return }
-        if (-not $script:chkAutoUpdate.Checked) { return }
+        if (-not $script:MnuAutoUpdate.Checked) { return }
         if ($script:UpdatePending) { return }
         $script:LastUpdateCheck = Get-Date
         if (Invoke-SelfUpdate -Silent) {
@@ -1693,15 +1954,11 @@ $script:updateTimer.Add_Tick({
 # ---------------------------------------------------------------------------
 #  Wire up / start
 # ---------------------------------------------------------------------------
-$script:numInterval   = $numInterval
-$script:numTimeout    = $numTimeout
-$script:numThreshold  = $numThreshold
-$script:chkTop        = $chkTop
 $script:btnAck        = $btnAck
-$script:chkAutoUpdate = $chkAutoUpdate
+$script:MnuTop        = $miTop
+$script:MnuAutoUpdate = $miAuto
 $script:btnRestartNow = $btnRestartNow
 $script:txtSearch     = $txtSearch
-$script:numLoss       = $numLoss
 $script:Version       = Get-LocalScriptVersion
 $form.Text = "GCL Ping Monitor  -  v:$($script:Version)"
 
