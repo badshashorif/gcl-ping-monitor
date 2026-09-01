@@ -192,16 +192,17 @@ gives the smallest possible window. Two shortcuts:
 The window's size and position are remembered, so a small corner window stays
 small across restarts and updates.
 
-## Notifications (Email / Telegram / SMS)
+## Notifications (Email / Telegram / SMS / Command)
 
-**Notifications...** in the toolbar opens the settings. All three channels are
-off by default; turn on any combination.
+**Settings → Notifications...** opens the settings. All four channels are off by
+default; turn on any combination.
 
 | Tab | What you need |
 |---|---|
 | **Email** | SMTP server, port, SSL on/off, username, password, From, To (comma separated) |
 | **Telegram** | Bot token from [@BotFather](https://t.me/BotFather) and a chat ID (get it from `https://api.telegram.org/bot<TOKEN>/getUpdates`; group ids start with `-100`) |
 | **SMS** | Your gateway's HTTP URL plus the phone numbers |
+| **Command (offline)** | A local program to run — see [below](#command-offline--gsm-modem) |
 
 The SMS tab works with **any HTTP SMS gateway** — put your provider's URL in and
 use these placeholders, which get filled in and URL-encoded for you:
@@ -231,6 +232,58 @@ Behaviour:
   balance. Suppressed messages are noted in the log.
 - Sending runs off the UI thread, so a slow SMTP server never freezes the window.
 
+### Command (offline) — GSM modem
+
+Email, Telegram and the HTTP SMS gateway all need the internet, so when the
+**link itself is what failed** none of them can deliver. The **Command** tab is
+the answer: it runs a program on the PC, so a GSM/USB modem still gets the alert
+out with no connectivity at all.
+
+| Field | |
+|---|---|
+| **Program / script** | the `.exe`, `.bat`, `.cmd` or `.ps1` to run (**...** browses) |
+| **Arguments** | the command line, with placeholders filled in |
+| **Numbers (comma)** | optional — with several numbers the command runs once per number |
+| **Modem** | picked from the modems and COM ports Windows can see, or typed in |
+| **Start in** | optional working directory |
+| **Timeout (sec)** | a hung modem tool is killed after this (default 60) |
+| **Run once per host** | one run per host event instead of one run per batch |
+
+Placeholders, in **Arguments**:
+
+```
+{phone}   {message}   {host}   {target}   {status}
+{time}    {pc}        {modem}  {port}     {subject}
+```
+
+`{modem}` is whatever the Modem box holds; `{port}` is the `COMx` pulled out of
+it, so `HUAWEI Mobile Connect  (COM7)` gives `{port}` = `COM7`.
+
+Examples:
+
+```
+Program:    C:\gammu\gammu.exe
+Arguments:  sendsms TEXT {phone} -text "{message}"
+
+Program:    C:\smstools\smssend.exe
+Arguments:  -p {port} {phone} "{host} is now {status}"
+
+Program:    C:\Windows\System32\cmd.exe
+Arguments:  /c C:\scripts\send-alert.bat {phone} "{message}"
+```
+
+With **Run once per host** on, `{message}` becomes
+`ACCESS_RTR_6 [122.99.103.227] is now DOWN` — one SMS per host, the same shape
+as The Dude's `[Device.Name] is now [Service.Status]`. With it off, one run gets
+the whole batch (`[PC] DOWN: a, b | UP: c`).
+
+The command runs off the UI thread, its exit code and output go to the event log
+(`NOTIFY : command ok` / `NOTIFY err: command exit 3`), and **Send test** fires
+it immediately with a fake `TEST-HOST` event.
+
+> The other three channels are unaffected — leave SMS on as well and whichever
+> one can get through will.
+
 **Security:** SMTP password, bot token and SMS API key are stored
 **DPAPI-encrypted** in `config.json` — never in plain text. DPAPI is tied to that
 Windows user on that machine, so copying `config.json` to another PC does not
@@ -251,7 +304,7 @@ Everything set once and forgotten lives in the **menu bar**:
 | **Hosts** | Add, Edit, Disable/Enable, Remove, Exit |
 | **View** | Text size (Small → TV), Always on top, Show event log, **Compact / Normal window size** |
 | **Monitoring** | Pause/Resume, Test alarm sound, **Alarm sound…**, **Monitoring settings…** (interval, timeout, fails→down, loss window) |
-| **Settings** | **Notifications…**, **Export / Import hosts + settings**, Auto-update, Check for updates now |
+| **Settings** | **Notifications…** (email / Telegram / SMS / offline command), **Export / Import hosts + settings**, Auto-update, Check for updates now |
 | **Help** | About, Open data folder, Open project page |
 
 **Right-click any row** for Edit / Disable-Enable / Remove / Acknowledge.

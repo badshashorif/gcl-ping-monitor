@@ -142,6 +142,9 @@ function Set-Default {
     param($Obj, [string]$Name, $Value)
     if ($null -eq $Obj.$Name) { $Obj | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force }
 }
+# Called at startup AND after an import: a backup written by an older version
+# replaces the whole Notify object and can be missing a channel entirely.
+function Initialize-NotifyDefaults {
 if ($null -eq $script:Config.Notify) {
     $script:Config | Add-Member -NotePropertyName Notify -NotePropertyValue ([pscustomobject]@{}) -Force
 }
@@ -162,6 +165,21 @@ Set-Default $n.Sms 'UrlTemplate' 'https://YOUR-SMS-GATEWAY/api/sendsms?api_key={
 Set-Default $n.Sms 'Method' 'GET';     Set-Default $n.Sms 'BodyTemplate' ''
 Set-Default $n.Sms 'ContentType' 'application/x-www-form-urlencoded'
 Set-Default $n.Sms 'ApiKeyEnc' ''
+# The offline channel: run a local program (GSM modem / smssend / gammu / a .bat).
+# Needs no internet, which is the whole point - when the link is down the HTTP
+# SMS gateway is exactly what cannot be reached.
+Set-Default $n 'Command' ([pscustomobject]@{})
+Set-Default $n.Command 'Enabled'    $false
+Set-Default $n.Command 'Path'       ''
+Set-Default $n.Command 'Args'       '{phone} "{message}"'
+Set-Default $n.Command 'Numbers'    ''
+Set-Default $n.Command 'WorkDir'    ''
+Set-Default $n.Command 'PerHost'    $false
+Set-Default $n.Command 'TimeoutSec' 60
+Set-Default $n.Command 'Modem'      ''     # modem name as shown by Windows -> {modem}
+Set-Default $n.Command 'ModemPort'  ''     # its COM port                   -> {port}
+}
+Initialize-NotifyDefaults
 
 # ---------------------------------------------------------------------------
 #  Runtime state
@@ -633,8 +651,14 @@ function Unprotect-Secret {
 }
 
 function Test-NotifyEnabled {
+    # null-safe on purpose: importing a backup written by an older version
+    # replaces the whole Notify object, and it may not have every channel yet
     $n = $script:Config.Notify
-    ($n.Email.Enabled -or $n.Telegram.Enabled -or $n.Sms.Enabled)
+    if (-not $n) { return $false }
+    foreach ($ch in 'Email','Telegram','Sms','Command') {
+        if ($n.$ch -and $n.$ch.Enabled) { return $true }
+    }
+    $false
 }
 
 function Add-Notification {
@@ -648,8 +672,17 @@ function Add-Notification {
     })
 }
 
+function Expand-CmdTemplate {
+    # placeholder substitution for the command channel. Kept out of the runspace
+    # so both the sender and the "what will run" preview use the same rules.
+    param([string]$Template, [hashtable]$Values)
+    $out = [string]$Template
+    foreach ($k in $Values.Keys) { $out = $out.Replace(('{' + $k + '}'), [string]$Values[$k]) }
+    $out
+}
+
 $script:NotifySender = {
-    param($LogPath, $Subject, $BodyLong, $BodyShort, $Cfg)
+    param($LogPath, $Subject, $BodyLong, $BodyShort, $Cfg, $Events)
     function Log($m) {
         for ($i = 0; $i -lt 5; $i++) {
             try { Add-Content -Path $LogPath -Value ('{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m) -Encoding UTF8; return }
@@ -707,10 +740,94 @@ $script:NotifySender = {
             } catch { Log ('NOTIFY err: sms {0} - {1}' -f $num, $_.Exception.Message) }
         }
     }
+
+    # ---- offline channel: run a local command (GSM modem, smssend, a .bat) ----
+    # Deliberately last and completely independent of the three above: when the
+    # internet is down they all fail and this is the one that still delivers.
+    if ($Cfg.CmdEnabled -and $Cfg.CmdPath) {
+        # one run per event when PerHost is on (so {host}/{status} mean something),
+        # otherwise a single run for the whole batch
+        $runs = New-Object System.Collections.ArrayList
+        if ($Cfg.CmdPerHost -and $Events -and $Events.Count -gt 0) {
+            foreach ($e in $Events) {
+                $st = if ($e.Kind -eq 'DOWN') { 'DOWN' } else { 'UP' }
+                [void]$runs.Add(@{
+                    message = ('{0} [{1}] is now {2}' -f $e.Label, $e.Target, $st)
+                    host    = [string]$e.Label
+                    target  = [string]$e.Target
+                    status  = $st
+                })
+            }
+        } else {
+            [void]$runs.Add(@{ message = $BodyShort; host = ''; target = ''; status = '' })
+        }
+
+        $numbers = @()
+        foreach ($raw in ($Cfg.CmdNumbers -split '[;,]')) { if ($raw.Trim()) { $numbers += $raw.Trim() } }
+        if ($numbers.Count -eq 0) { $numbers = @('') }   # no numbers: run once, {phone} empty
+
+        $timeout = [int]$Cfg.CmdTimeout
+        if ($timeout -lt 5) { $timeout = 5 }
+
+        foreach ($r in $runs) {
+            foreach ($num in $numbers) {
+                try {
+                    $map = @{
+                        message = $r.message
+                        host    = $r.host
+                        target  = $r.target
+                        status  = $r.status
+                        phone   = $num
+                        subject = $Subject
+                        time    = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                        pc      = $env:COMPUTERNAME
+                        modem   = [string]$Cfg.CmdModem
+                        port    = [string]$Cfg.CmdModemPort
+                    }
+                    $argLine = [string]$Cfg.CmdArgs
+                    foreach ($k in $map.Keys) { $argLine = $argLine.Replace(('{' + $k + '}'), [string]$map[$k]) }
+
+                    $psi = New-Object System.Diagnostics.ProcessStartInfo
+                    $psi.FileName        = $Cfg.CmdPath
+                    $psi.Arguments       = $argLine
+                    $psi.UseShellExecute = $false
+                    $psi.CreateNoWindow  = $true
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError  = $true
+                    if ($Cfg.CmdWorkDir) { $psi.WorkingDirectory = $Cfg.CmdWorkDir }
+
+                    $proc = [System.Diagnostics.Process]::Start($psi)
+                    # Drain the pipes ASYNCHRONOUSLY. A child that fills a 4KB pipe
+                    # buffer blocks forever if nobody reads it, but a blocking
+                    # ReadToEnd() would also sit there until the child exits and so
+                    # defeat the timeout below - a hung modem tool would hang here.
+                    $soT = $proc.StandardOutput.ReadToEndAsync()
+                    $seT = $proc.StandardError.ReadToEndAsync()
+                    if (-not $proc.WaitForExit($timeout * 1000)) {
+                        try { $proc.Kill() } catch { }
+                        Log ('NOTIFY err: command timed out after {0}s - {1}' -f $timeout, $Cfg.CmdPath)
+                        continue
+                    }
+                    $so = ''; $se = ''
+                    try { if ($soT.Wait(2000)) { $so = [string]$soT.Result } } catch { }
+                    try { if ($seT.Wait(2000)) { $se = [string]$seT.Result } } catch { }
+                    $code = $proc.ExitCode
+                    $tail = (($so + ' ' + $se) -replace '\s+', ' ').Trim()
+                    if ($tail.Length -gt 160) { $tail = $tail.Substring(0, 157) + '...' }
+                    if ($code -eq 0) {
+                        Log ('NOTIFY    : command ok{0}{1}' -f `
+                            $(if ($num) { " -> $num" } else { '' }), $(if ($tail) { " - $tail" } else { '' }))
+                    } else {
+                        Log ('NOTIFY err: command exit {0}{1}' -f $code, $(if ($tail) { " - $tail" } else { '' }))
+                    }
+                } catch { Log ('NOTIFY err: command - {0}' -f $_.Exception.Message) }
+            }
+        }
+    }
 }
 
 function Send-Notification {
-    param([string]$Subject, [string]$BodyLong, [string]$BodyShort)
+    param([string]$Subject, [string]$BodyLong, [string]$BodyShort, $Events = @())
     $n = $script:Config.Notify
     $cfg = @{
         EmailEnabled = [bool]$n.Email.Enabled
@@ -731,6 +848,15 @@ function Send-Notification {
         SmsBody      = [string]$n.Sms.BodyTemplate
         SmsContentType = [string]$n.Sms.ContentType
         SmsKey       = (Unprotect-Secret ([string]$n.Sms.ApiKeyEnc))
+        CmdEnabled   = [bool]$n.Command.Enabled
+        CmdPath      = [string]$n.Command.Path
+        CmdArgs      = [string]$n.Command.Args
+        CmdNumbers   = [string]$n.Command.Numbers
+        CmdWorkDir   = [string]$n.Command.WorkDir
+        CmdPerHost   = [bool]$n.Command.PerHost
+        CmdTimeout   = [int]$n.Command.TimeoutSec
+        CmdModem     = [string]$n.Command.Modem
+        CmdModemPort = [string]$n.Command.ModemPort
     }
     try {
         $ps = [PowerShell]::Create()
@@ -740,6 +866,7 @@ function Send-Notification {
         [void]$ps.AddArgument($BodyLong)
         [void]$ps.AddArgument($BodyShort)
         [void]$ps.AddArgument($cfg)
+        [void]$ps.AddArgument($Events)
         [void]$ps.BeginInvoke()
     } catch {
         Write-Event ("NOTIFY err: could not start sender - {0}" -f $_.Exception.Message)
@@ -791,7 +918,9 @@ function Send-QueuedNotifications {
     if ($short.Length -gt 300) { $short = $short.Substring(0, 297) + '...' }
 
     Write-Event ('NOTIFY    : sending ({0} down, {1} up)' -f $downs.Count, $ups.Count)
-    Send-Notification -Subject $subject -BodyLong $long -BodyShort $short
+    # the raw events go along too - the command channel can run once per host
+    $evts = @($items | ForEach-Object { @{ Kind = $_.Kind; Label = $_.Label; Target = $_.Target } })
+    Send-Notification -Subject $subject -BodyLong $long -BodyShort $short -Events $evts
 }
 
 function Stop-Alarm {
@@ -1667,16 +1796,17 @@ $miNotify.Add_Click({
     $n = $script:Config.Notify
     $s = $script:TextSize
     $dlg = New-Object System.Windows.Forms.Form
-    $dlg.Text = 'Notifications - email / Telegram / SMS'
+    $dlg.Text = 'Notifications - email / Telegram / SMS / command'
     $dlg.StartPosition = 'CenterParent'
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
     $dlg.Font = UiFont
-    $dlg.ClientSize = New-Object System.Drawing.Size([int]($s * 52), [int]($s * 40))
+    # tall enough for the Command tab, which is the longest one
+    $dlg.ClientSize = New-Object System.Drawing.Size([int]($s * 52), [int]($s * 42))
 
     $tabs = New-Object System.Windows.Forms.TabControl
     $tabs.Location = New-Object System.Drawing.Point(10, 10)
-    $tabs.Size = New-Object System.Drawing.Size([int]($s * 52 - 20), [int]($s * 36))
+    $tabs.Size = New-Object System.Drawing.Size([int]($s * 52 - 20), [int]($s * 38))
     $dlg.Controls.Add($tabs)
 
     $rowY = 0
@@ -1781,18 +1911,79 @@ $miNotify.Add_Click({
     $pSms.Controls.Add($sInfo)
     $tabs.TabPages.Add($pSms)
 
+    # ---------- Command (offline / GSM modem) ----------
+    # The one channel that does not need the internet. Runs any local program:
+    # a modem CLI, gammu, smssend, a .bat - whatever the desk already has.
+    $pCmd = New-Object System.Windows.Forms.TabPage; $pCmd.Text = 'Command (offline)'; $pCmd.BackColor = 'White'
+    $script:rowY = [int]($s * 1.2)
+    $cEn   = NChk $pCmd 'Run a command when a host goes down / recovers' $n.Command.Enabled
+    $cPath = NTxt $n.Command.Path;    NRow $pCmd 'Program / script' $cPath 30
+    $cBrowse = New-Object System.Windows.Forms.Button
+    $cBrowse.Text = '...'
+    $cBrowse.Size = New-Object System.Drawing.Size([int]($s*2.6), [int]($s*1.9))
+    $cBrowse.Location = New-Object System.Drawing.Point([int]($s*43.4), [int]($script:rowY - $s*2.9))
+    $pCmd.Controls.Add($cBrowse)
+    $cArgs = NTxt $n.Command.Args;    NRow $pCmd 'Arguments' $cArgs 34
+    $cNum  = NTxt $n.Command.Numbers; NRow $pCmd 'Numbers (comma)' $cNum 22
+
+    # Modem: filled from what Windows actually has attached, but editable so a
+    # name the modem tool expects can just be typed in
+    $cMdm = New-Object System.Windows.Forms.ComboBox
+    $cMdm.DropDownStyle = 'DropDown'
+    $cMdm.AutoCompleteMode = 'SuggestAppend'
+    $cMdm.AutoCompleteSource = 'ListItems'
+    try {
+        Get-WmiObject Win32_POTSModem -ErrorAction Stop | ForEach-Object {
+            $p = [string]$_.AttachedTo
+            [void]$cMdm.Items.Add($(if ($p) { '{0}  ({1})' -f $_.Name, $p } else { [string]$_.Name }))
+        }
+    } catch { }
+    try {
+        foreach ($p in [System.IO.Ports.SerialPort]::GetPortNames()) {
+            $seen = $false
+            foreach ($it in $cMdm.Items) { if ([string]$it -like "*$p*") { $seen = $true; break } }
+            if (-not $seen) { [void]$cMdm.Items.Add($p) }
+        }
+    } catch { }
+    $cMdm.Text = [string]$n.Command.Modem
+    NRow $pCmd 'Modem' $cMdm 30
+
+    $cDir  = NTxt $n.Command.WorkDir; NRow $pCmd 'Start in (opt.)' $cDir 30
+    $cTmo  = New-Object System.Windows.Forms.NumericUpDown; $cTmo.Minimum=5; $cTmo.Maximum=600
+    $cTmo.Value = [Math]::Min([Math]::Max([int]$n.Command.TimeoutSec, 5), 600)
+    NRow $pCmd 'Timeout (sec)' $cTmo 8
+    $cPer  = NChk $pCmd 'Run once per host instead of once per batch' $n.Command.PerHost
+    $cInfo = New-Object System.Windows.Forms.Label
+    $cInfo.Text = "Needs no internet - use a GSM / USB modem so alerts still go out" + [Environment]::NewLine +
+                  "when the link itself is what failed. Several numbers = one run each." + [Environment]::NewLine +
+                  "{phone} {message} {host} {target} {status} {time} {pc} {modem} {port}" + [Environment]::NewLine +
+                  "Example:  C:\gammu\gammu.exe   sendsms TEXT {phone} -text ""{message}"""
+    $cInfo.AutoSize = $true
+    $cInfo.ForeColor = [System.Drawing.Color]::FromArgb(90,94,100)
+    $cInfo.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]($script:rowY + $s*0.6))
+    $pCmd.Controls.Add($cInfo)
+    $tabs.TabPages.Add($pCmd)
+
+    $script:CmdPathBox = $cPath
+    $cBrowse.Add_Click({
+        $of = New-Object System.Windows.Forms.OpenFileDialog
+        $of.Title  = 'Choose the program to run'
+        $of.Filter = 'Programs and scripts (*.exe;*.bat;*.cmd;*.ps1)|*.exe;*.bat;*.cmd;*.ps1|All files (*.*)|*.*'
+        if ($of.ShowDialog($script:CmdPathBox.FindForm()) -eq 'OK') { $script:CmdPathBox.Text = $of.FileName }
+    })
+
     # ---------- buttons ----------
     $bTest = New-Object System.Windows.Forms.Button
-    $bTest.Text = 'Send test'
-    $bTest.Location = New-Object System.Drawing.Point(10, [int]($s * 36.6))
+    $bTest.Text = 'Send &test'
+    $bTest.Location = New-Object System.Drawing.Point(10, [int]($s * 38.6))
     $bTest.Size = New-Object System.Drawing.Size([int]($s*9), [int]($s*2.6))
     $bOk = New-Object System.Windows.Forms.Button
     $bOk.Text = 'Save'; $bOk.DialogResult = 'OK'
-    $bOk.Location = New-Object System.Drawing.Point([int]($s*35), [int]($s * 36.6))
+    $bOk.Location = New-Object System.Drawing.Point([int]($s*35), [int]($s * 38.6))
     $bOk.Size = New-Object System.Drawing.Size([int]($s*7.5), [int]($s*2.6))
     $bCancel = New-Object System.Windows.Forms.Button
     $bCancel.Text = 'Cancel'; $bCancel.DialogResult = 'Cancel'
-    $bCancel.Location = New-Object System.Drawing.Point([int]($s*43), [int]($s * 36.6))
+    $bCancel.Location = New-Object System.Drawing.Point([int]($s*43), [int]($s * 38.6))
     $bCancel.Size = New-Object System.Drawing.Size([int]($s*7.5), [int]($s*2.6))
     $dlg.Controls.AddRange(@($bTest, $bOk, $bCancel))
     $dlg.AcceptButton = $bOk
@@ -1824,6 +2015,20 @@ $miNotify.Add_Click({
         if ($sKey.Text -ne '********') { $n.Sms.ApiKeyEnc = Protect-Secret $sKey.Text.Trim() }
         $n.Sms.Method       = [string]$sMet.SelectedItem
         $n.Sms.BodyTemplate = $sBody.Text
+
+        $n.Command.Enabled    = [bool]$cEn.Checked
+        $n.Command.Path       = $cPath.Text.Trim()
+        $n.Command.Args       = $cArgs.Text
+        $n.Command.Numbers    = $cNum.Text.Trim()
+        $n.Command.WorkDir    = $cDir.Text.Trim()
+        $n.Command.TimeoutSec = [int]$cTmo.Value
+        $n.Command.PerHost    = [bool]$cPer.Checked
+        # the picker shows "HUAWEI Mobile Connect  (COM7)" - keep the name for
+        # {modem} and pull the port out of it for {port}
+        $mdm = $cMdm.Text.Trim()
+        $n.Command.Modem = $mdm
+        $mm = [regex]::Match($mdm, '(?i)\bCOM\d+\b')
+        $n.Command.ModemPort = $(if ($mm.Success) { $mm.Value.ToUpper() } else { '' })
     }
 
     $bTest.Add_Click({
@@ -1832,9 +2037,11 @@ $miNotify.Add_Click({
             [System.Windows.Forms.MessageBox]::Show('Enable at least one channel first.', 'Send test', 'OK', 'Information') | Out-Null
             return
         }
+        # a fake event so the command channel has something to expand {host} with
         Send-Notification -Subject 'GCL Ping Monitor - test' `
             -BodyLong  ("This is a test from GCL Ping Monitor on {0}.`r`n{1}" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) `
-            -BodyShort ("[{0}] GCL Ping Monitor test message" -f $env:COMPUTERNAME)
+            -BodyShort ("[{0}] GCL Ping Monitor test message" -f $env:COMPUTERNAME) `
+            -Events @(@{ Kind = 'DOWN'; Label = 'TEST-HOST'; Target = '0.0.0.0' })
         Write-Event 'NOTIFY    : test message queued'
         [System.Windows.Forms.MessageBox]::Show("Test sent. Watch the log panel for 'NOTIFY : ... sent' or an error.", 'Send test', 'OK', 'Information') | Out-Null
     })
@@ -1847,6 +2054,7 @@ $miNotify.Add_Click({
         if ($n.Email.Enabled)    { $on += 'email' }
         if ($n.Telegram.Enabled) { $on += 'telegram' }
         if ($n.Sms.Enabled)      { $on += 'sms' }
+        if ($n.Command.Enabled)  { $on += 'command' }
         Write-Event ('NOTIFY    : settings saved - channels: {0}' -f $(if ($on.Count) { $on -join ', ' } else { 'none' }))
     }
     $dlg.Dispose()
@@ -2189,7 +2397,7 @@ function Import-Settings {
         foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','AutoUpdate','UpdateHours','TextSize','LossWindow','SplitPercent','AlarmSound','AlarmFile','AlarmRepeatMs') {
             if ($null -ne $cfg.$p) { $script:Config.$p = $cfg.$p }
         }
-        if ($cfg.Notify) { $script:Config.Notify = $cfg.Notify }
+        if ($cfg.Notify) { $script:Config.Notify = $cfg.Notify; Initialize-NotifyDefaults }
         $script:Hosts.Clear()
         foreach ($c in $incoming) {
             $en = if ($null -eq $c.Enabled) { $true } else { [bool]$c.Enabled }
