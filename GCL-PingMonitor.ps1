@@ -69,17 +69,19 @@ try {
 $script:Mutex = New-Object System.Threading.Mutex($false, 'Global\GCL-PingMonitor-SingleInstance')
 $script:HaveMutex = $false
 try { $script:HaveMutex = $script:Mutex.WaitOne(0, $false) } catch { $script:HaveMutex = $true }
+
+# A named event is how a second launch asks the running one to show itself.
+# Matching on MainWindowTitle does NOT work here: the console host is hidden,
+# so Process.MainWindowTitle comes back empty and the second copy would just
+# exit silently - which looks exactly like "the app won't open".
+$script:ShowEvent = $null
+try {
+    $script:ShowEvent = New-Object System.Threading.EventWaitHandle($false,
+        [System.Threading.EventResetMode]::AutoReset, 'Global\GCL-PingMonitor-Show')
+} catch { }
+
 if (-not $script:HaveMutex) {
-    # bring the window that is already running to the front, then quit quietly
-    try {
-        $other = Get-Process -Name 'powershell' -ErrorAction SilentlyContinue |
-                 Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -like 'GCL Ping Monitor*' } |
-                 Select-Object -First 1
-        if ($other) {
-            [void][Win32.Native]::ShowWindowAsync($other.MainWindowHandle, 9)   # SW_RESTORE
-            [void][Win32.Native]::SetForegroundWindow($other.MainWindowHandle)
-        }
-    } catch { }
+    try { if ($script:ShowEvent) { [void]$script:ShowEvent.Set() } } catch { }
     exit
 }
 
@@ -1534,6 +1536,8 @@ $script:uiTimer = New-Object System.Windows.Forms.Timer
 $script:uiTimer.Interval = 400
 $script:uiTimer.Add_Tick({
     try {
+        # someone double-clicked the shortcut again - show this window instead
+        if ($script:ShowEvent -and $script:ShowEvent.WaitOne(0, $false)) { Show-MainWindow }
         Poll-Results
         Refresh-Grid
         Update-Alarm
@@ -1591,7 +1595,24 @@ $script:txtSearch     = $txtSearch
 $script:Version       = Get-LocalScriptVersion
 $form.Text = "GCL Ping Monitor  -  v:$($script:Version)"
 
+function Show-MainWindow {
+    # Launched with "-WindowStyle Hidden" (so no black console box appears) the
+    # process start info carries SW_HIDE, and WinForms applies it to the FIRST
+    # top-level window - the form comes up invisible while everything else runs
+    # normally. Force it visible explicitly.
+    try {
+        $form.WindowState   = [System.Windows.Forms.FormWindowState]::Normal
+        $form.ShowInTaskbar = $true
+        $form.Visible       = $true
+        [void][Win32.Native]::ShowWindowAsync($form.Handle, 5)   # SW_SHOW
+        $form.BringToFront()
+        $form.Activate()
+        [void][Win32.Native]::SetForegroundWindow($form.Handle)
+    } catch { }
+}
+
 $form.Add_Shown({
+    Show-MainWindow
     Apply-TextSize $script:TextSize
     Rebuild-Grid
     Refresh-Banner
@@ -1615,6 +1636,7 @@ $form.Add_FormClosing({
         Save-Config
         Write-Event 'MONITOR   : stopped'
     } catch { }
+    try { if ($script:ShowEvent) { $script:ShowEvent.Close() } } catch { }
     try { if ($script:HaveMutex -and $script:Mutex) { $script:Mutex.ReleaseMutex(); $script:Mutex.Dispose() } } catch { }
 })
 
