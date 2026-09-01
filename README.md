@@ -129,6 +129,50 @@ Requirement: the tool's folder must be user-writable (Desktop / Documents — no
 `C:\Program Files`), and the machine needs outbound HTTPS to
 `raw.githubusercontent.com`.
 
+## Notifications (Email / Telegram / SMS)
+
+**Notifications...** in the toolbar opens the settings. All three channels are
+off by default; turn on any combination.
+
+| Tab | What you need |
+|---|---|
+| **Email** | SMTP server, port, SSL on/off, username, password, From, To (comma separated) |
+| **Telegram** | Bot token from [@BotFather](https://t.me/BotFather) and a chat ID (get it from `https://api.telegram.org/bot<TOKEN>/getUpdates`; group ids start with `-100`) |
+| **SMS** | Your gateway's HTTP URL plus the phone numbers |
+
+The SMS tab works with **any HTTP SMS gateway** — put your provider's URL in and
+use these placeholders, which get filled in and URL-encoded for you:
+
+```
+{apikey}    {phone}    {message}
+```
+
+For example a GET gateway:
+
+```
+https://api.example.com/send?api_key={apikey}&to={phone}&msg={message}
+```
+
+Choose `POST` instead of `GET` if your provider needs a body, and put the body
+template in the **POST body** field (same placeholders).
+
+**Send test** in the dialog sends a message immediately — the result (`NOTIFY :
+email sent` or `NOTIFY err: ...`) appears in the log panel.
+
+Behaviour:
+
+- **General** tab controls whether to notify on DOWN, on RECOVERY, or both.
+- Events are **batched** (default 20s) into a single message, so a link failure
+  taking 30 hosts down sends one message, not 30.
+- A **max messages/hour** cap (default 20) stops an outage storm burning your SMS
+  balance. Suppressed messages are noted in the log.
+- Sending runs off the UI thread, so a slow SMTP server never freezes the window.
+
+**Security:** SMTP password, bot token and SMS API key are stored
+**DPAPI-encrypted** in `config.json` — never in plain text. DPAPI is tied to that
+Windows user on that machine, so copying `config.json` to another PC does not
+carry the secrets with it. Each machine is configured once.
+
 ## Settings (top toolbar)
 
 | Field | Meaning |
