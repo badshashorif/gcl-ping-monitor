@@ -1,7 +1,35 @@
 # GCL Ping Monitor
 
-Windows desktop ping monitor for the support desk. No admin rights, no
-dependencies — just Windows PowerShell 5.1 (built into Windows 10/11).
+Windows desktop ping monitor for the support desk. No admin rights, no installer
+bundle, no dependencies beyond what Windows already ships.
+
+## Supported Windows versions
+
+Needs **Windows PowerShell 3.0+** and **.NET Framework 4.5+** — both already
+present on everything below.
+
+| Windows | PowerShell it ships with | Status |
+|---|---|---|
+| Windows 11 (all builds) | 5.1 | works as-is |
+| Windows 10 (1607 and newer) | 5.1 | works as-is |
+| Windows Server 2025 / 2022 / 2019 / 2016 | 5.1 | works as-is |
+| Windows Server 2012 R2 | 4.0 | works as-is |
+| Windows Server 2012 | 3.0 | works; installing [WMF 5.1](https://www.microsoft.com/download/details.aspx?id=54616) is recommended |
+| Windows 8.1 | 4.0 | works as-is |
+| Windows 7 SP1 | 2.0 | needs WMF 4.0 or 5.1 first |
+
+Verified on Windows 11. The older targets are supported by keeping to
+PowerShell 3.0 / .NET 4.5 APIs — nothing newer is used anywhere in the tool. If
+PowerShell is older than 4.0 the tool shows a plain message telling you to
+install WMF instead of failing with a cryptic error.
+
+**Two caveats for servers:**
+
+- It is a desktop (WinForms) window, so it needs a GUI. **Server Core has no
+  GUI** — use a full "Desktop Experience" install, or just run it on the
+  support desk PCs, which is what it is for.
+- The alarm needs a **working audio output device**. Most servers have none, so
+  on a server you get the red banner and the log but no sound.
 
 ## Install (recommended)
 
@@ -113,7 +141,14 @@ auto-update overwrites.
 
 - Runs fully async — all hosts are pinged concurrently, so 50 down hosts do not
   freeze the UI.
-- Alarm sound is `C:\Windows\Media\Alarm01.wav` if present, otherwise it falls
-  back to the Windows "critical stop" system sound.
+- The alarm plays `alarm.wav`, a loud two-tone siren the tool generates itself
+  into `%APPDATA%\GCL-PingMonitor\` on first run. It is deliberately **not** a
+  Windows system sound: many machines have the sound scheme set to "No Sounds",
+  which silences `SystemSounds`/`MessageBeep` but not a real .wav file.
+- **Test sound** proves the audio path end to end and writes which source it
+  used to the log. If that button is silent, it is the machine's audio (muted,
+  wrong output device, no sound card), not the tool.
+- While the alarm is on, the taskbar button flashes too, so it is noticed even
+  when the window is behind something else.
 - The installer already sets up start-with-Windows. For a manual copy, put a
   shortcut to `Start-PingMonitor.cmd` in `shell:startup`.
