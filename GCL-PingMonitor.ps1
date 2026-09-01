@@ -1,15 +1,21 @@
-#Requires -Version 5.1
+#Requires -Version 3
 <#
     GCL Ping Monitor
     ----------------
     Simple Windows desktop ping monitor for the support desk.
       * Add / remove hosts from the GUI (saved automatically)
       * Every host is pinged on an interval; grid turns RED when a host is down
-      * A looping alarm sounds while any un-acknowledged host is down
+      * A loud alarm sounds while any un-acknowledged host is down
       * "Acknowledge" silences the current alarm; a NEW host going down re-arms it
       * All state changes are written to an event log
 
     Config + log location:  %APPDATA%\GCL-PingMonitor\
+
+    Supported: Windows 10 / 11 and Windows Server 2012 R2 -> 2025.
+      - Needs Windows PowerShell 4.0 or newer + .NET Framework 4.5 or newer.
+      - Windows 10/11 and Server 2016+ already have PowerShell 5.1 (nothing to do).
+      - Server 2012 / 2012 R2: install "Windows Management Framework 5.1" (free)
+        if PowerShell is still 3.0/4.0 - or at least WMF 4.0.
 
     Run it with:  Start-PingMonitor.cmd   (or  powershell -STA -ExecutionPolicy Bypass -File GCL-PingMonitor.ps1)
 #>
@@ -20,6 +26,16 @@ param(
     [int]$FailThreshold   = 2,
     [switch]$NoUpdate                # skip the GitHub self-update check
 )
+
+# --- minimum-platform guard (friendly message instead of a cryptic failure) ---
+if ($PSVersionTable.PSVersion.Major -lt 4) {
+    $msg = "GCL Ping Monitor needs Windows PowerShell 4.0 or newer.`n`n" +
+           "This machine has $($PSVersionTable.PSVersion).`n`n" +
+           "Install 'Windows Management Framework 5.1' from Microsoft, then run it again."
+    try { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show($msg, 'GCL Ping Monitor', 'OK', 'Warning') | Out-Null }
+    catch { [Console]::Error.WriteLine($msg) }
+    exit 1
+}
 
 # ---------------------------------------------------------------------------
 #  Self-update settings  (edit these if you fork the repo)
@@ -127,54 +143,37 @@ function Write-Event {
 # ---------------------------------------------------------------------------
 #  Self-update  (pulls the latest files straight from GitHub - no git needed)
 # ---------------------------------------------------------------------------
-#  * Asks the GitHub API for the latest commit SHA on the branch, then fetches
-#    each tracked file from the SHA-pinned raw URL (immutable - never a stale
-#    CDN copy). Rewrites only the files that differ. Any push is picked up;
-#    nothing to version-bump.
-#  * A downloaded .ps1 that fails to parse is rejected, so a broken push cannot
-#    replace a working install.
+#  * Fetches each tracked file from raw.githubusercontent.com (branch tip) and
+#    rewrites only the ones whose content differs. Any push to the repo is
+#    picked up within a few minutes - nothing to version-bump.
+#  * A downloaded .ps1 that fails to parse is rejected, so a broken push can
+#    never replace a working install.
 #  * A dev checkout (folder has a .git) is left alone so local edits survive.
-#  * Startup: if files changed, the script relaunches itself so new code runs
-#    immediately. While running: a background check downloads updates and shows
-#    a "restart to apply" button instead of yanking the window away mid-incident.
-
-$script:ShaFile = Join-Path $script:AppDir 'installed.sha'
+#  * Startup: if files changed it relaunches once (guarded by a timestamp file
+#    so it can't loop). While running: a background check downloads updates and
+#    shows a "RESTART to apply" button - it never closes the window itself.
 
 function Get-LocalScriptVersion {
-    try { (Get-FileHash -Path $script:ScriptPath -Algorithm SHA1).Hash.Substring(0, 7).ToLower() } catch { '???????' }
-}
-
-function Get-RemoteSha {
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
-    } catch { }
-    try {
-        $r = Invoke-WebRequest -Uri "https://api.github.com/repos/$($script:Repo)/commits/$($script:Branch)" `
-                -UseBasicParsing -TimeoutSec 8 -Headers @{ 'User-Agent' = 'GCL-PingMonitor'; 'Accept' = 'application/vnd.github.sha' }
-        $s = ([string]$r.Content).Trim()
-        if ($s -match '^[0-9a-f]{40}$') { return $s }
-    } catch { }
-    return $null
+    try { (Get-FileHash -Path $script:ScriptPath -Algorithm SHA1).Hash.Substring(0, 7).ToLower() }
+    catch { 'local' }
 }
 
 function Invoke-SelfUpdate {
     param([switch]$Silent)
     if ($script:IsGitCheckout -or -not $script:ScriptDir) { return $false }
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+    } catch { }
 
-    $sha = Get-RemoteSha
-    if (-not $sha) { return $false }                       # offline / rate-limited - try later
-    $applied = ''
-    if (Test-Path $script:ShaFile) { try { $applied = (Get-Content $script:ShaFile -Raw -ErrorAction Stop).Trim() } catch { } }
-    if ($sha -eq $applied) { return $false }               # already on this commit
-
-    $base = "https://raw.githubusercontent.com/$($script:Repo)/$sha/"
-    $changed = $false
+    $base    = "https://raw.githubusercontent.com/$($script:Repo)/$($script:Branch)/"
+    $pending = @{}
     foreach ($name in $script:UpdateFiles) {
         try {
-            $resp = Invoke-WebRequest -Uri ($base + $name) -UseBasicParsing -TimeoutSec 10
+            $resp = Invoke-WebRequest -Uri ($base + $name) -UseBasicParsing -TimeoutSec 10 `
+                        -Headers @{ 'Cache-Control' = 'no-cache'; 'Pragma' = 'no-cache' }
         } catch {
             if (-not $Silent) { Write-Event ("UPDATE err : {0} ({1})" -f $name, $_.Exception.Message) }
-            return $false                                  # abort - don't half-apply
+            return $false                                  # network problem - try again later
         }
         if ($resp.StatusCode -ne 200) { return $false }
         $remote = [string]$resp.Content
@@ -182,43 +181,48 @@ function Invoke-SelfUpdate {
             $perr = $null
             [void][System.Management.Automation.Language.Parser]::ParseInput($remote, [ref]$null, [ref]$perr)
             if ($perr -and $perr.Count) {
-                if (-not $Silent) { Write-Event ("UPDATE err : {0} from GitHub has syntax errors - update held back" -f $name) }
+                if (-not $Silent) { Write-Event ("UPDATE err : {0} upstream has syntax errors - held back" -f $name) }
                 return $false
             }
         }
         $dest  = Join-Path $script:ScriptDir $name
         $local = if (Test-Path $dest) { [System.IO.File]::ReadAllText($dest) } else { $null }
-        if ($remote -ne $local) {
-            try {
-                [System.IO.File]::WriteAllText($dest, $remote, (New-Object System.Text.UTF8Encoding($false)))
-                $changed = $true
-                Write-Event ("UPDATE    : refreshed {0}" -f $name)
-            } catch {
-                if (-not $Silent) { Write-Event ("UPDATE err : cannot write {0} ({1})" -f $name, $_.Exception.Message) }
-                return $false
-            }
+        if ($remote -ne $local) { $pending[$dest] = $remote }
+    }
+
+    if ($pending.Count -eq 0) { return $false }             # already up to date
+    foreach ($dest in @($pending.Keys)) {
+        try {
+            [System.IO.File]::WriteAllText($dest, $pending[$dest], (New-Object System.Text.UTF8Encoding($false)))
+            Write-Event ("UPDATE    : refreshed {0}" -f (Split-Path $dest -Leaf))
+        } catch {
+            if (-not $Silent) { Write-Event ("UPDATE err : cannot write {0} ({1})" -f (Split-Path $dest -Leaf), $_.Exception.Message) }
+            return $false
         }
     }
-    try { Set-Content -Path $script:ShaFile -Value $sha -Encoding ASCII } catch { }
-    return $changed
+    return $true
 }
 
 # ---- run the check once at startup, before the GUI is built ----
-if (-not $NoUpdate -and -not $script:IsGitCheckout -and $env:GCLPM_CHILD -ne '1' -and $script:Config.AutoUpdate) {
+if (-not $NoUpdate -and -not $script:IsGitCheckout -and $script:Config.AutoUpdate) {
     try {
         if (Invoke-SelfUpdate -Silent) {
-            $env:GCLPM_CHILD = '1'
-            $child = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList @(
-                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"{0}"' -f $script:ScriptPath)
-            )
-            Start-Sleep -Milliseconds 1800
-            if ($child -and -not $child.HasExited) {
-                exit                                  # new version is up - hand over
+            $stamp   = Join-Path $script:AppDir '.last-relaunch'
+            $justDid = $false
+            if (Test-Path $stamp) {
+                try { $justDid = ((Get-Date) - (Get-Item $stamp).LastWriteTime).TotalSeconds -lt 120 } catch { }
             }
-            # the freshly-pulled version failed to start - keep running the code
-            # already loaded in this process so monitoring is not interrupted
-            $env:GCLPM_CHILD = $null
-            Write-Event 'UPDATE err : new version did not start - keeping the running version'
+            if ($justDid) {
+                # updated again right after a relaunch (rapid pushes) - don't loop,
+                # just let this session run and offer the button
+                $script:UpdatePending = $true
+            } else {
+                Set-Content -Path $stamp -Value (Get-Date -Format 'o') -ErrorAction SilentlyContinue
+                Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+                    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"{0}"' -f $script:ScriptPath)
+                )
+                exit
+            }
         }
     } catch { }
 }
@@ -751,11 +755,11 @@ $chkAutoUpdate.Add_CheckedChanged({ Save-Config })
 
 function Restart-Self {
     try { Save-Config } catch { }
-    [Environment]::SetEnvironmentVariable('GCLPM_CHILD', $null)   # let the fresh instance re-check
+    # clear the relaunch guard so the fresh instance starts cleanly
+    try { Remove-Item (Join-Path $script:AppDir '.last-relaunch') -ErrorAction SilentlyContinue } catch { }
     Start-Process powershell -WindowStyle Hidden -ArgumentList @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"{0}"' -f $script:ScriptPath)
     ) | Out-Null
-    $script:AllowClose = $true
     $form.Close()
 }
 
