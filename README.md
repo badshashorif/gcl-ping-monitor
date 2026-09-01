@@ -104,6 +104,9 @@ Delete these two shortcuts and one folder:
   red, and the taskbar button flashes.
 - **ACKNOWLEDGE ALARM** silences it immediately. If a *different* host then goes
   down the alarm re-arms by itself; a host recovering resets its ack too.
+- If **nobody** acknowledges, the sound stops on its own after 5 minutes — but
+  the screen keeps showing the fault in red. A **recovery sound** plays when a
+  host comes back. Both are under [Alarm sound](#alarm-sound).
 - **Text** selector (Small → TV) scales the whole window — fonts, rows, buttons
   — for a big wall monitor read from across the room. It is remembered.
 - The **alarm sound can be changed** — seven built-in tones, any Windows sound,
@@ -161,6 +164,21 @@ downloaded and no media library is needed.
 **Repeat every** sets how often the sound restarts while the alarm is on
 (default 1.4s). Give a long custom sound a longer gap so it does not cut itself
 off.
+
+**Stop sound after N minutes** (default 5) silences an alarm nobody has
+acknowledged — so a link that goes down at 2am does not scream all night. It
+silences the *sound only*: the banner stays red, the row stays red, the
+ACKNOWLEDGE button stays lit and the taskbar keeps flashing, because nobody has
+actually seen it yet. It is **not** an auto-acknowledge. If another host goes
+down afterwards the sound comes straight back, and the clock restarts — a new
+fault is never swallowed by an older one. Set it to **0** to keep sounding
+forever.
+
+**Play a recovery sound** (default on, soft chime) plays once when a host comes
+back up, so you hear that a link has returned without watching the screen. It
+has its own player, so a recovery is audible even while the alarm is still
+sounding for some other host. It only fires on a real DOWN → UP recovery, never
+on a host's first ever reply at startup.
 
 A custom file must be an uncompressed **.wav (PCM)** — Windows' built-in player
 cannot play mp3. If the file is later deleted or moved, the alarm falls back to

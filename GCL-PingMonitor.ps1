@@ -125,6 +125,10 @@ $script:Defaults = @{
     AlarmSound      = 'siren'    # key from $script:SoundDefs, or 'custom'
     AlarmFile       = ''         # the .wav when AlarmSound = 'custom'
     AlarmRepeatMs   = 1400       # how often the alarm sound is re-started
+    AlarmAutoStopMin = 5         # silence an un-acknowledged alarm after N min (0 = never)
+    UpSoundEnabled  = $true      # a short sound when a host comes back
+    UpSound         = 'chime'
+    UpSoundFile     = ''
     WinW            = 1180       # window size / position are remembered so a
     WinH            = 780        # small "corner of the screen" window stays small
     WinX            = -32000     # -32000 = never positioned yet -> centre
@@ -430,6 +434,7 @@ function Process-Result {
                 $dur = if ($h.DownSince) { Format-Duration ((Get-Date) - $h.DownSince) } else { '?' }
                 Write-Event ("RECOVERED : {0} [{1}] - was down {2}" -f $h.Label, $h.Target, $dur)
                 Add-Notification -Kind 'UP' -Host_ $h
+                Play-UpSound
             } elseif ($prev -eq 'INIT') {
                 Write-Event ("OK        : {0} [{1}] - reachable" -f $h.Label, $h.Target)
             }
@@ -607,6 +612,39 @@ if (-not $script:Player) {
         (Join-Path $env:WINDIR 'Media\notify.wav')
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($fb) { Set-AlarmPlayer $fb }
+}
+
+# ---- recovery sound ---------------------------------------------------------
+# Its own player, so a recovery can be heard even while the down alarm is still
+# sounding for some OTHER host - one SoundPlayer can only play one thing.
+$script:UpPlayer   = $null
+$script:UpWavPath  = ''
+function Resolve-UpSound {
+    $key = [string]$script:Config.UpSound
+    if ($key -eq 'custom') {
+        $f = [string]$script:Config.UpSoundFile
+        if ($f -and (Test-Path $f)) { return $f }
+        return (Get-BuiltInSoundPath 'chime')
+    }
+    Get-BuiltInSoundPath $key
+}
+function Set-UpPlayer {
+    param([string]$Path)
+    try { if ($script:UpPlayer) { $script:UpPlayer.Stop(); $script:UpPlayer.Dispose() } } catch { }
+    $script:UpPlayer = $null
+    $script:UpWavPath = $Path
+    try {
+        if ($Path -and (Test-Path $Path)) {
+            $script:UpPlayer = New-Object System.Media.SoundPlayer $Path
+            $script:UpPlayer.Load()
+        }
+    } catch { $script:UpPlayer = $null }
+}
+Set-UpPlayer (Resolve-UpSound)
+
+function Play-UpSound {
+    if (-not $script:Config.UpSoundEnabled) { return }
+    try { if ($script:UpPlayer) { $script:UpPlayer.Play() } } catch { }
 }
 
 $script:AlarmActive = $false
@@ -1110,9 +1148,34 @@ function Stop-Alarm {
     try { if ($script:Player) { $script:Player.Stop() } } catch { }
 }
 
+#  Auto-silence: after N minutes an un-acknowledged alarm stops MAKING NOISE but
+#  stays an alarm - the banner is still red, the row is still red, the button is
+#  still lit. It is deliberately NOT an auto-acknowledge: nobody has seen it, and
+#  the screen must not claim otherwise. A host going down AFTER that re-arms the
+#  sound, so a new fault is never swallowed by an older one.
+$script:AlarmOnSince = $null
+$script:AlarmMuted   = $false
+$script:AlarmSet     = @()          # targets currently down and un-acknowledged
+
 function Update-Alarm {
     $down   = @($script:Hosts | Where-Object { $_.Enabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
     $active = $down.Count -gt 0
+
+    # anything in the down set that was not there last time re-arms the sound
+    $now = @($down | ForEach-Object { $_.Target })
+    $fresh = @($now | Where-Object { $script:AlarmSet -notcontains $_ })
+    $script:AlarmSet = $now
+    if ($fresh.Count -gt 0 -and $script:AlarmActive) {
+        # a new fault restarts the auto-silence clock even if the alarm is
+        # already sounding for something else
+        $script:AlarmOnSince = Get-Date
+        if ($script:AlarmMuted) {
+            $script:AlarmMuted = $false
+            Write-Event ('ALARM     : re-armed - {0} newly down' -f ($fresh -join ', '))
+            Play-Alarm
+        }
+    }
+
     if ($script:btnAck) {
         $script:btnAck.Enabled = $active
         # the button itself goes red while it has something to acknowledge
@@ -1128,12 +1191,28 @@ function Update-Alarm {
     $script:AlarmActive = $active
     if ($active) {
         $src = if ($script:Player) { Split-Path $script:AlarmWavPath -Leaf } else { 'system sound' }
+        $script:AlarmOnSince = Get-Date
+        $script:AlarmMuted   = $false
         Write-Event ("ALARM     : ON  ({0} host(s) down, sound={1})" -f $down.Count, $src)
         Play-Alarm
     } else {
         Stop-Alarm
+        $script:AlarmOnSince = $null
+        $script:AlarmMuted   = $false
         Write-Event 'ALARM     : off'
     }
+}
+
+function Update-AlarmAutoStop {
+    # called from the alarm timer, once a second-ish
+    if (-not $script:AlarmActive -or $script:AlarmMuted) { return }
+    $mins = [double]$script:Config.AlarmAutoStopMin
+    if ($mins -le 0) { return }                       # 0 = keep sounding forever
+    if (-not $script:AlarmOnSince) { return }
+    if (((Get-Date) - $script:AlarmOnSince).TotalMinutes -lt $mins) { return }
+    Stop-Alarm
+    $script:AlarmMuted = $true
+    Write-Event ('ALARM     : auto-silenced after {0} min - STILL DOWN and not acknowledged' -f $mins)
 }
 
 # ---------------------------------------------------------------------------
@@ -2309,6 +2388,29 @@ function Sync-SoundList {
     foreach ($it in $script:SndItems) { [void]$script:SndList.Items.Add($it.Text) }
 }
 
+# ---- recovery-sound picker (same script-scope rule as above) ----
+$script:SndUpCombo = $null
+$script:SndUpFile  = ''
+function Get-UpPickPath {
+    # the last combo entry is "Use my own .wav..."
+    if (-not $script:SndUpCombo) { return '' }
+    $i = $script:SndUpCombo.SelectedIndex
+    if ($i -lt 0) { return '' }
+    if ($i -ge $script:SoundDefs.Count) { return [string]$script:SndUpFile }
+    Get-BuiltInSoundPath $script:SoundDefs[$i].Key
+}
+function Play-UpPreview {
+    $p = Get-UpPickPath
+    Stop-SoundPreview
+    try {
+        if ($p -and (Test-Path $p)) {
+            $script:PreviewPlayer = New-Object System.Media.SoundPlayer $p
+            $script:PreviewPlayer.Load()
+            $script:PreviewPlayer.Play()
+        }
+    } catch { }
+}
+
 function Show-AlarmSoundDialog {
     $s = $script:TextSize
     $dlg = New-Object System.Windows.Forms.Form
@@ -2317,10 +2419,10 @@ function Show-AlarmSoundDialog {
     $dlg.StartPosition = 'CenterParent'
     $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
     $dlg.Font = UiFont
-    $dlg.ClientSize = New-Object System.Drawing.Size([int]($s * 38), [int]($s * 30))
+    $dlg.ClientSize = New-Object System.Drawing.Size([int]($s * 38), [int]($s * 38))
 
     $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text = 'Sound played while a host is down:'
+    $lbl.Text = 'Sound played while a host is DOWN:'
     $lbl.AutoSize = $true
     $lbl.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 0.9))
     $dlg.Controls.Add($lbl)
@@ -2341,7 +2443,7 @@ function Show-AlarmSoundDialog {
 
     $list = New-Object System.Windows.Forms.ListBox
     $list.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 2.6))
-    $list.Size = New-Object System.Drawing.Size([int]($s * 35.6), [int]($s * 18))
+    $list.Size = New-Object System.Drawing.Size([int]($s * 35.6), [int]($s * 14))
     $list.IntegralHeight = $false
     $dlg.Controls.Add($list)
 
@@ -2370,47 +2472,116 @@ function Show-AlarmSoundDialog {
 
     $btnPlay = New-Object System.Windows.Forms.Button
     $btnPlay.Text = 'Play'
-    $btnPlay.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 21.2))
+    $btnPlay.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 17.2))
     $btnPlay.Size = New-Object System.Drawing.Size([int]($s * 6.5), [int]($s * 2.6))
     $btnStop = New-Object System.Windows.Forms.Button
     $btnStop.Text = 'Stop'
-    $btnStop.Location = New-Object System.Drawing.Point([int]($s * 8.2), [int]($s * 21.2))
+    $btnStop.Location = New-Object System.Drawing.Point([int]($s * 8.2), [int]($s * 17.2))
     $btnStop.Size = New-Object System.Drawing.Size([int]($s * 6.5), [int]($s * 2.6))
     $btnBrowse = New-Object System.Windows.Forms.Button
     $btnBrowse.Text = 'Use my own .wav...'
-    $btnBrowse.Location = New-Object System.Drawing.Point([int]($s * 15.2), [int]($s * 21.2))
+    $btnBrowse.Location = New-Object System.Drawing.Point([int]($s * 15.2), [int]($s * 17.2))
     $btnBrowse.Size = New-Object System.Drawing.Size([int]($s * 21.6), [int]($s * 2.6))
     $dlg.Controls.AddRange(@($btnPlay, $btnStop, $btnBrowse))
 
     $lblRep = New-Object System.Windows.Forms.Label
     $lblRep.Text = 'Repeat every'
     $lblRep.AutoSize = $true
-    $lblRep.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 24.9))
+    $lblRep.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 20.9))
     $nRep = New-Object System.Windows.Forms.NumericUpDown
     $nRep.DecimalPlaces = 1; $nRep.Increment = 0.5
     $nRep.Minimum = 0.5; $nRep.Maximum = 60
-    $nRep.Location = New-Object System.Drawing.Point([int]($s * 10), [int]($s * 24.5))
+    $nRep.Location = New-Object System.Drawing.Point([int]($s * 12), [int]($s * 20.5))
     $nRep.Width = [int]($s * 5)
     $repSec = [Math]::Round(([double][int]$script:Config.AlarmRepeatMs) / 1000.0, 1)
     if ($repSec -lt 0.5) { $repSec = 1.4 }; if ($repSec -gt 60) { $repSec = 60 }
     $nRep.Value = [decimal]$repSec
     $lblRep2 = New-Object System.Windows.Forms.Label
-    $lblRep2.Text = 'seconds between repeats'
+    $lblRep2.Text = 'seconds'
     $lblRep2.AutoSize = $true
     $lblRep2.ForeColor = [System.Drawing.Color]::FromArgb(110, 114, 120)
-    $lblRep2.Location = New-Object System.Drawing.Point([int]($s * 15.6), [int]($s * 24.9))
+    $lblRep2.Location = New-Object System.Drawing.Point([int]($s * 17.6), [int]($s * 20.9))
     $dlg.Controls.AddRange(@($lblRep, $nRep, $lblRep2))
 
+    # auto-silence
+    $lblStop = New-Object System.Windows.Forms.Label
+    $lblStop.Text = 'Stop sound after'
+    $lblStop.AutoSize = $true
+    $lblStop.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 23.7))
+    $nStop = New-Object System.Windows.Forms.NumericUpDown
+    $nStop.Minimum = 0; $nStop.Maximum = 240
+    $nStop.Location = New-Object System.Drawing.Point([int]($s * 12), [int]($s * 23.3))
+    $nStop.Width = [int]($s * 5)
+    $nStop.Value = [Math]::Min([Math]::Max([int]$script:Config.AlarmAutoStopMin, 0), 240)
+    $lblStop2 = New-Object System.Windows.Forms.Label
+    $lblStop2.Text = "minutes if nobody acknowledges" + [Environment]::NewLine +
+                     "(0 = never stop.  Row stays red)"
+    $lblStop2.AutoSize = $true
+    $lblStop2.ForeColor = [System.Drawing.Color]::FromArgb(110, 114, 120)
+    $lblStop2.Location = New-Object System.Drawing.Point([int]($s * 17.6), [int]($s * 23.4))
+    $dlg.Controls.AddRange(@($lblStop, $nStop, $lblStop2))
+
+    # ---- recovery sound ----
+    $lblUp = New-Object System.Windows.Forms.Label
+    $lblUp.Text = 'When a host comes back UP:'
+    $lblUp.AutoSize = $true
+    $lblUp.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 27.2))
+    $dlg.Controls.Add($lblUp)
+
+    $chkUp = New-Object System.Windows.Forms.CheckBox
+    $chkUp.Text = 'Play a recovery sound'
+    $chkUp.AutoSize = $true
+    $chkUp.Checked = [bool]$script:Config.UpSoundEnabled
+    $chkUp.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 29.2))
+    $dlg.Controls.Add($chkUp)
+
+    $cboUp = New-Object System.Windows.Forms.ComboBox
+    $cboUp.DropDownStyle = 'DropDownList'
+    $cboUp.Location = New-Object System.Drawing.Point([int]($s * 1.2), [int]($s * 31.4))
+    $cboUp.Width = [int]($s * 21)
+    foreach ($d in $script:SoundDefs) { [void]$cboUp.Items.Add($d.Name) }
+    [void]$cboUp.Items.Add('Use my own .wav...')
+    $upIx = 0
+    for ($i = 0; $i -lt $script:SoundDefs.Count; $i++) {
+        if ($script:SoundDefs[$i].Key -eq [string]$script:Config.UpSound) { $upIx = $i; break }
+    }
+    if ([string]$script:Config.UpSound -eq 'custom') { $upIx = $cboUp.Items.Count - 1 }
+    $cboUp.SelectedIndex = $upIx
+    $dlg.Controls.Add($cboUp)
+
+    $btnUpPlay = New-Object System.Windows.Forms.Button
+    $btnUpPlay.Text = 'Play'
+    $btnUpPlay.Location = New-Object System.Drawing.Point([int]($s * 23), [int]($s * 31.2))
+    $btnUpPlay.Size = New-Object System.Drawing.Size([int]($s * 6.5), [int]($s * 2.4))
+    $dlg.Controls.Add($btnUpPlay)
+
     $ok = New-Object System.Windows.Forms.Button
-    $ok.Text = 'Save'; $ok.DialogResult = 'OK'
-    $ok.Location = New-Object System.Drawing.Point([int]($s * 21.2), [int]($s * 27))
+    $ok.Text = '&Save'; $ok.DialogResult = 'OK'
+    $ok.Location = New-Object System.Drawing.Point([int]($s * 21.2), [int]($s * 34.6))
     $ok.Size = New-Object System.Drawing.Size([int]($s * 7.5), [int]($s * 2.6))
     $cn = New-Object System.Windows.Forms.Button
     $cn.Text = 'Cancel'; $cn.DialogResult = 'Cancel'
-    $cn.Location = New-Object System.Drawing.Point([int]($s * 29.2), [int]($s * 27))
+    $cn.Location = New-Object System.Drawing.Point([int]($s * 29.2), [int]($s * 34.6))
     $cn.Size = New-Object System.Drawing.Size([int]($s * 7.5), [int]($s * 2.6))
     $dlg.Controls.AddRange(@($ok, $cn))
     $dlg.AcceptButton = $ok; $dlg.CancelButton = $cn
+
+    $script:SndUpCombo = $cboUp
+    $script:SndUpFile  = [string]$script:Config.UpSoundFile
+    $btnUpPlay.Add_Click({ Play-UpPreview })
+    $cboUp.Add_SelectedIndexChanged({
+        if ($script:SndUpCombo.SelectedIndex -lt $script:SoundDefs.Count) { return }
+        $of = New-Object System.Windows.Forms.OpenFileDialog
+        $of.Title  = 'Choose the recovery sound'
+        $of.Filter = 'Wave sound (*.wav)|*.wav|All files (*.*)|*.*'
+        $of.InitialDirectory = (Join-Path $env:WINDIR 'Media')
+        if ($of.ShowDialog($script:SndUpCombo.FindForm()) -eq 'OK') {
+            $script:SndUpFile = $of.FileName
+            Play-UpPreview
+        } elseif (-not $script:SndUpFile) {
+            $script:SndUpCombo.SelectedIndex = 0     # nothing picked - fall back
+        }
+    })
 
     $btnPlay.Add_Click({ Play-SoundPreview })
     $btnStop.Add_Click({ Stop-SoundPreview })
@@ -2443,19 +2614,33 @@ function Show-AlarmSoundDialog {
     $items = $script:SndItems          # the Browse button may have added a row
     if ($res -eq 'OK' -and $list.SelectedIndex -ge 0) {
         $sel = $items[$list.SelectedIndex]
-        $script:Config.AlarmSound    = $sel.Key
-        $script:Config.AlarmFile     = [string]$sel.File
-        $script:Config.AlarmRepeatMs = [int]([double]$nRep.Value * 1000)
+        $script:Config.AlarmSound     = $sel.Key
+        $script:Config.AlarmFile      = [string]$sel.File
+        $script:Config.AlarmRepeatMs  = [int]([double]$nRep.Value * 1000)
+        $script:Config.AlarmAutoStopMin = [int]$nStop.Value
+
+        $upIdx = $cboUp.SelectedIndex
+        $script:Config.UpSoundEnabled = [bool]$chkUp.Checked
+        if ($upIdx -ge $script:SoundDefs.Count) {
+            $script:Config.UpSound     = 'custom'
+            $script:Config.UpSoundFile = [string]$script:SndUpFile
+        } else {
+            $script:Config.UpSound     = $script:SoundDefs[$upIdx].Key
+            $script:Config.UpSoundFile = ''
+        }
+        Set-UpPlayer (Resolve-UpSound)
 
         # a live alarm must not be left playing the old sound
-        $wasOn = $script:AlarmActive
+        $wasOn = $script:AlarmActive -and -not $script:AlarmMuted
         Stop-Alarm
         Set-AlarmPlayer (Resolve-AlarmSound)
         $script:AlarmTimer.Interval = [Math]::Max([int]$script:Config.AlarmRepeatMs, 500)
         if ($wasOn) { Play-Alarm }
         Save-Config
-        Write-Event ('ALARM     : sound set to "{0}" ({1}), repeat every {2}s' -f `
-            $sel.Text, (Split-Path $script:AlarmWavPath -Leaf), $nRep.Value)
+        Write-Event ('ALARM     : sound "{0}", repeat {1}s, auto-stop {2}, recovery sound {3}' -f `
+            $sel.Text, $nRep.Value,
+            $(if ([int]$nStop.Value -gt 0) { "$($nStop.Value)m" } else { 'off' }),
+            $(if ($chkUp.Checked) { Split-Path $script:UpWavPath -Leaf } else { 'off' }))
     }
     $dlg.Dispose()
 }
@@ -2592,7 +2777,7 @@ function Import-Settings {
     if ($ans -eq 'Yes') {
         # window size/position are deliberately NOT imported - a backup from
         # another PC would drop the window on a monitor that may not exist here
-        foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','AutoUpdate','UpdateHours','TextSize','LossWindow','SplitPercent','AlarmSound','AlarmFile','AlarmRepeatMs') {
+        foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','AutoUpdate','UpdateHours','TextSize','LossWindow','SplitPercent','AlarmSound','AlarmFile','AlarmRepeatMs','AlarmAutoStopMin','UpSoundEnabled','UpSound','UpSoundFile') {
             if ($null -ne $cfg.$p) { $script:Config.$p = $cfg.$p }
         }
         if ($cfg.Notify) { $script:Config.Notify = $cfg.Notify; Initialize-NotifyDefaults }
@@ -2611,6 +2796,7 @@ function Import-Settings {
         $script:notifyTimer.Interval = [Math]::Max([int]$script:Config.Notify.BatchSeconds, 5) * 1000
         Stop-Alarm
         Set-AlarmPlayer (Resolve-AlarmSound)
+        Set-UpPlayer (Resolve-UpSound)
         $script:AlarmTimer.Interval = [Math]::Min([Math]::Max([int]$script:Config.AlarmRepeatMs, 500), 60000)
         Apply-TextSize ([int]$script:Config.TextSize)
         Write-Event ('BACKUP    : imported {0} host(s) + settings (replaced) from {1}' -f $added, $dlg.FileName)
@@ -2758,8 +2944,13 @@ $script:uiTimer.Add_Tick({
 $script:AlarmTimer = New-Object System.Windows.Forms.Timer
 $script:AlarmTimer.Interval = [Math]::Min([Math]::Max([int]$script:Config.AlarmRepeatMs, 500), 60000)
 $script:AlarmTimer.Add_Tick({
-    if ($script:AlarmActive) {
+    Update-AlarmAutoStop
+    if ($script:AlarmActive -and -not $script:AlarmMuted) {
         Play-Alarm
+    }
+    if ($script:AlarmActive) {
+        # the taskbar keeps flashing even once the sound has been auto-silenced -
+        # the fault has not gone away, only the noise has
         try {
             if (-not $form.ContainsFocus) { [Win32.Native]::FlashWindow($form.Handle, $true) }
         } catch { }
