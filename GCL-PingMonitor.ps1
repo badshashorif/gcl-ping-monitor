@@ -127,40 +127,67 @@ function Write-Event {
 # ---------------------------------------------------------------------------
 #  Self-update  (pulls the latest files straight from GitHub - no git needed)
 # ---------------------------------------------------------------------------
-#  * Compares each tracked file against raw.githubusercontent.com and rewrites
-#    only the ones that differ. Any push to the repo is picked up automatically
-#    (nothing to version-bump).
+#  * Asks the GitHub API for the latest commit SHA on the branch, then fetches
+#    each tracked file from the SHA-pinned raw URL (immutable - never a stale
+#    CDN copy). Rewrites only the files that differ. Any push is picked up;
+#    nothing to version-bump.
+#  * A downloaded .ps1 that fails to parse is rejected, so a broken push cannot
+#    replace a working install.
 #  * A dev checkout (folder has a .git) is left alone so local edits survive.
 #  * Startup: if files changed, the script relaunches itself so new code runs
 #    immediately. While running: a background check downloads updates and shows
-#    a "restart to apply" bar instead of yanking the window away mid-incident.
+#    a "restart to apply" button instead of yanking the window away mid-incident.
+
+$script:ShaFile = Join-Path $script:AppDir 'installed.sha'
 
 function Get-LocalScriptVersion {
     try { (Get-FileHash -Path $script:ScriptPath -Algorithm SHA1).Hash.Substring(0, 7).ToLower() } catch { '???????' }
 }
 
-function Invoke-SelfUpdate {
-    param([switch]$Silent)
-    if ($script:IsGitCheckout) { return $false }
-    if (-not $script:ScriptDir) { return $false }
-    $base = "https://raw.githubusercontent.com/$($script:Repo)/$($script:Branch)/"
-    $changed = $false
+function Get-RemoteSha {
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
     } catch { }
+    try {
+        $r = Invoke-WebRequest -Uri "https://api.github.com/repos/$($script:Repo)/commits/$($script:Branch)" `
+                -UseBasicParsing -TimeoutSec 8 -Headers @{ 'User-Agent' = 'GCL-PingMonitor'; 'Accept' = 'application/vnd.github.sha' }
+        $s = ([string]$r.Content).Trim()
+        if ($s -match '^[0-9a-f]{40}$') { return $s }
+    } catch { }
+    return $null
+}
+
+function Invoke-SelfUpdate {
+    param([switch]$Silent)
+    if ($script:IsGitCheckout -or -not $script:ScriptDir) { return $false }
+
+    $sha = Get-RemoteSha
+    if (-not $sha) { return $false }                       # offline / rate-limited - try later
+    $applied = ''
+    if (Test-Path $script:ShaFile) { try { $applied = (Get-Content $script:ShaFile -Raw -ErrorAction Stop).Trim() } catch { } }
+    if ($sha -eq $applied) { return $false }               # already on this commit
+
+    $base = "https://raw.githubusercontent.com/$($script:Repo)/$sha/"
+    $changed = $false
     foreach ($name in $script:UpdateFiles) {
         try {
-            $resp = Invoke-WebRequest -Uri ($base + $name + '?_=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) `
-                        -UseBasicParsing -TimeoutSec 8 -Headers @{ 'Cache-Control' = 'no-cache'; 'Pragma' = 'no-cache' }
+            $resp = Invoke-WebRequest -Uri ($base + $name) -UseBasicParsing -TimeoutSec 10
         } catch {
-            # network problem / offline / rate-limited - abort cleanly, retry later
             if (-not $Silent) { Write-Event ("UPDATE err : {0} ({1})" -f $name, $_.Exception.Message) }
-            return $false
+            return $false                                  # abort - don't half-apply
         }
         if ($resp.StatusCode -ne 200) { return $false }
         $remote = [string]$resp.Content
-        $dest   = Join-Path $script:ScriptDir $name
-        $local  = if (Test-Path $dest) { [System.IO.File]::ReadAllText($dest) } else { $null }
+        if ($name -like '*.ps1') {
+            $perr = $null
+            [void][System.Management.Automation.Language.Parser]::ParseInput($remote, [ref]$null, [ref]$perr)
+            if ($perr -and $perr.Count) {
+                if (-not $Silent) { Write-Event ("UPDATE err : {0} from GitHub has syntax errors - update held back" -f $name) }
+                return $false
+            }
+        }
+        $dest  = Join-Path $script:ScriptDir $name
+        $local = if (Test-Path $dest) { [System.IO.File]::ReadAllText($dest) } else { $null }
         if ($remote -ne $local) {
             try {
                 [System.IO.File]::WriteAllText($dest, $remote, (New-Object System.Text.UTF8Encoding($false)))
@@ -168,9 +195,11 @@ function Invoke-SelfUpdate {
                 Write-Event ("UPDATE    : refreshed {0}" -f $name)
             } catch {
                 if (-not $Silent) { Write-Event ("UPDATE err : cannot write {0} ({1})" -f $name, $_.Exception.Message) }
+                return $false
             }
         }
     }
+    try { Set-Content -Path $script:ShaFile -Value $sha -Encoding ASCII } catch { }
     return $changed
 }
 
