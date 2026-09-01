@@ -159,6 +159,9 @@ Set-Default $n 'Sms'      ([pscustomobject]@{})
 Set-Default $n.Email 'Enabled' $false; Set-Default $n.Email 'SmtpServer' ''; Set-Default $n.Email 'Port' 587
 Set-Default $n.Email 'UseSsl'  $true;  Set-Default $n.Email 'User' '';       Set-Default $n.Email 'PassEnc' ''
 Set-Default $n.Email 'From' '';        Set-Default $n.Email 'To' ''
+# Auto = port 465 means implicit SSL, anything else means STARTTLS if UseSsl.
+# The two are NOT interchangeable and .NET's SmtpClient can only do STARTTLS.
+Set-Default $n.Email 'Security' 'Auto'
 Set-Default $n.Telegram 'Enabled' $false; Set-Default $n.Telegram 'TokenEnc' ''; Set-Default $n.Telegram 'ChatId' ''
 Set-Default $n.Sms 'Enabled' $false;   Set-Default $n.Sms 'Numbers' ''
 Set-Default $n.Sms 'UrlTemplate' 'https://YOUR-SMS-GATEWAY/api/sendsms?api_key={apikey}&msisdn={phone}&message={message}'
@@ -667,9 +670,42 @@ function Add-Notification {
     if (-not (Test-NotifyEnabled)) { return }
     if ($Kind -eq 'DOWN' -and -not $n.OnDown)    { return }
     if ($Kind -eq 'UP'   -and -not $n.OnRecover) { return }
+    # DownSince is still set at this point - Process-Result clears it right after
+    # this call - so the recovery message can carry the downtime
+    $down = ''
+    if ($Kind -eq 'UP' -and $Host_.DownSince) { $down = Format-Duration ((Get-Date) - $Host_.DownSince) }
     [void]$script:NotifyQueue.Add([pscustomobject]@{
-        Kind = $Kind; Label = $Host_.Label; Target = $Host_.Target; Time = Get-Date
+        Kind = $Kind; Label = $Host_.Label; Target = $Host_.Target; Time = Get-Date; DownFor = $down
     })
+}
+
+function Format-NotifyBody {
+    # The message people actually read, one block per event:
+    #
+    #   [red][red] "niketon pop" Down
+    #   Severity: Critical
+    #   Timestamp: 2026-09-01 14:14:16
+    #
+    # The emoji are built from code points instead of being typed literally:
+    # the installer writes these files as UTF-8 WITHOUT a BOM and Windows
+    # PowerShell 5.1 then reads a plain .ps1 as ANSI, which would mangle any
+    # literal emoji into mojibake before it ever reached Telegram.
+    param($Items)
+    $red   = [char]::ConvertFromUtf32(0x1F534)   # large red circle
+    $green = [char]::ConvertFromUtf32(0x1F7E2)   # large green circle
+    $nl    = [Environment]::NewLine
+    $blocks = @()
+    foreach ($e in $Items) {
+        $isDown = ($e.Kind -eq 'DOWN')
+        $icon   = $(if ($isDown) { $red + $red } else { $green + $green })
+        $state  = $(if ($isDown) { 'Down' } else { 'Up' })
+        $sev    = $(if ($isDown) { 'Critical' } else { 'Normal' })
+        $b = '{0} "{1}" {2}{3}Severity: {4}{3}Timestamp: {5}' -f `
+            $icon, $e.Label, $state, $nl, $sev, $e.Time.ToString('yyyy-MM-dd HH:mm:ss')
+        if (-not $isDown -and $e.DownFor) { $b += ('{0}Downtime: {1}' -f $nl, $e.DownFor) }
+        $blocks += $b
+    }
+    ($blocks -join ($nl + $nl))
 }
 
 function Expand-CmdTemplate {
@@ -691,35 +727,139 @@ $script:NotifySender = {
     }
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls } catch { }
 
+    # SmtpClient only speaks STARTTLS. On port 465 (implicit SSL, which is what
+    # most cPanel hosts hand out) it connects, waits for a plaintext greeting
+    # that never comes and dies on "The operation has timed out." So 465 gets a
+    # hand-rolled SMTP conversation over an SslStream instead.
+    function Send-SmtpImplicitSsl {
+        param($Server, $Port, $User, $Pass, $From, $Recipients, $Subject_, $Body_, $TimeoutMs = 25000)
+        $client = $null; $ssl = $null
+        try {
+            $client = New-Object System.Net.Sockets.TcpClient
+            if (-not $client.ConnectAsync($Server, [int]$Port).Wait($TimeoutMs)) { throw "connect to ${Server}:${Port} timed out" }
+            $ssl = New-Object System.Net.Security.SslStream($client.GetStream(), $false)
+            $ssl.ReadTimeout = $TimeoutMs; $ssl.WriteTimeout = $TimeoutMs
+            $proto = [System.Security.Authentication.SslProtocols]::Tls12 -bor
+                     [System.Security.Authentication.SslProtocols]::Tls11 -bor
+                     [System.Security.Authentication.SslProtocols]::Tls
+            $ssl.AuthenticateAsClient($Server, $null, $proto, $false)
+            $rd = New-Object System.IO.StreamReader($ssl, [System.Text.Encoding]::UTF8)
+            $wr = New-Object System.IO.StreamWriter($ssl, (New-Object System.Text.UTF8Encoding($false)))
+            $wr.NewLine = "`r`n"; $wr.AutoFlush = $true
+
+            function Read-Reply {
+                # SMTP replies can be multi-line: "250-CAP" ... "250 CAP" ends it
+                $last = ''
+                while ($true) {
+                    $line = $rd.ReadLine()
+                    if ($null -eq $line) { break }
+                    $last = $line
+                    if ($line -match '^\d{3} ') { break }
+                }
+                $last
+            }
+            function Say { param($cmd, $expect)
+                if ($cmd -ne $null) { $wr.WriteLine($cmd) }
+                $r = Read-Reply
+                if ($r -notmatch ('^' + $expect)) { throw ("SMTP said: " + $r) }
+                $r
+            }
+            $b64 = { param($t) [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$t)) }
+
+            [void](Say $null '220')
+            [void](Say ('EHLO {0}' -f $env:COMPUTERNAME) '250')
+            if ($User) {
+                [void](Say 'AUTH LOGIN' '334')
+                [void](Say (& $b64 $User) '334')
+                [void](Say (& $b64 $Pass) '235')
+            }
+            [void](Say ('MAIL FROM:<{0}>' -f $From) '250')
+            foreach ($rcpt in $Recipients) { [void](Say ('RCPT TO:<{0}>' -f $rcpt) '25') }
+            [void](Say 'DATA' '354')
+            $wr.WriteLine('From: {0}' -f $From)
+            $wr.WriteLine('To: {0}' -f ($Recipients -join ', '))
+            $wr.WriteLine('Subject: {0}' -f $Subject_)
+            $wr.WriteLine('MIME-Version: 1.0')
+            $wr.WriteLine('Content-Type: text/plain; charset=utf-8')
+            $wr.WriteLine('Content-Transfer-Encoding: base64')
+            $wr.WriteLine('Date: {0}' -f (Get-Date).ToString('r'))
+            $wr.WriteLine('')
+            # base64 so the emoji survive and no body line can ever look like the
+            # "." that ends DATA
+            $b = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$Body_))
+            for ($i = 0; $i -lt $b.Length; $i += 76) {
+                $wr.WriteLine($b.Substring($i, [Math]::Min(76, $b.Length - $i)))
+            }
+            [void](Say '.' '250')
+            try { $wr.WriteLine('QUIT') } catch { }
+        } finally {
+            if ($ssl)    { try { $ssl.Dispose() }    catch { } }
+            if ($client) { try { $client.Close() }   catch { } }
+        }
+    }
+
     if ($Cfg.EmailEnabled) {
         try {
-            $msg = New-Object System.Net.Mail.MailMessage
-            $msg.From = New-Object System.Net.Mail.MailAddress($Cfg.EmailFrom)
-            $any = $false
-            foreach ($to in ($Cfg.EmailTo -split '[;,]')) { if ($to.Trim()) { $msg.To.Add($to.Trim()); $any = $true } }
-            if (-not $any) { throw 'no recipient address' }
-            $msg.Subject = $Subject
-            $msg.Body    = $BodyLong
-            $cli = New-Object System.Net.Mail.SmtpClient($Cfg.EmailServer, [int]$Cfg.EmailPort)
-            $cli.EnableSsl = [bool]$Cfg.EmailSsl
-            $cli.Timeout   = 25000
-            if ($Cfg.EmailUser) {
-                $cli.UseDefaultCredentials = $false
-                $cli.Credential = New-Object System.Net.NetworkCredential($Cfg.EmailUser, $Cfg.EmailPass)
+            $rcpts = @()
+            foreach ($to in ($Cfg.EmailTo -split '[;,]')) { if ($to.Trim()) { $rcpts += $to.Trim() } }
+            if ($rcpts.Count -eq 0) { throw 'no recipient address' }
+
+            $mode = [string]$Cfg.EmailSecurity
+            if (-not $mode -or $mode -eq 'Auto') {
+                $mode = if ([int]$Cfg.EmailPort -eq 465) { 'SSL' }
+                        elseif ([bool]$Cfg.EmailSsl)     { 'STARTTLS' }
+                        else                             { 'None' }
             }
-            $cli.Send($msg)
-            $msg.Dispose(); $cli.Dispose()
-            Log ('NOTIFY    : email sent to {0}' -f $Cfg.EmailTo)
+
+            if ($mode -eq 'SSL') {
+                Send-SmtpImplicitSsl -Server $Cfg.EmailServer -Port $Cfg.EmailPort `
+                    -User $Cfg.EmailUser -Pass $Cfg.EmailPass -From $Cfg.EmailFrom `
+                    -Recipients $rcpts -Subject_ $Subject -Body_ $BodyLong
+            } else {
+                $msg = New-Object System.Net.Mail.MailMessage
+                $msg.From = New-Object System.Net.Mail.MailAddress($Cfg.EmailFrom)
+                foreach ($r in $rcpts) { $msg.To.Add($r) }
+                $msg.Subject         = $Subject
+                $msg.Body            = $BodyLong
+                $msg.SubjectEncoding = [System.Text.Encoding]::UTF8
+                $msg.BodyEncoding    = [System.Text.Encoding]::UTF8
+                $cli = New-Object System.Net.Mail.SmtpClient($Cfg.EmailServer, [int]$Cfg.EmailPort)
+                $cli.EnableSsl = ($mode -eq 'STARTTLS')
+                $cli.Timeout   = 25000
+                if ($Cfg.EmailUser) {
+                    $cli.UseDefaultCredentials = $false
+                    # NOTE: "Credentials", plural. SmtpClient has no "Credential"
+                    # property - setting it throws, which is why email silently
+                    # never worked until 1 Sep 2026.
+                    $cli.Credentials = New-Object System.Net.NetworkCredential($Cfg.EmailUser, $Cfg.EmailPass)
+                }
+                $cli.Send($msg)
+                $msg.Dispose(); $cli.Dispose()
+            }
+            Log ('NOTIFY    : email sent to {0} ({1}:{2} {3})' -f ($rcpts -join ','), $Cfg.EmailServer, $Cfg.EmailPort, $mode)
         } catch { Log ('NOTIFY err: email - {0}' -f $_.Exception.Message) }
     }
 
     if ($Cfg.TgEnabled) {
         try {
-            $uri  = 'https://api.telegram.org/bot{0}/sendMessage' -f $Cfg.TgToken
-            $body = @{ chat_id = $Cfg.TgChat; text = $BodyLong; disable_web_page_preview = 'true' }
-            $null = Invoke-WebRequest -Uri $uri -Method Post -Body $body -UseBasicParsing -TimeoutSec 25
+            $uri = 'https://api.telegram.org/bot{0}/sendMessage' -f $Cfg.TgToken
+            # percent-encode the form body ourselves: EscapeDataString is UTF-8,
+            # so the status emoji survive whatever the console code page is
+            $body = 'chat_id={0}&disable_web_page_preview=true&text={1}' -f `
+                [Uri]::EscapeDataString([string]$Cfg.TgChat), [Uri]::EscapeDataString([string]$BodyLong)
+            $null = Invoke-WebRequest -Uri $uri -Method Post -Body $body -UseBasicParsing -TimeoutSec 25 `
+                -ContentType 'application/x-www-form-urlencoded; charset=utf-8'
             Log ('NOTIFY    : telegram sent to chat {0}' -f $Cfg.TgChat)
-        } catch { Log ('NOTIFY err: telegram - {0}' -f $_.Exception.Message) }
+        } catch {
+            $detail = $_.Exception.Message
+            try {
+                $rs = $_.Exception.Response.GetResponseStream()
+                $sr = New-Object System.IO.StreamReader($rs)
+                $txt = $sr.ReadToEnd()
+                if ($txt) { $detail = $detail + ' | ' + (($txt -replace '\s+', ' ').Trim()) }
+            } catch { }
+            Log ('NOTIFY err: telegram - {0}' -f $detail)
+        }
     }
 
     if ($Cfg.SmsEnabled) {
@@ -834,6 +974,7 @@ function Send-Notification {
         EmailServer  = [string]$n.Email.SmtpServer
         EmailPort    = [int]$n.Email.Port
         EmailSsl     = [bool]$n.Email.UseSsl
+        EmailSecurity = [string]$n.Email.Security
         EmailUser    = [string]$n.Email.User
         EmailPass    = (Unprotect-Secret ([string]$n.Email.PassEnc))
         EmailFrom    = [string]$n.Email.From
@@ -893,28 +1034,30 @@ function Send-QueuedNotifications {
     $downs = @($items | Where-Object { $_.Kind -eq 'DOWN' })
     $ups   = @($items | Where-Object { $_.Kind -eq 'UP' })
     $where = $env:COMPUTERNAME
-    $subject = if ($downs.Count -gt 0) { 'GCL Ping Monitor: {0} DOWN' -f $downs.Count }
-               else                    { 'GCL Ping Monitor: {0} recovered' -f $ups.Count }
-
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine(('GCL Ping Monitor  ({0})' -f $where))
-    [void]$sb.AppendLine((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
-    if ($downs.Count -gt 0) {
-        [void]$sb.AppendLine('')
-        [void]$sb.AppendLine(('DOWN ({0}):' -f $downs.Count))
-        foreach ($d in $downs) { [void]$sb.AppendLine(('  {0}  [{1}]' -f $d.Label, $d.Target)) }
+    # one event is the normal case, so the subject names the host rather than
+    # counting it
+    $subject = if ($items.Count -eq 1) {
+        '{0} "{1}" {2}' -f $(if ($downs.Count) { '[CRITICAL]' } else { '[OK]' }), $items[0].Label,
+                            $(if ($downs.Count) { 'Down' } else { 'Up' })
+    } elseif ($downs.Count -gt 0 -and $ups.Count -gt 0) {
+        '[CRITICAL] {0} Down, {1} Up' -f $downs.Count, $ups.Count
+    } elseif ($downs.Count -gt 0) {
+        '[CRITICAL] {0} host(s) Down' -f $downs.Count
+    } else {
+        '[OK] {0} host(s) Up' -f $ups.Count
     }
-    if ($ups.Count -gt 0) {
-        [void]$sb.AppendLine('')
-        [void]$sb.AppendLine(('RECOVERED ({0}):' -f $ups.Count))
-        foreach ($u in $ups) { [void]$sb.AppendLine(('  {0}  [{1}]' -f $u.Label, $u.Target)) }
-    }
-    $long = $sb.ToString()
 
+    $long = Format-NotifyBody $items
+
+    # SMS / modem text: plain ASCII on purpose - emoji force a phone into UCS-2
+    # and halve the characters that fit in one SMS
     $parts = @()
-    if ($downs.Count -gt 0) { $parts += ('DOWN: ' + (($downs | ForEach-Object { $_.Label }) -join ', ')) }
-    if ($ups.Count   -gt 0) { $parts += ('UP: '   + (($ups   | ForEach-Object { $_.Label }) -join ', ')) }
-    $short = ('[{0}] ' -f $where) + ($parts -join ' | ')
+    foreach ($e in $items) {
+        $p = '"{0}" {1}' -f $e.Label, $(if ($e.Kind -eq 'DOWN') { 'Down' } else { 'Up' })
+        if ($e.Kind -eq 'UP' -and $e.DownFor) { $p += (' (was down {0})' -f $e.DownFor) }
+        $parts += $p
+    }
+    $short = ('[{0}] {1} - {2}' -f $where, ($parts -join '; '), (Get-Date -Format 'HH:mm:ss'))
     if ($short.Length -gt 300) { $short = $short.Substring(0, 297) + '...' }
 
     Write-Event ('NOTIFY    : sending ({0} down, {1} up)' -f $downs.Count, $ups.Count)
@@ -1861,7 +2004,19 @@ $miNotify.Add_Click({
     $mSrv  = NTxt $n.Email.SmtpServer;        NRow $pMail 'SMTP server' $mSrv
     $mPort = New-Object System.Windows.Forms.NumericUpDown; $mPort.Minimum=1; $mPort.Maximum=65535; $mPort.Value=[Math]::Min([Math]::Max([int]$n.Email.Port,1),65535)
     NRow $pMail 'Port' $mPort 8
-    $mSsl  = NChk $pMail 'Use SSL / TLS' $n.Email.UseSsl
+    # SSL/TLS on 465 and STARTTLS on 587 are NOT the same protocol - picking the
+    # wrong one just times out, so it is a choice, not a checkbox
+    $mSec = New-Object System.Windows.Forms.ComboBox; $mSec.DropDownStyle = 'DropDownList'
+    [void]$mSec.Items.AddRange(@(
+        'Auto  (465 = SSL, else STARTTLS)',
+        'STARTTLS  (587 / 25)',
+        'SSL / TLS  (465)',
+        'None'))
+    $mSecKeys = @('Auto','STARTTLS','SSL','None')
+    $ix = [Array]::IndexOf($mSecKeys, [string]$n.Email.Security)
+    if ($ix -lt 0) { $ix = 0 }
+    $mSec.SelectedIndex = $ix
+    NRow $pMail 'Security' $mSec 24
     $mUser = NTxt $n.Email.User;              NRow $pMail 'Username' $mUser
     $mPass = NTxt '' -Pass;                   NRow $pMail 'Password' $mPass
     if ($n.Email.PassEnc) { $mPass.Text = '********' }
@@ -1999,7 +2154,8 @@ $miNotify.Add_Click({
         $n.Email.Enabled    = [bool]$mEn.Checked
         $n.Email.SmtpServer = $mSrv.Text.Trim()
         $n.Email.Port       = [int]$mPort.Value
-        $n.Email.UseSsl     = [bool]$mSsl.Checked
+        $n.Email.Security   = $mSecKeys[$mSec.SelectedIndex]
+        $n.Email.UseSsl     = ($n.Email.Security -ne 'None')   # kept for older builds
         $n.Email.User       = $mUser.Text.Trim()
         if ($mPass.Text -ne '********') { $n.Email.PassEnc = Protect-Secret $mPass.Text }
         $n.Email.From       = $mFrom.Text.Trim()
@@ -2037,10 +2193,15 @@ $miNotify.Add_Click({
             [System.Windows.Forms.MessageBox]::Show('Enable at least one channel first.', 'Send test', 'OK', 'Information') | Out-Null
             return
         }
-        # a fake event so the command channel has something to expand {host} with
-        Send-Notification -Subject 'GCL Ping Monitor - test' `
-            -BodyLong  ("This is a test from GCL Ping Monitor on {0}.`r`n{1}" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) `
-            -BodyShort ("[{0}] GCL Ping Monitor test message" -f $env:COMPUTERNAME) `
+        # a fake event, so the test looks exactly like a real alert - including
+        # the emoji, which is the bit worth proving on a new machine
+        $fake = @([pscustomobject]@{
+            Kind = 'DOWN'; Label = 'TEST-HOST'; Target = '0.0.0.0'; Time = Get-Date; DownFor = ''
+        })
+        Send-Notification -Subject '[TEST] GCL Ping Monitor' `
+            -BodyLong  ((Format-NotifyBody $fake) + [Environment]::NewLine + [Environment]::NewLine +
+                        ('(test message from {0})' -f $env:COMPUTERNAME)) `
+            -BodyShort ('[{0}] GCL Ping Monitor test message' -f $env:COMPUTERNAME) `
             -Events @(@{ Kind = 'DOWN'; Label = 'TEST-HOST'; Target = '0.0.0.0' })
         Write-Event 'NOTIFY    : test message queued'
         [System.Windows.Forms.MessageBox]::Show("Test sent. Watch the log panel for 'NOTIFY : ... sent' or an error.", 'Send test', 'OK', 'Information') | Out-Null

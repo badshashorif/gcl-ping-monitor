@@ -199,7 +199,7 @@ default; turn on any combination.
 
 | Tab | What you need |
 |---|---|
-| **Email** | SMTP server, port, SSL on/off, username, password, From, To (comma separated) |
+| **Email** | SMTP server, port, **Security**, username, password, From, To (comma separated) |
 | **Telegram** | Bot token from [@BotFather](https://t.me/BotFather) and a chat ID (get it from `https://api.telegram.org/bot<TOKEN>/getUpdates`; group ids start with `-100`) |
 | **SMS** | Your gateway's HTTP URL plus the phone numbers |
 | **Command (offline)** | A local program to run — see [below](#command-offline--gsm-modem) |
@@ -231,6 +231,42 @@ Behaviour:
 - A **max messages/hour** cap (default 20) stops an outage storm burning your SMS
   balance. Suppressed messages are noted in the log.
 - Sending runs off the UI thread, so a slow SMTP server never freezes the window.
+
+### What the message looks like
+
+```
+🔴🔴 "niketon pop" Down
+Severity: Critical
+Timestamp: 2026-09-01 14:14:16
+
+🟢🟢 "niketon pop" Up
+Severity: Normal
+Timestamp: 2026-09-01 14:15:24
+Downtime: 1m 8s
+```
+
+Email and Telegram get this; the email subject is
+`[CRITICAL] "niketon pop" Down`. SMS and the offline command get a plain-ASCII
+one-liner instead — emoji push a phone into UCS-2 and halve how much fits in one
+SMS.
+
+### Email security: 465 and 587 are not the same
+
+The **Security** box on the Email tab matters more than it looks:
+
+| Setting | Use it for |
+|---|---|
+| **Auto** (default) | port 465 → SSL/TLS, anything else → STARTTLS |
+| **STARTTLS** | port 587 or 25 — the connection starts plain and is upgraded |
+| **SSL / TLS** | port 465 — the connection is encrypted from the first byte |
+| **None** | plain SMTP, no encryption |
+
+They are different protocols, not two names for the same thing. .NET's own
+`SmtpClient` speaks **only STARTTLS**, so on port 465 it waits for a plaintext
+greeting that never arrives and eventually fails with *"The operation has timed
+out"* — which is what a lot of "my SMTP works in Outlook but not here" reports
+turn out to be. This tool therefore talks SMTP over an SSL stream itself for 465
+and 465 works as you would expect.
 
 ### Command (offline) — GSM modem
 
