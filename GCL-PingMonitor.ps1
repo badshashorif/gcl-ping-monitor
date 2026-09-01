@@ -109,9 +109,9 @@ if (-not $script:Config) {
         Hosts           = @()
     }
 }
-foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','AutoUpdate','UpdateHours','TextSize','Hosts') {
+foreach ($p in 'IntervalSeconds','TimeoutMs','FailThreshold','AlwaysOnTop','AutoUpdate','UpdateHours','TextSize','LossWindow','SplitPercent','Hosts') {
     if ($null -eq $script:Config.$p) {
-        $def = switch ($p) { 'IntervalSeconds' {$IntervalSeconds} 'TimeoutMs' {$TimeoutMs} 'FailThreshold' {$FailThreshold} 'AlwaysOnTop' {$false} 'AutoUpdate' {$true} 'UpdateHours' {6} 'TextSize' {12} 'Hosts' {@()} }
+        $def = switch ($p) { 'IntervalSeconds' {$IntervalSeconds} 'TimeoutMs' {$TimeoutMs} 'FailThreshold' {$FailThreshold} 'AlwaysOnTop' {$false} 'AutoUpdate' {$true} 'UpdateHours' {6} 'TextSize' {12} 'LossWindow' {100} 'SplitPercent' {72} 'Hosts' {@()} }
         $script:Config | Add-Member -NotePropertyName $p -NotePropertyValue $def -Force
     }
 }
@@ -167,7 +167,43 @@ function New-HostState {
         Ping       = $null
         SyncError  = $null
         StyleKey   = ''          # cached row style so we only restyle on change
+        Hist       = (New-Object System.Collections.Generic.Queue[bool])  # rolling ping results
+        Lost       = 0           # failures currently inside Hist
+        TotSent    = 0           # lifetime counters, for the tooltip
+        TotLost    = 0
+        LastRtts   = (New-Object System.Collections.Generic.Queue[int])   # for average latency
     }
+}
+
+# Rolling packet-loss window. Keeping a running "Lost" counter and adjusting it
+# as samples fall out of the queue avoids rescanning the whole history 3x/sec.
+function Add-PingSample {
+    param($h, [bool]$Ok, $Rtt)
+    $h.TotSent++
+    if (-not $Ok) { $h.TotLost++ }
+    $h.Hist.Enqueue($Ok)
+    if (-not $Ok) { $h.Lost++ }
+    $win = [int]$script:Config.LossWindow
+    if ($win -lt 5) { $win = 5 }
+    while ($h.Hist.Count -gt $win) {
+        if (-not $h.Hist.Dequeue()) { $h.Lost-- }
+    }
+    if ($Ok -and $null -ne $Rtt) {
+        $h.LastRtts.Enqueue([int]$Rtt)
+        while ($h.LastRtts.Count -gt 20) { [void]$h.LastRtts.Dequeue() }
+    }
+}
+
+function Get-LossPercent {
+    param($h)
+    if ($h.Hist.Count -eq 0) { return $null }
+    [int][Math]::Round(($h.Lost * 100.0) / $h.Hist.Count)
+}
+
+function Reset-HostStats {
+    param($h)
+    $h.Hist.Clear(); $h.LastRtts.Clear()
+    $h.Lost = 0; $h.TotSent = 0; $h.TotLost = 0
 }
 
 foreach ($c in @($script:Config.Hosts)) {
@@ -296,6 +332,7 @@ function Save-Config {
         $script:Config.AlwaysOnTop     = [bool]$script:chkTop.Checked
         if ($script:chkAutoUpdate) { $script:Config.AutoUpdate = [bool]$script:chkAutoUpdate.Checked }
         if ($script:TextSize)      { $script:Config.TextSize   = [int]$script:TextSize }
+        if ($script:numLoss)       { $script:Config.LossWindow = [int]$script:numLoss.Value }
         $script:Config.Hosts = @($script:Hosts | ForEach-Object {
             [pscustomobject]@{ Label = $_.Label; Target = $_.Target; Enabled = [bool]$_.Enabled }
         })
@@ -330,6 +367,8 @@ function Process-Result {
     param($h, [bool]$ok, $rtt)
     $threshold = [int]$script:Config.FailThreshold
     if ($threshold -lt 1) { $threshold = 1 }
+
+    Add-PingSample $h $ok $rtt
 
     if ($ok) {
         $h.Latency = $rtt
@@ -786,6 +825,11 @@ $numThreshold.Minimum = 1; $numThreshold.Maximum = 10
 $numThreshold.Value = [Math]::Min([Math]::Max([int]$script:Config.FailThreshold,1),10)
 $numThreshold.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
 
+$numLoss = New-Object System.Windows.Forms.NumericUpDown
+$numLoss.Minimum = 5; $numLoss.Maximum = 5000; $numLoss.Increment = 10
+$numLoss.Value = [Math]::Min([Math]::Max([int]$script:Config.LossWindow,5),5000)
+$numLoss.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
+
 $cboSize = New-Object System.Windows.Forms.ComboBox
 $cboSize.DropDownStyle = 'DropDownList'
 $cboSize.Margin = New-Object System.Windows.Forms.Padding(2, 5, 6, 0)
@@ -827,6 +871,7 @@ $panelTop.Controls.AddRange(@(
     (New-Lbl 'Interval s:'), $numInterval,
     (New-Lbl 'Timeout ms:'), $numTimeout,
     (New-Lbl 'Fails->down:'), $numThreshold,
+    (New-Lbl 'Loss over:'), $numLoss,
     (New-Lbl 'Text:'), $cboSize,
     $chkTop, $chkAutoUpdate, $btnNotify, $btnUpdate, $btnRestartNow
 ))
@@ -835,9 +880,24 @@ $panelTop.Controls.AddRange(@(
 $split = New-Object System.Windows.Forms.SplitContainer
 $split.Dock = 'Fill'
 $split.Orientation = 'Horizontal'
-$split.SplitterDistance = 340
+$split.Panel1MinSize = 120
+$split.Panel2MinSize = 80
 $form.Controls.Add($split)
 $split.BringToFront()
+
+# A fixed SplitterDistance set before the control is laid out ends up wrong once
+# the form has its real size - that is how the log panel got squashed to one
+# line. Drive it from a saved percentage instead.
+function Apply-SplitPercent {
+    try {
+        $pct = [double]$script:Config.SplitPercent
+        if ($pct -lt 25) { $pct = 25 }; if ($pct -gt 90) { $pct = 90 }
+        $h = $split.Height
+        if ($h -gt ($split.Panel1MinSize + $split.Panel2MinSize + 20)) {
+            $split.SplitterDistance = [int]($h * $pct / 100.0)
+        }
+    } catch { }
+}
 
 $grid = New-Object System.Windows.Forms.DataGridView
 $grid.Dock = 'Fill'
@@ -866,12 +926,14 @@ $null = $grid.Columns.Add('cLabel',  'Name')
 $null = $grid.Columns.Add('cTarget', 'IP / Host')
 $null = $grid.Columns.Add('cStatus', 'Status')
 $null = $grid.Columns.Add('cLat',    'Latency')
+$null = $grid.Columns.Add('cLoss',   'Loss %')
 $null = $grid.Columns.Add('cSince',  'Since')
 $null = $grid.Columns.Add('cDown',   'Down for')
 $grid.Columns['cLabel'].FillWeight  = 130
 $grid.Columns['cTarget'].FillWeight = 120
 $grid.Columns['cStatus'].FillWeight = 80
-$grid.Columns['cLat'].FillWeight    = 60
+$grid.Columns['cLat'].FillWeight    = 62
+$grid.Columns['cLoss'].FillWeight   = 62
 $grid.Columns['cSince'].FillWeight  = 90
 $grid.Columns['cDown'].FillWeight   = 70
 $split.Panel1.Controls.Add($grid)
@@ -905,6 +967,7 @@ function Apply-TextSize {
     $txtTarget.Width = [int]($s * 14)
     $txtSearch.Width = [int]($s * 14)
     foreach ($n in @($numInterval, $numTimeout, $numThreshold)) { $n.Width = [int]($s * 6.5) }
+    $numLoss.Width = [int]($s * 7.5)
     $cboSize.Width = [int]($s * 11)
 
     $btnAck.Font        = UiFont -Bold
@@ -995,7 +1058,7 @@ function Rebuild-Grid {
     $grid.SuspendLayout()
     $grid.Rows.Clear()
     foreach ($h in $script:Visible) {
-        $i = $grid.Rows.Add(@($h.Label, $h.Target, '', '', '', ''))
+        $i = $grid.Rows.Add(@($h.Label, $h.Target, '', '', '', '', ''))
         $grid.Rows[$i].Tag = $h
         $h.StyleKey = ''                       # force a restyle on the new row
     }
@@ -1048,7 +1111,20 @@ function Refresh-Grid {
         $row.Cells['cSince'].Value  = if ($h.LastChange) { $h.LastChange.ToString('MM-dd HH:mm:ss') } else { '' }
         $row.Cells['cDown'].Value   = if ($h.Enabled -and $h.Status -eq 'DOWN' -and $h.DownSince) { Format-Duration ((Get-Date) - $h.DownSince) } else { '' }
 
-        $key = "$statusText|$($script:TextSize)"
+        $loss = Get-LossPercent $h
+        if ($null -eq $loss) {
+            $row.Cells['cLoss'].Value = ''
+            $lossBucket = 'na'
+        } else {
+            $row.Cells['cLoss'].Value = "$loss %"
+            $lossBucket = if ($loss -eq 0) { 'ok' } elseif ($loss -lt 10) { 'low' } elseif ($loss -lt 50) { 'mid' } else { 'high' }
+            $avg = if ($h.LastRtts.Count -gt 0) { [int]((@($h.LastRtts.ToArray()) | Measure-Object -Average).Average) } else { $null }
+            $row.Cells['cLoss'].ToolTipText = ("{0} lost of last {1} pings   (lifetime {2}/{3}){4}" -f `
+                $h.Lost, $h.Hist.Count, $h.TotLost, $h.TotSent,
+                $(if ($null -ne $avg) { "`r`navg latency {0} ms (last {1})" -f $avg, $h.LastRtts.Count } else { '' }))
+        }
+
+        $key = "$statusText|$lossBucket|$($script:TextSize)"
         if ($h.StyleKey -ne $key) {
             $h.StyleKey = $key
             $row.DefaultCellStyle.BackColor = $bg
@@ -1056,6 +1132,26 @@ function Refresh-Grid {
             $row.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::White
             $row.DefaultCellStyle.Font = if ($bold) { UiFont 1.0 -Bold } else { UiFont }
             $row.Height = [int]($script:TextSize * 2.5)
+
+            # loss cell gets its own emphasis on a healthy-looking (green) row,
+            # so partial loss on a host that is still "UP" cannot be missed
+            $lc = $row.Cells['cLoss']
+            if ($statusText -eq 'UP') {
+                switch ($lossBucket) {
+                    'ok'   { $lc.Style.ForeColor = $fg;                                        $lc.Style.Font = UiFont }
+                    'low'  { $lc.Style.ForeColor = [System.Drawing.Color]::FromArgb(150,90,0);  $lc.Style.Font = UiFont 1.0 -Bold }
+                    'mid'  { $lc.Style.BackColor = $colWarnBg
+                             $lc.Style.ForeColor = [System.Drawing.Color]::FromArgb(120,60,0);  $lc.Style.Font = UiFont 1.0 -Bold }
+                    'high' { $lc.Style.BackColor = [System.Drawing.Color]::FromArgb(255,170,170)
+                             $lc.Style.ForeColor = [System.Drawing.Color]::FromArgb(150,20,20); $lc.Style.Font = UiFont 1.0 -Bold }
+                    default { $lc.Style.ForeColor = $fg;                                       $lc.Style.Font = UiFont }
+                }
+                if ($lossBucket -in 'ok','low','na') { $lc.Style.BackColor = $bg }
+            } else {
+                $lc.Style.BackColor = $bg
+                $lc.Style.ForeColor = $fg
+                $lc.Style.Font = if ($bold) { UiFont 1.0 -Bold } else { UiFont }
+            }
         }
     }
 }
@@ -1201,6 +1297,7 @@ function Edit-SelectedHost {
         $h.Status = if ($h.Enabled) { 'INIT' } else { 'OFF' }
         $h.Latency = $null; $h.DownSince = $null; $h.LastChange = $null
         $h.Acked = $false; $h.FailCount = 0; $h.Task = $null; $h.Ping = $null
+        Reset-HostStats $h
     }
     $h.StyleKey = ''
     Write-Event ("EDITED    : {0} [{1}]  ->  {2} [{3}]" -f $oldLabel, $oldTarget, $h.Label, $h.Target)
@@ -1418,6 +1515,7 @@ $btnToggle.Add_Click({
         if ($h.Enabled) {
             $h.Status = 'INIT'; $h.FailCount = 0; $h.Acked = $false
             $h.DownSince = $null; $h.Latency = $null; $h.LastChange = Get-Date
+            Reset-HostStats $h            # loss % from before the outage is meaningless
             Write-Event ("ENABLED   : {0} [{1}]" -f $h.Label, $h.Target)
         } else {
             $h.Status = 'OFF'; $h.FailCount = 0; $h.Acked = $false
@@ -1482,6 +1580,17 @@ $btnTest.Add_Click({
 $numInterval.Add_ValueChanged({ $script:checkTimer.Interval = [int]$numInterval.Value * 1000; Save-Config; Refresh-Status })
 $numTimeout.Add_ValueChanged({ Save-Config })
 $numThreshold.Add_ValueChanged({ Save-Config })
+$numLoss.Add_ValueChanged({
+    $script:Config.LossWindow = [int]$numLoss.Value
+    foreach ($h in $script:Hosts) { $h.StyleKey = '' }
+    Save-Config
+})
+$split.Add_SplitterMoved({
+    if ($split.Height -gt 0) {
+        $script:Config.SplitPercent = [int](100.0 * $split.SplitterDistance / $split.Height)
+        Save-Config
+    }
+})
 $chkTop.Add_CheckedChanged({ $form.TopMost = $chkTop.Checked; Save-Config })
 $chkAutoUpdate.Add_CheckedChanged({ Save-Config })
 $cboSize.Add_SelectedIndexChanged({
@@ -1592,6 +1701,7 @@ $script:btnAck        = $btnAck
 $script:chkAutoUpdate = $chkAutoUpdate
 $script:btnRestartNow = $btnRestartNow
 $script:txtSearch     = $txtSearch
+$script:numLoss       = $numLoss
 $script:Version       = Get-LocalScriptVersion
 $form.Text = "GCL Ping Monitor  -  v:$($script:Version)"
 
@@ -1614,6 +1724,7 @@ function Show-MainWindow {
 $form.Add_Shown({
     Show-MainWindow
     Apply-TextSize $script:TextSize
+    Apply-SplitPercent
     Rebuild-Grid
     Refresh-Banner
     Refresh-Status
