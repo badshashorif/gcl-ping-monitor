@@ -36,6 +36,12 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
 
+try {
+    Add-Type -Namespace Win32 -Name Flash -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool FlashWindow(IntPtr hwnd, bool bInvert);
+'@
+} catch { }
+
 # ---------------------------------------------------------------------------
 #  Paths / config
 # ---------------------------------------------------------------------------
@@ -73,7 +79,7 @@ $script:Hosts        = New-Object System.Collections.Generic.List[object]
 $script:CycleRunning = $false
 $script:Paused       = $false
 $script:LastCheck    = $null
-$script:AlarmPlaying = $false
+$script:AlarmActive  = $false
 
 function New-HostState {
     param($Label, $Target)
@@ -295,37 +301,92 @@ function Poll-Results {
 # ---------------------------------------------------------------------------
 #  Alarm
 # ---------------------------------------------------------------------------
-$script:AlarmWav = @(
-    (Join-Path $env:WINDIR 'Media\Alarm01.wav'),
-    (Join-Path $env:WINDIR 'Media\Alarm02.wav'),
-    (Join-Path $env:WINDIR 'Media\Ring06.wav'),
-    (Join-Path $env:WINDIR 'Media\notify.wav'),
-    (Join-Path $env:WINDIR 'Media\Windows Foreground.wav')
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
+#  We generate our OWN alarm.wav (a loud two-tone siren) so the alarm never
+#  depends on the Windows sound scheme - which on a lot of machines is set to
+#  "No Sounds", which is why SystemSounds / MessageBeep can be silent.
+#  The sound is (re)started on a short timer while the alarm is active, rather
+#  than PlayLooping(), because a re-triggered Play() is self-healing.
+
+function New-AlarmWav {
+    param([string]$Path)
+    try {
+        $sr = 16000
+        $segments = @(
+            @{ F = 880;  Ms = 260 },
+            @{ F = 0;    Ms = 80  },
+            @{ F = 1245; Ms = 260 },
+            @{ F = 0;    Ms = 240 }
+        )
+        $mem = New-Object System.IO.MemoryStream
+        foreach ($seg in $segments) {
+            $n = [int]($sr * $seg.Ms / 1000)
+            $fade = [int]($sr * 0.008)
+            for ($i = 0; $i -lt $n; $i++) {
+                $amp = 0
+                if ($seg.F -gt 0) {
+                    $e = 1.0
+                    if ($i -lt $fade) { $e = $i / $fade }
+                    elseif ($i -gt ($n - $fade)) { $e = ($n - $i) / $fade }
+                    $amp = [int][math]::Round([math]::Sin(2 * [math]::PI * $seg.F * $i / $sr) * 27000 * $e)
+                }
+                $bytes = [System.BitConverter]::GetBytes([int16]$amp)
+                $mem.Write($bytes, 0, 2)
+            }
+        }
+        $pcm = $mem.ToArray()
+        $fs  = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Create)
+        $bw  = New-Object System.IO.BinaryWriter($fs)
+        $ascii = [System.Text.Encoding]::ASCII
+        $bw.Write($ascii.GetBytes('RIFF')); $bw.Write([int](36 + $pcm.Length)); $bw.Write($ascii.GetBytes('WAVE'))
+        $bw.Write($ascii.GetBytes('fmt ')); $bw.Write([int]16)
+        $bw.Write([int16]1); $bw.Write([int16]1); $bw.Write([int]$sr)
+        $bw.Write([int]($sr * 2)); $bw.Write([int16]2); $bw.Write([int16]16)
+        $bw.Write($ascii.GetBytes('data')); $bw.Write([int]$pcm.Length); $bw.Write($pcm)
+        $bw.Close(); $fs.Close()
+        return (Test-Path $Path)
+    } catch { return $false }
+}
+
+$script:AlarmWavPath = Join-Path $script:AppDir 'alarm.wav'
+if (-not (Test-Path $script:AlarmWavPath)) { [void](New-AlarmWav -Path $script:AlarmWavPath) }
+if (-not (Test-Path $script:AlarmWavPath)) {
+    $script:AlarmWavPath = @(
+        (Join-Path $env:WINDIR 'Media\Alarm01.wav'),
+        (Join-Path $env:WINDIR 'Media\Ring06.wav'),
+        (Join-Path $env:WINDIR 'Media\notify.wav')
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
 
 $script:Player = $null
-if ($script:AlarmWav) {
-    try { $script:Player = New-Object System.Media.SoundPlayer $script:AlarmWav } catch { $script:Player = $null }
-}
+try {
+    if ($script:AlarmWavPath -and (Test-Path $script:AlarmWavPath)) {
+        $script:Player = New-Object System.Media.SoundPlayer $script:AlarmWavPath
+        $script:Player.Load()
+    }
+} catch { $script:Player = $null }
+
+$script:AlarmActive = $false
 
 function Get-AlarmHosts {
     @($script:Hosts | Where-Object { $_.Status -eq 'DOWN' -and -not $_.Acked })
 }
 
+function Play-Alarm {
+    try { if ($script:Player) { $script:Player.Play(); return } } catch { }
+    try { [System.Media.SystemSounds]::Hand.Play() } catch { }
+}
+
 function Update-Alarm {
-    $down = Get-AlarmHosts
-    $active = $down.Count -gt 0
-    if ($active -and -not $script:AlarmPlaying) {
-        $script:AlarmPlaying = $true
-        if ($script:Player) { try { $script:Player.PlayLooping() } catch { } }
-        $script:AlarmTimer.Start()
-        $script:btnAck.Enabled = $true
-    }
-    elseif (-not $active -and $script:AlarmPlaying) {
-        $script:AlarmPlaying = $false
-        if ($script:Player) { try { $script:Player.Stop() } catch { } }
-        $script:AlarmTimer.Stop()
-        $script:btnAck.Enabled = $false
+    $active = (Get-AlarmHosts).Count -gt 0
+    if ($script:btnAck) { $script:btnAck.Enabled = $active }
+    if ($active -eq $script:AlarmActive) { return }
+    $script:AlarmActive = $active
+    if ($active) {
+        $src = if ($script:Player) { Split-Path $script:AlarmWavPath -Leaf } else { 'system sound' }
+        Write-Event ("ALARM     : ON  ({0} down, sound={1})" -f (Get-AlarmHosts).Count, $src)
+        Play-Alarm
+    } else {
+        Write-Event 'ALARM     : off'
     }
 }
 
@@ -648,8 +709,9 @@ $btnPause.Add_Click({
 })
 
 $btnTest.Add_Click({
-    if ($script:Player) { try { $script:Player.Play() } catch { [System.Media.SystemSounds]::Exclamation.Play() } }
-    else { [System.Media.SystemSounds]::Exclamation.Play() }
+    Play-Alarm
+    $src = if ($script:Player) { Split-Path $script:AlarmWavPath -Leaf } else { 'system sound (Windows sounds may be off!)' }
+    Write-Event ("TEST      : played alarm - source: {0}" -f $src)
 })
 
 $numInterval.Add_ValueChanged({ $script:checkTimer.Interval = [int]$numInterval.Value * 1000; Save-Config; Refresh-Status })
@@ -712,9 +774,14 @@ $script:uiTimer.Add_Tick({
 })
 
 $script:AlarmTimer = New-Object System.Windows.Forms.Timer
-$script:AlarmTimer.Interval = 2500
+$script:AlarmTimer.Interval = 1400
 $script:AlarmTimer.Add_Tick({
-    if (-not $script:Player -and $script:AlarmPlaying) { [System.Media.SystemSounds]::Hand.Play() }
+    if ($script:AlarmActive) {
+        Play-Alarm
+        try {
+            if (-not $form.ContainsFocus) { [Win32.Flash]::FlashWindow($form.Handle, $true) }
+        } catch { }
+    }
 })
 
 # background self-update check while the app is running
@@ -755,6 +822,7 @@ $form.Add_Shown({
     Write-Event ("MONITOR   : started - v:{0} - {1} host(s) loaded" -f $script:Version, $script:Hosts.Count)
     $script:checkTimer.Start()
     $script:uiTimer.Start()
+    $script:AlarmTimer.Start()
     if (-not $script:IsGitCheckout) { $script:updateTimer.Start() }
     Start-CheckCycle
     if ($script:Hosts.Count -eq 0) { $txtTarget.Focus() }
