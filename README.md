@@ -82,17 +82,20 @@ Delete these two shortcuts and one folder:
 ## What it does
 
 - **Add / edit / remove** hosts right in the window — the list is saved
-  automatically. Edit with the **Edit** button or by **double-clicking a row**.
-  **Hosts → Add many hosts...** takes a pasted list, including IP ranges.
+  automatically. **Add host** on the toolbar opens a small dialog; edit by
+  **double-clicking a row**. **Hosts → Add many hosts...** takes a pasted list,
+  including IP ranges.
 - **Enable / Disable** any host. A disabled host is not pinged, shows greyed out
   as `DISABLED`, and can never raise the alarm — use it for kit that is down for
   maintenance instead of deleting it.
 - **Alarm on / off per host** — the **Alarm** tick box in the row. Off means the
   host is still pinged and still shown, but it makes no sound and sends no
   message. For a link you know is flapping and do not want to be woken by.
-- **Tick boxes** in the first column select as many hosts as you like, and every
-  action then applies to all of them at once — enable, disable, mute, acknowledge,
-  reset statistics, copy, delete. See [Bulk actions](#bulk-actions).
+- **Tick boxes** in the first column select as many hosts as you like, and the
+  **Bulk select** button on the toolbar then applies one action to all of them —
+  enable, disable, mute, acknowledge, reset statistics, copy, delete. The check
+  box in that column's **header** ticks or unticks everything on screen.
+  See [Bulk actions](#bulk-actions).
 - **Loss %** column shows rolling packet loss over the last N pings (N is the
   **Loss over** box, default 100). It is colour-graded — amber past 10%, red past
   50% — so a host that is still *UP* but dropping packets cannot be missed.
@@ -193,13 +196,17 @@ the default siren rather than going silent.
 
 ## Bulk actions
 
-The first column is a **tick box**. Tick as many hosts as you want and every
+The first column is a **tick box**, and the **Bulk select** button on the
+toolbar is where the actions live. Tick as many hosts as you want and every
 action below applies to all of them in one go.
+
+The button shows the count — **Bulk select (4)** — and its menu spells out what
+each entry will do: `Disable (4 ticked)`.
 
 | How | |
 |---|---|
 | tick one host | click its box |
-| tick / untick **everything showing** | click the **tick-box column header** |
+| tick / untick **everything showing** | click the check box in the **column header** |
 | tick a group | type in **Search** first — *Tick all shown* only ticks what the filter is showing |
 | untick everything | **Hosts → Untick all** |
 | invert | **Hosts → Invert ticks** |
@@ -215,12 +222,12 @@ does not.
 
 | Bulk action | Where | What it does |
 |---|---|---|
-| **Enable** / **Disable** | Hosts menu, right-click | starts / stops monitoring them |
-| **Alarm ON** / **Alarm OFF** | Hosts menu, right-click | mutes them without stopping monitoring |
-| **Acknowledge** | Hosts menu | acknowledges only those hosts (the toolbar **ACKNOWLEDGE** does all of them) |
-| **Reset statistics** | Hosts menu, right-click | clears loss % / latency history — use it after fixing a link |
-| **Copy to clipboard** | Hosts menu, right-click | CSV: name, address, monitoring, alarm, status |
-| **Remove** | Hosts menu, right-click | deletes them — the confirm box **lists what it is about to delete** and defaults to *No* |
+| **Enable** / **Disable** | Bulk select, Hosts menu, right-click | starts / stops monitoring them |
+| **Alarm ON** / **Alarm OFF** | Bulk select, Hosts menu, right-click | mutes them without stopping monitoring |
+| **Acknowledge** | Bulk select, Hosts menu | acknowledges only those hosts (the toolbar **ACKNOWLEDGE** does all of them) |
+| **Reset statistics** | Bulk select, Hosts menu, right-click | clears loss % / latency history — use it after fixing a link |
+| **Copy to clipboard** | Bulk select, Hosts menu, right-click | CSV: name, address, monitoring, alarm, status |
+| **Remove** | Bulk select, Hosts menu, right-click | deletes them — the confirm box **lists what it is about to delete** and defaults to *No* |
 
 `Disable / Enable` on a mixed set turns them **all on** — flipping each one
 would leave the list just as mixed and tell you nothing.
@@ -265,7 +272,9 @@ rearranges itself as it shrinks rather than clipping:
 | smallest | **ms** and **Alarm** are dropped — the tick box, **Name, Status and Loss %** always stay |
 
 Toolbar items that no longer fit move into the `»` dropdown, and **ACKNOWLEDGE**
-and **Pause** are pinned so they are never the ones that disappear. If the
+and **Pause** are pinned so they are never the ones that disappear. **Bulk
+select** is pinned too, shortens to **Bulk**, and steps aside only in the very
+smallest window — where it is still in the **Hosts** menu. If the
 window gets too short the event log panel hides itself and gives its space to
 the host list; it comes back when there is room again.
 
@@ -421,11 +430,17 @@ carry the secrets with it. Each machine is configured once.
 
 ## Where things live
 
-The **toolbar** carries only what gets used during a shift — add a host, search,
-**ACKNOWLEDGE**, Pause. It is a real toolbar with overflow: anything that does
-not fit the window moves into a `»` dropdown instead of wrapping or scrolling,
-so it stays one clean line at any window size and any text size. ACKNOWLEDGE and
-Pause are pinned and never hide.
+The **toolbar** carries only what gets used during a shift — **Add host**,
+Search, **ACKNOWLEDGE**, **Pause**, **Bulk select**. It is a real toolbar with
+overflow: anything that does not fit the window moves into a `»` dropdown
+instead of wrapping or scrolling, so it stays one clean line at any window size
+and any text size. ACKNOWLEDGE and Pause are pinned and never hide; Bulk select
+is pinned too and only steps aside in a corner-sized window, where it is still
+in the **Hosts** menu.
+
+**Add host** opens the same small dialog as Edit. It used to be two text boxes
+sitting on the toolbar — they took more than half its width for the least
+frequent thing anyone does, which left no room for Search.
 
 Everything set once and forgotten lives in the **menu bar**:
 

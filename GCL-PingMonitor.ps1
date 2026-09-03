@@ -1425,11 +1425,10 @@ function New-TSep {
     $s
 }
 
-$txtLabel  = New-Txt 13
-$txtTarget = New-Txt 14
-$btnAdd    = New-Btn 'Add'
+$btnAdd    = New-Btn 'Add host'
+$btnAdd.ToolTipText = 'Add a single host.  Hosts menu -> Add many hosts... takes a whole pasted list'
 
-$txtSearch      = New-Txt 14
+$txtSearch      = New-Txt 13
 $btnClearSearch = New-Btn 'x'
 
 $btnAck  = New-Btn 'ACKNOWLEDGE' -Strong
@@ -1437,6 +1436,34 @@ $btnAck.Enabled = $false
 $btnAck.ToolTipText = 'Silence the alarm (a NEW host going down re-arms it)'
 
 $btnPause = New-Btn 'Pause'
+
+# The tick box column is discoverable only if something on screen names it, so
+# the bulk actions get their own toolbar button rather than hiding in a menu.
+$btnBulk = New-Object System.Windows.Forms.ToolStripDropDownButton
+$btnBulk.Text = 'Bulk select'
+$btnBulk.DisplayStyle = 'Text'
+$btnBulk.AutoSize = $true
+$btnBulk.Margin  = New-Object System.Windows.Forms.Padding(3, 1, 6, 1)
+$btnBulk.Padding = New-Object System.Windows.Forms.Padding(8, 3, 4, 3)
+$btnBulk.ToolTipText = 'Tick hosts in the first column, then act on all of them at once'
+$script:UiButtons.Add($btnBulk)
+
+$tbTickAll = New-Mnu 'Tick &all shown'
+$tbTickNon = New-Mnu 'Untick a&ll'
+$tbTickInv = New-Mnu '&Invert ticks'
+$tbEnable  = New-Mnu 'E&nable ticked'
+$tbDisable = New-Mnu '&Disable ticked'
+$tbAlarmOn = New-Mnu 'Alarm &ON for ticked'
+$tbAlarmOf = New-Mnu 'Alarm O&FF for ticked  (silent)'
+$tbAck     = New-Mnu 'Ac&knowledge ticked'
+$tbReset   = New-Mnu 'Reset &statistics for ticked'
+$tbCopy    = New-Mnu '&Copy ticked to clipboard'
+$tbRemove  = New-Mnu '&Remove ticked'
+[void]$btnBulk.DropDownItems.AddRange(@(
+    $tbTickAll, $tbTickNon, $tbTickInv, (New-Sep),
+    $tbEnable, $tbDisable, (New-Sep),
+    $tbAlarmOn, $tbAlarmOf, $tbAck, (New-Sep),
+    $tbReset, $tbCopy, (New-Sep), $tbRemove))
 
 # becomes visible only after a newer version has been downloaded in the background
 $btnRestartNow = New-Btn 'RESTART to apply update' -Strong
@@ -1448,14 +1475,17 @@ $btnRestartNow.BackColor = [System.Drawing.Color]::Gold
 $btnAck.Overflow        = 'Never'
 $btnPause.Overflow      = 'Never'
 $btnRestartNow.Overflow = 'Never'
+# Bulk select is pinned too: it is the only thing on screen that names the tick
+# box column, and a feature nobody can find is a feature nobody has. Its label
+# shortens to "Bulk" in a narrow window so all three still fit.
+$btnBulk.Overflow       = 'Never'
 
 [void]$panelTop.Items.AddRange(@(
-    (New-Lbl 'Name:'), $txtLabel,
-    (New-Lbl 'IP / host:'), $txtTarget, $btnAdd,
+    $btnAdd,
     (New-TSep),
     (New-Lbl 'Search:'), $txtSearch, $btnClearSearch,
     (New-TSep),
-    $btnAck, $btnPause, $btnRestartNow
+    $btnAck, $btnPause, $btnBulk, $btnRestartNow
 ))
 
 # Edit / Disable / Remove live on the right-click menu and the Hosts menu -
@@ -1539,7 +1569,7 @@ function New-ChkCol($name, $header, $tip) {
     $c.DefaultCellStyle.Alignment = 'MiddleCenter'
     $c
 }
-$null = $grid.Columns.Add((New-ChkCol 'cSel' '' 'Tick hosts, then use Hosts / right-click to enable, disable or mute them together.  Click this header to tick or untick every host.'))
+$null = $grid.Columns.Add((New-ChkCol 'cSel' '' 'BULK SELECT - tick hosts here, then use the Bulk select button (or the Hosts / right-click menu) to enable, disable, mute, acknowledge or remove all of them at once.  Click this header to tick or untick every host shown.'))
 $null = $grid.Columns.Add('cLabel',  'Name')
 $null = $grid.Columns.Add('cTarget', 'IP / Host')
 $null = $grid.Columns.Add('cStatus', 'Status')
@@ -1597,7 +1627,7 @@ function Apply-TextSize {
     $minH = [int][Math]::Max(210, $s * 16)
     try { $form.MinimumSize = New-Object System.Drawing.Size($minW, $minH) } catch { }
 
-    foreach ($t in @($txtLabel, $txtTarget, $txtSearch)) {
+    foreach ($t in @($txtSearch)) {
         $t.Font = UiFont
         $t.Size = New-Object System.Drawing.Size([int]($s * [double]$t.Tag), [int]($s * 2.0))
     }
@@ -1611,11 +1641,11 @@ function Apply-TextSize {
     $grid.RowTemplate.Height    = [int]($s * 2.5)
     # fixed-width check box columns still have to follow the text size
     try {
-        $grid.Columns['cSel'].Width   = [int]($s * 2.4)
+        $grid.Columns['cSel'].Width   = [int]($s * 2.8)
         # wide enough for the bold "Alarm" header, which is what sets the size -
         # a clipped header ("Alarr") is worse than a slightly wide column. In a
         # narrow window the header is already the short "Alm", so ask the tier.
-        $grid.Columns['cAlarm'].Width = [int]($s * $(if ($script:RespTier -ge 2) { 3.2 } else { 5.6 }))
+        $grid.Columns['cAlarm'].Width = [int]($s * $(if ($script:RespTier -ge 2) { 4.0 } else { 5.6 }))
     } catch { }
     foreach ($r in $grid.Rows) { $r.Height = [int]($s * 2.5) }
 
@@ -1672,7 +1702,7 @@ function Update-Responsive {
                 $grid.Columns['cLat'].HeaderText    = 'ms'
                 $grid.Columns['cLoss'].HeaderText   = 'Loss'
                 $grid.Columns['cAlarm'].HeaderText  = 'Alm'
-                $grid.Columns['cAlarm'].Width       = [int]($u * 3.2)
+                $grid.Columns['cAlarm'].Width       = [int]($u * 4.0)
                 $grid.Columns['cLabel'].FillWeight  = 132
                 $grid.Columns['cTarget'].FillWeight = 96
                 $grid.Columns['cStatus'].FillWeight = 64
@@ -1702,6 +1732,11 @@ function Update-Responsive {
             # the clock is the first thing to go in the status bar - the counts
             # (UP / DOWN / disabled) are the part that matters
             if ($lblClock) { $lblClock.Visible = ($tier -lt 2) }
+            # Three pinned buttons do not fit a corner-sized window, and
+            # ACKNOWLEDGE is the one that must never be squeezed out. Bulk
+            # select gives up its place first - it is still in the Hosts menu.
+            if ($script:btnBulk) { $script:btnBulk.Visible = ($tier -lt 3) }
+            Update-BulkButton
         }
 
         # --- height: hand the log panel's space back when there is none ---
@@ -1935,6 +1970,16 @@ function Refresh-Banner {
     }
 }
 
+# The toolbar button carries the tick count, so the selection is visible without
+# hunting for it - and shortens to "Bulk" once the window is narrow.
+function Update-BulkButton {
+    if (-not $script:btnBulk) { return }
+    $t = Get-TickCount
+    $base = if ($script:RespTier -ge 2) { 'Bulk' } else { 'Bulk select' }
+    $want = if ($t -gt 0) { '{0} ({1})' -f $base, $t } else { $base }
+    if ($script:btnBulk.Text -ne $want) { $script:btnBulk.Text = $want }
+}
+
 function Refresh-Status {
     $active = @($script:Hosts | Where-Object { $_.Enabled })
     $up   = @($active | Where-Object { $_.Status -eq 'UP' }).Count
@@ -1947,6 +1992,7 @@ function Refresh-Status {
     # still decides what the next bulk action does
     $ticked = Get-TickCount
     $muted  = @($script:Hosts | Where-Object { $_.Enabled -and -not $_.AlarmEnabled }).Count
+    Update-BulkButton
     if ($muted -gt 0)  { $filter += ("    |    {0} muted" -f $muted) }
     if ($ticked -gt 0) { $filter += ("    |    {0} ticked" -f $ticked) }
     if ($script:RespTier -ge 2) {
@@ -1967,10 +2013,17 @@ function Refresh-Status {
 # ---------------------------------------------------------------------------
 #  Handlers
 # ---------------------------------------------------------------------------
+# Adding used to be two text boxes sitting on the toolbar. They cost more than
+# half its width - for the least frequent action there is - which is what
+# pushed Search into the ">>" overflow once ACKNOWLEDGE, Pause and Bulk select
+# were all pinned. It uses the same dialog as Edit instead; the fields are
+# bigger, properly labelled, and Enter / Esc work.
 function Add-Host {
-    $target = $txtTarget.Text.Trim()
+    $r = Show-HostDialog -Name '' -Target '' -Title 'Add host'
+    if (-not $r) { return }
+    $target = $r.Target
     if (-not $target) { return }
-    $label = $txtLabel.Text.Trim()
+    $label = $r.Label
     if (-not $label) { $label = $target }
     if (@($script:Hosts | Where-Object { $_.Target -eq $target }).Count -gt 0) {
         [System.Windows.Forms.MessageBox]::Show("'$target' is already in the list.", 'Duplicate', 'OK', 'Warning') | Out-Null
@@ -1981,20 +2034,18 @@ function Add-Host {
     Save-Config
     Rebuild-Grid
     Refresh-Banner
-    $txtLabel.Clear(); $txtTarget.Clear(); $txtTarget.Focus()
+    Refresh-Status
     $script:CycleRunning = $false
     Start-CheckCycle
 }
 
 $btnAdd.Add_Click({ Add-Host })
-$txtTarget.Add_KeyDown({ if ($_.KeyCode -eq 'Enter') { $_.SuppressKeyPress = $true; Add-Host } })
-$txtLabel.Add_KeyDown({ if ($_.KeyCode -eq 'Enter') { $_.SuppressKeyPress = $true; $txtTarget.Focus() } })
 
 # ---- Edit / modify a host ----------------------------------------------------
 function Show-HostDialog {
-    param([string]$Name, [string]$Target)
+    param([string]$Name, [string]$Target, [string]$Title = 'Edit host')
     $dlg = New-Object System.Windows.Forms.Form
-    $dlg.Text = 'Edit host'
+    $dlg.Text = $Title
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.StartPosition = 'CenterParent'
     $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
@@ -2019,7 +2070,7 @@ function Show-HostDialog {
     $t2.Width = [int]($s * 24)
 
     $ok = New-Object System.Windows.Forms.Button
-    $ok.Text = 'Save'; $ok.DialogResult = 'OK'
+    $ok.Text = $(if ($Title -like 'Add*') { '&Add' } else { '&Save' }); $ok.DialogResult = 'OK'
     $ok.Location = New-Object System.Drawing.Point([int]($s*17), [int]($s*7.4))
     $ok.Size = New-Object System.Drawing.Size([int]($s*7), [int]($s*2.6))
 
@@ -2105,6 +2156,12 @@ function Show-NothingPicked {
         $Title, 'OK', 'Information') | Out-Null
 }
 
+# The header check box draws itself from the current ticks, so it has to be
+# repainted whenever they change - the cell values alone do not invalidate it.
+function Update-SelHeader {
+    try { $grid.InvalidateCell($grid.Columns['cSel'].Index, -1) } catch { }
+}
+
 function Set-AllTicks {
     param([bool]$On)
     # only what the search box is currently showing - ticking hosts you cannot
@@ -2112,12 +2169,13 @@ function Set-AllTicks {
     foreach ($h in $script:Visible) { $h.Sel = $On }
     if (-not $On) { foreach ($h in $script:Hosts) { $h.Sel = $false } }
     Refresh-Grid
+    Update-SelHeader
     Refresh-Status
 }
 
 function Invert-Ticks {
     foreach ($h in $script:Visible) { $h.Sel = -not $h.Sel }
-    Refresh-Grid; Refresh-Status
+    Refresh-Grid; Update-SelHeader; Refresh-Status
 }
 
 function Get-TickCount { @($script:Hosts | Where-Object { $_.Sel }).Count }
@@ -2413,7 +2471,7 @@ $cmTick.Add_Click({
     if ($sel.Count -eq 0) { return }
     $allOn = @($sel | Where-Object { -not $_.Sel }).Count -eq 0
     foreach ($h in $sel) { $h.Sel = -not $allOn }
-    Refresh-Grid; Refresh-Status
+    Refresh-Grid; Update-SelHeader; Refresh-Status
 })
 $cmTickAll.Add_Click({ Set-AllTicks $true })
 $cmTickNon.Add_Click({ Set-AllTicks $false })
@@ -2753,10 +2811,37 @@ $grid.Add_CellMouseUp({
     if ($col -eq 'cSel') {
         $h.Sel = -not $h.Sel
         $grid.Rows[$_.RowIndex].Cells['cSel'].Value = [bool]$h.Sel
+        Update-SelHeader
         Refresh-Status
     } else {
         Toggle-HostAlarmRow $h
     }
+})
+
+# An empty header over a column of tick boxes tells nobody what it is for, so
+# the header gets a check box of its own - the one control everybody already
+# knows means "all of them". It shows the current state: ticked when everything
+# on screen is ticked. A text label would not fit the column width.
+$grid.Add_CellPainting({
+    if ($_.RowIndex -ne -1 -or $_.ColumnIndex -lt 0) { return }
+    if ($grid.Columns[$_.ColumnIndex].Name -ne 'cSel') { return }
+    $_.PaintBackground($_.CellBounds, $false)
+    $shown = @($script:Visible)
+    $all   = ($shown.Count -gt 0) -and (@($shown | Where-Object { -not $_.Sel }).Count -eq 0)
+    $side  = [int][Math]::Max(13, $script:TextSize * 1.1)
+    $x = $_.CellBounds.X + [int](($_.CellBounds.Width  - $side) / 2)
+    $y = $_.CellBounds.Y + [int](($_.CellBounds.Height - $side) / 2)
+    try {
+        # themed first, classic if visual styles are off (Server Core-ish boxes)
+        $st = if ($all) { [System.Windows.Forms.VisualStyles.CheckBoxState]::CheckedNormal }
+              else      { [System.Windows.Forms.VisualStyles.CheckBoxState]::UncheckedNormal }
+        [System.Windows.Forms.CheckBoxRenderer]::DrawCheckBox($_.Graphics,
+            (New-Object System.Drawing.Point($x, $y)), $st)
+    } catch {
+        $bs = if ($all) { [System.Windows.Forms.ButtonState]::Checked } else { [System.Windows.Forms.ButtonState]::Normal }
+        [System.Windows.Forms.ControlPaint]::DrawCheckBox($_.Graphics, $x, $y, $side, $side, $bs)
+    }
+    $_.Handled = $true
 })
 
 # Header of the tick column = tick / untick everything that is showing
@@ -2783,6 +2868,34 @@ $btnClearSearch.Add_Click({ $txtSearch.Clear(); $txtSearch.Focus() })
 
 $btnAck.Add_Click({ Confirm-Alarm })
 $btnPause.Add_Click({ Toggle-Pause })
+
+# ---- Bulk select toolbar button ----------------------------------------------
+$tbTickAll.Add_Click({ Set-AllTicks $true })
+$tbTickNon.Add_Click({ Set-AllTicks $false })
+$tbTickInv.Add_Click({ Invert-Ticks })
+$tbEnable.Add_Click({ Set-HostsEnabled $true })
+$tbDisable.Add_Click({ Set-HostsEnabled $false })
+$tbAlarmOn.Add_Click({ Set-HostsAlarm $true })
+$tbAlarmOf.Add_Click({ Set-HostsAlarm $false })
+$tbAck.Add_Click({ Confirm-AlarmSelected })
+$tbReset.Add_Click({ Reset-SelectedStats })
+$tbCopy.Add_Click({ Copy-SelectedHosts })
+$tbRemove.Add_Click({ Remove-SelectedHosts })
+
+$btnBulk.Add_DropDownOpening({
+    $t = Get-TickCount
+    $n = if ($t -gt 0) { $t } else { @(Get-SelectedHosts).Count }
+    $what = if ($t -gt 0) { "$t ticked" } else { "$n selected" }
+    $tbEnable.Text  = "E&nable  ($what)"
+    $tbDisable.Text = "&Disable  ($what)"
+    $tbAlarmOn.Text = "Alarm &ON  ($what)"
+    $tbAlarmOf.Text = "Alarm O&FF - silent  ($what)"
+    $tbAck.Text     = "Ac&knowledge  ($what)"
+    $tbReset.Text   = "Reset &statistics  ($what)"
+    $tbCopy.Text    = "&Copy to clipboard  ($what)"
+    $tbRemove.Text  = "&Remove  ($what)"
+    $tbTickNon.Enabled = ($t -gt 0)
+})
 
 function Test-AlarmSound {
     Play-Alarm
@@ -3302,7 +3415,7 @@ function Invoke-UpdateCheck {
 }
 
 # ---- Menu wiring -------------------------------------------------------------
-$miAdd.Add_Click({ $txtLabel.Focus() })
+$miAdd.Add_Click({ Add-Host })
 $miAddMany.Add_Click({ Add-ManyHosts })
 $miEdit.Add_Click({ Edit-SelectedHost })
 $miAckSel.Add_Click({ Confirm-AlarmSelected })
@@ -3477,7 +3590,6 @@ $form.Add_Shown({
     $script:notifyTimer.Start()
     if (-not $script:IsGitCheckout) { $script:updateTimer.Start() }
     Start-CheckCycle
-    if ($script:Hosts.Count -eq 0) { $txtTarget.Focus() }
 })
 
 $form.Add_FormClosing({
