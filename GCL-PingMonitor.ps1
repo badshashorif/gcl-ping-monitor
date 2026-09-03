@@ -198,11 +198,16 @@ $script:LastCheck    = $null
 $script:AlarmActive  = $false
 
 function New-HostState {
-    param($Label, $Target, $Enabled = $true)
+    param($Label, $Target, $Enabled = $true, $AlarmEnabled = $true)
     [pscustomobject]@{
         Label      = $Label
         Target     = $Target
         Enabled    = [bool]$Enabled
+        # Alarm off = still pinged, still shown, still logged - but it makes no
+        # sound and sends no notification. Different from Enabled = $false,
+        # which stops monitoring the host altogether.
+        AlarmEnabled = [bool]$AlarmEnabled
+        Sel        = $false      # the tick box in the first column (not saved)
         Status     = 'INIT'      # INIT | UP | WARN | DOWN | OFF
         Latency    = $null
         LastChange = $null
@@ -252,10 +257,20 @@ function Reset-HostStats {
     $h.Lost = 0; $h.TotSent = 0; $h.TotLost = 0
 }
 
+# Missing flags mean "on" - a config written by an older version has no Alarm
+# property at all, and silently muting somebody's hosts on upgrade would be the
+# worst possible default.
+function Get-SavedFlag {
+    param($Entry, [string]$Name)
+    if ($null -eq $Entry.$Name) { return $true }
+    [bool]$Entry.$Name
+}
+
 foreach ($c in @($script:Config.Hosts)) {
     if ($c -and $c.Target) {
-        $en = if ($null -eq $c.Enabled) { $true } else { [bool]$c.Enabled }
-        $h  = New-HostState -Label ([string]$c.Label) -Target ([string]$c.Target) -Enabled $en
+        $en = Get-SavedFlag $c 'Enabled'
+        $h  = New-HostState -Label ([string]$c.Label) -Target ([string]$c.Target) -Enabled $en `
+                            -AlarmEnabled (Get-SavedFlag $c 'Alarm')
         if (-not $en) { $h.Status = 'OFF' }
         $script:Hosts.Add($h)
     }
@@ -388,7 +403,7 @@ function Save-Config {
             $script:Config.WinMax = ($form.WindowState -eq 'Maximized')
         }
         $script:Config.Hosts = @($script:Hosts | ForEach-Object {
-            [pscustomobject]@{ Label = $_.Label; Target = $_.Target; Enabled = [bool]$_.Enabled }
+            [pscustomobject]@{ Label = $_.Label; Target = $_.Target; Enabled = [bool]$_.Enabled; Alarm = [bool]$_.AlarmEnabled }
         })
         $script:Config | ConvertTo-Json -Depth 5 | Set-Content -Path $script:ConfigPath -Encoding UTF8
     } catch { }
@@ -434,7 +449,7 @@ function Process-Result {
                 $dur = if ($h.DownSince) { Format-Duration ((Get-Date) - $h.DownSince) } else { '?' }
                 Write-Event ("RECOVERED : {0} [{1}] - was down {2}" -f $h.Label, $h.Target, $dur)
                 Add-Notification -Kind 'UP' -Host_ $h
-                Play-UpSound
+                if ($h.AlarmEnabled) { Play-UpSound }
             } elseif ($prev -eq 'INIT') {
                 Write-Event ("OK        : {0} [{1}] - reachable" -f $h.Label, $h.Target)
             }
@@ -706,6 +721,8 @@ function Add-Notification {
     param([ValidateSet('DOWN','UP')][string]$Kind, $Host_)
     $n = $script:Config.Notify
     if (-not (Test-NotifyEnabled)) { return }
+    # "Alarm off" on a host means off completely: no sound AND no message
+    if (-not $Host_.AlarmEnabled) { return }
     if ($Kind -eq 'DOWN' -and -not $n.OnDown)    { return }
     if ($Kind -eq 'UP'   -and -not $n.OnRecover) { return }
     # DownSince is still set at this point - Process-Result clears it right after
@@ -1158,7 +1175,7 @@ $script:AlarmMuted   = $false
 $script:AlarmSet     = @()          # targets currently down and un-acknowledged
 
 function Update-Alarm {
-    $down   = @($script:Hosts | Where-Object { $_.Enabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
+    $down   = @($script:Hosts | Where-Object { $_.Enabled -and $_.AlarmEnabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
     $active = $down.Count -gt 0
 
     # anything in the down set that was not there last time re-arms the sound
@@ -1300,11 +1317,27 @@ $mHelp   = New-Mnu 'Hel&p'
 foreach ($t in @($mFile, $mView, $mMon, $mSet, $mHelp)) { $t.ForeColor = [System.Drawing.Color]::White }
 
 $miAdd     = New-Mnu '&Add host'
+$miAddMany = New-Mnu 'Add &many hosts...  (paste a list)'
 $miEdit    = New-Mnu '&Edit selected...'
-$miToggle  = New-Mnu '&Disable / Enable selected'
-$miRemove  = New-Mnu '&Remove selected'
+$miTickAll = New-Mnu 'Tick &all shown'
+$miTickNon = New-Mnu 'Untick a&ll'
+$miTickInv = New-Mnu '&Invert ticks'
+$miEnable  = New-Mnu 'E&nable ticked'
+$miDisable = New-Mnu '&Disable ticked'
+$miAlarmOn = New-Mnu 'Alarm &ON for ticked'
+$miAlarmOf = New-Mnu 'Alarm O&FF for ticked  (silent)'
+$miAckSel  = New-Mnu 'Ac&knowledge ticked'
+$miResetSt = New-Mnu 'Reset &statistics for ticked'
+$miCopySel = New-Mnu '&Copy ticked to clipboard'
+$miRemove  = New-Mnu '&Remove ticked'
 $miExit    = New-Mnu 'E&xit'
-[void]$mFile.DropDownItems.AddRange(@($miAdd, $miEdit, $miToggle, $miRemove, (New-Sep), $miExit))
+[void]$mFile.DropDownItems.AddRange(@(
+    $miAdd, $miAddMany, $miEdit, (New-Sep),
+    $miTickAll, $miTickNon, $miTickInv, (New-Sep),
+    $miEnable, $miDisable, (New-Sep),
+    $miAlarmOn, $miAlarmOf, $miAckSel, (New-Sep),
+    $miResetSt, $miCopySel, (New-Sep),
+    $miRemove, (New-Sep), $miExit))
 
 $miSize    = New-Mnu '&Text size'
 $script:SizeItems = @()
@@ -1429,11 +1462,20 @@ $btnRestartNow.Overflow = 'Never'
 # keeping them off the toolbar is what lets it stay on a single line.
 $ctx = New-Object System.Windows.Forms.ContextMenuStrip
 $ctx.Font = UiFont
-$cmEdit   = New-Mnu '&Edit host...'
-$cmToggle = New-Mnu '&Disable / Enable'
-$cmRemove = New-Mnu '&Remove'
-$cmAck    = New-Mnu '&Acknowledge alarm'
-[void]$ctx.Items.AddRange(@($cmEdit, $cmToggle, $cmRemove, (New-Sep), $cmAck))
+$cmEdit    = New-Mnu '&Edit host...'
+$cmToggle  = New-Mnu '&Disable / Enable'
+$cmAlarm   = New-Mnu 'Alarm on / o&ff'
+$cmRemove  = New-Mnu '&Remove'
+$cmTick    = New-Mnu '&Tick / untick this host'
+$cmTickAll = New-Mnu 'Tick &all shown'
+$cmTickNon = New-Mnu '&Untick all'
+$cmReset   = New-Mnu 'Reset &statistics'
+$cmCopy    = New-Mnu '&Copy to clipboard'
+$cmAck     = New-Mnu '&Acknowledge alarm'
+[void]$ctx.Items.AddRange(@(
+    $cmEdit, $cmToggle, $cmAlarm, $cmRemove, (New-Sep),
+    $cmTick, $cmTickAll, $cmTickNon, (New-Sep),
+    $cmReset, $cmCopy, (New-Sep), $cmAck))
 
 # ---- Split: grid on top, log on bottom ----
 $split = New-Object System.Windows.Forms.SplitContainer
@@ -1484,16 +1526,36 @@ $grid.ColumnHeadersDefaultCellStyle.Padding = New-Object System.Windows.Forms.Pa
 $grid.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(6, 2, 4, 2)
 $grid.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(0, 90, 158)
 $grid.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::White
+# The tick box for bulk actions, and the per-host alarm switch. Both are
+# read-only checkbox columns toggled by hand in CellContentClick: making them
+# editable would mean taking the whole grid out of read-only mode, and then a
+# stray keypress could start editing a host's name.
+function New-ChkCol($name, $header, $tip) {
+    $c = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+    $c.Name = $name; $c.HeaderText = $header
+    $c.SortMode = 'NotSortable'
+    $c.ToolTipText = $tip
+    $c.FlatStyle = 'Standard'
+    $c.DefaultCellStyle.Alignment = 'MiddleCenter'
+    $c
+}
+$null = $grid.Columns.Add((New-ChkCol 'cSel' '' 'Tick hosts, then use Hosts / right-click to enable, disable or mute them together.  Click this header to tick or untick every host.'))
 $null = $grid.Columns.Add('cLabel',  'Name')
 $null = $grid.Columns.Add('cTarget', 'IP / Host')
 $null = $grid.Columns.Add('cStatus', 'Status')
+$null = $grid.Columns.Add((New-ChkCol 'cAlarm' 'Alarm' 'Alarm on / off for this host. Off = still monitored, but no sound and no notification.  Click to toggle.'))
 $null = $grid.Columns.Add('cLat',    'Latency')
 $null = $grid.Columns.Add('cLoss',   'Loss %')
 $null = $grid.Columns.Add('cSince',  'Since')
 $null = $grid.Columns.Add('cDown',   'Down for')
 # Fill mode refuses to shrink a column below its MinimumWidth, and the default is
 # wide enough to push the last column off the right edge in a small window
-foreach ($c in $grid.Columns) { $c.MinimumWidth = 26 }
+foreach ($c in $grid.Columns) { $c.MinimumWidth = 22 }
+# the two check boxes keep a fixed width instead of a share of it - a tick box
+# that grows with the window would look like a mistake
+$grid.Columns['cSel'].AutoSizeMode   = 'None'
+$grid.Columns['cAlarm'].AutoSizeMode = 'None'
+$grid.Columns['cSel'].Resizable      = 'False'
 $grid.Columns['cLabel'].FillWeight  = 130
 $grid.Columns['cTarget'].FillWeight = 120
 $grid.Columns['cStatus'].FillWeight = 80
@@ -1547,6 +1609,14 @@ function Apply-TextSize {
     $grid.ColumnHeadersHeight = [int]($s * 2.8)
     $grid.DefaultCellStyle.Font = UiFont
     $grid.RowTemplate.Height    = [int]($s * 2.5)
+    # fixed-width check box columns still have to follow the text size
+    try {
+        $grid.Columns['cSel'].Width   = [int]($s * 2.4)
+        # wide enough for the bold "Alarm" header, which is what sets the size -
+        # a clipped header ("Alarr") is worse than a slightly wide column. In a
+        # narrow window the header is already the short "Alm", so ask the tier.
+        $grid.Columns['cAlarm'].Width = [int]($s * $(if ($script:RespTier -ge 2) { 3.2 } else { 5.6 }))
+    } catch { }
     foreach ($r in $grid.Rows) { $r.Height = [int]($s * 2.5) }
 
     $txtLog.Font = New-Object System.Drawing.Font('Consolas', [single][Math]::Max($s - 2, 8))
@@ -1592,7 +1662,7 @@ function Update-Responsive {
             if ($tier -ge 1) { $hide += 'cSince'  }
             if ($tier -ge 2) { $hide += 'cDown'   }
             if ($tier -ge 3) { $hide += 'cTarget' }
-            if ($tier -ge 4) { $hide += 'cLat'    }
+            if ($tier -ge 4) { $hide += 'cLat'; $hide += 'cAlarm' }
             foreach ($c in $grid.Columns) { $c.Visible = ($hide -notcontains $c.Name) }
 
             # short headers + a different share of the width once space is tight:
@@ -1601,6 +1671,8 @@ function Update-Responsive {
                 $grid.Columns['cTarget'].HeaderText = 'IP'
                 $grid.Columns['cLat'].HeaderText    = 'ms'
                 $grid.Columns['cLoss'].HeaderText   = 'Loss'
+                $grid.Columns['cAlarm'].HeaderText  = 'Alm'
+                $grid.Columns['cAlarm'].Width       = [int]($u * 3.2)
                 $grid.Columns['cLabel'].FillWeight  = 132
                 $grid.Columns['cTarget'].FillWeight = 96
                 $grid.Columns['cStatus'].FillWeight = 64
@@ -1610,6 +1682,8 @@ function Update-Responsive {
                 $grid.Columns['cTarget'].HeaderText = 'IP / Host'
                 $grid.Columns['cLat'].HeaderText    = 'Latency'
                 $grid.Columns['cLoss'].HeaderText   = 'Loss %'
+                $grid.Columns['cAlarm'].HeaderText  = 'Alarm'
+                $grid.Columns['cAlarm'].Width       = [int]($u * 5.6)
                 $grid.Columns['cLabel'].FillWeight  = 130
                 $grid.Columns['cTarget'].FillWeight = 120
                 $grid.Columns['cStatus'].FillWeight = 80
@@ -1722,7 +1796,9 @@ function Rebuild-Grid {
     $grid.SuspendLayout()
     $grid.Rows.Clear()
     foreach ($h in $script:Visible) {
-        $i = $grid.Rows.Add(@($h.Label, $h.Target, '', '', '', '', ''))
+        # added empty and filled by name - with check box columns in the middle a
+        # positional value array is one reordering away from silent nonsense
+        $i = $grid.Rows.Add()
         $grid.Rows[$i].Tag = $h
         $h.StyleKey = ''                       # force a restyle on the new row
     }
@@ -1754,6 +1830,8 @@ function Refresh-Grid {
         if (-not $h) { continue }
         $row.Cells['cLabel'].Value  = $h.Label
         $row.Cells['cTarget'].Value = $h.Target
+        $row.Cells['cSel'].Value    = [bool]$h.Sel
+        $row.Cells['cAlarm'].Value  = [bool]$h.AlarmEnabled
 
         if (-not $h.Enabled) {
             $statusText = 'DISABLED'
@@ -1763,8 +1841,11 @@ function Refresh-Grid {
                 'UP'   { $statusText = 'UP';           $bg = $colUpBg;   $fg = $colUpFg;   $bold = $false }
                 'WARN' { $statusText = 'checking...';  $bg = $colWarnBg; $fg = $colWarnFg; $bold = $false }
                 'DOWN' {
-                    if ($h.Acked) { $statusText = 'DOWN (ack)'; $bg = $colAckBg;  $fg = $colAckFg;  $bold = $true }
-                    else          { $statusText = 'DOWN';       $bg = $colDownBg; $fg = $colDownFg; $bold = $true }
+                    # a muted host is down without being an alarm - say so in the
+                    # cell, because the Alarm column is hidden in a small window
+                    if (-not $h.AlarmEnabled) { $statusText = 'DOWN (muted)'; $bg = $colAckBg; $fg = $colAckFg; $bold = $true }
+                    elseif ($h.Acked) { $statusText = 'DOWN (ack)'; $bg = $colAckBg;  $fg = $colAckFg;  $bold = $true }
+                    else              { $statusText = 'DOWN';       $bg = $colDownBg; $fg = $colDownFg; $bold = $true }
                 }
                 default { $statusText = '-';           $bg = $colInitBg; $fg = $colInitFg; $bold = $false }
             }
@@ -1831,7 +1912,9 @@ function Refresh-Grid {
 function Refresh-Banner {
     $active  = @($script:Hosts | Where-Object { $_.Enabled })
     $down    = @($active | Where-Object { $_.Status -eq 'DOWN' })
-    $unacked = @($down   | Where-Object { -not $_.Acked })
+    # only a host that is allowed to raise an alarm turns the banner red -
+    # a muted host is still listed, but in the calmer "acknowledged" colour
+    $unacked = @($down   | Where-Object { $_.AlarmEnabled -and -not $_.Acked })
     if ($down.Count -gt 0) {
         $names = ($down | Select-Object -First 6 | ForEach-Object { $_.Label }) -join ',  '
         if ($down.Count -gt 6) { $names += '  ...' }
@@ -1860,10 +1943,17 @@ function Refresh-Status {
     $off  = $script:Hosts.Count - $active.Count
     $shown = $grid.Rows.Count
     $filter = if ($shown -ne $script:Hosts.Count) { ("    |    showing {0} of {1}" -f $shown, $script:Hosts.Count) } else { '' }
+    # a live tick count, because a tick made three screens up is invisible and
+    # still decides what the next bulk action does
+    $ticked = Get-TickCount
+    $muted  = @($script:Hosts | Where-Object { $_.Enabled -and -not $_.AlarmEnabled }).Count
+    if ($muted -gt 0)  { $filter += ("    |    {0} muted" -f $muted) }
+    if ($ticked -gt 0) { $filter += ("    |    {0} ticked" -f $ticked) }
     if ($script:RespTier -ge 2) {
         # a narrow window gets the short form - a clipped status bar tells nobody anything
-        $lblCounts.Text = ('UP {0}  DOWN {1}  off {2}{3}' -f `
-            $up, $down, $off, $(if ($script:Paused) { '  [PAUSED]' } else { '' }))
+        $lblCounts.Text = ('UP {0}  DOWN {1}  off {2}{3}{4}' -f `
+            $up, $down, $off, $(if ($ticked -gt 0) { "  tick $ticked" } else { '' }),
+            $(if ($script:Paused) { '  [PAUSED]' } else { '' }))
     } else {
         $lblCounts.Text = ('UP: {0}    DOWN: {1}    other: {2}    disabled: {3}    |    every {4}s{5}{6}' -f `
             $up, $down, $oth, $off, [int]$script:Config.IntervalSeconds, $(if ($script:Paused) { '   [PAUSED]' } else { '' }), $filter)
@@ -1991,46 +2081,314 @@ function Get-SelectedHosts {
     @($grid.SelectedRows | ForEach-Object { $_.Tag } | Where-Object { $_ })
 }
 
-function Toggle-SelectedHosts {
-    $sel = Get-SelectedHosts
-    if ($sel.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show('Select one or more hosts first.', 'Enable / disable', 'OK', 'Information') | Out-Null
+# ---- Bulk selection ---------------------------------------------------------
+# What a bulk action works on: every TICKED host if anything is ticked, and only
+# then the highlighted rows. A tick survives sorting, searching and the 400 ms
+# refresh; a highlight does not - which is why the tick wins when both exist.
+function Get-BulkHosts {
+    $ticked = @($script:Hosts | Where-Object { $_.Sel })
+    if ($ticked.Count -gt 0) { return $ticked }
+    @($grid.SelectedRows | ForEach-Object { $_.Tag } | Where-Object { $_ })
+}
+
+# A one-line wrapper, so a headless test can stub the message box - a static
+# .NET call cannot be replaced, and an unattended MessageBox just hangs forever.
+function Show-Info {
+    param([string]$Text, [string]$Title)
+    [System.Windows.Forms.MessageBox]::Show($Text, $Title, 'OK', 'Information') | Out-Null
+}
+
+function Show-NothingPicked {
+    param([string]$Title)
+    [System.Windows.Forms.MessageBox]::Show(
+        "Nothing picked.`r`n`r`nTick the boxes in the first column (or highlight rows) first.`r`nClick the tick-box column header to select every host at once.",
+        $Title, 'OK', 'Information') | Out-Null
+}
+
+function Set-AllTicks {
+    param([bool]$On)
+    # only what the search box is currently showing - ticking hosts you cannot
+    # see and then disabling them is exactly the accident to avoid
+    foreach ($h in $script:Visible) { $h.Sel = $On }
+    if (-not $On) { foreach ($h in $script:Hosts) { $h.Sel = $false } }
+    Refresh-Grid
+    Refresh-Status
+}
+
+function Invert-Ticks {
+    foreach ($h in $script:Visible) { $h.Sel = -not $h.Sel }
+    Refresh-Grid; Refresh-Status
+}
+
+function Get-TickCount { @($script:Hosts | Where-Object { $_.Sel }).Count }
+
+# ---- Enable / disable -------------------------------------------------------
+function Apply-HostEnabled {
+    param($h, [bool]$On)
+    $h.Enabled   = $On
+    $h.StyleKey  = ''
+    $h.FailCount = 0; $h.Acked = $false
+    $h.DownSince = $null; $h.Latency = $null; $h.LastChange = Get-Date
+    if ($On) {
+        $h.Status = 'INIT'
+        Reset-HostStats $h                # loss % from before the outage is meaningless
+    } else {
+        $h.Status = 'OFF'
+        $h.Task = $null; $h.Ping = $null
+    }
+}
+
+# One log line per host up to 5, a summary beyond that - a 60-host bulk action
+# must not push everything else out of the event log.
+function Write-BulkEvent {
+    param([string]$Tag, $Hosts_, [string]$Suffix = '')
+    if ($Hosts_.Count -le 5) {
+        foreach ($h in $Hosts_) { Write-Event ("{0}: {1} [{2}]{3}" -f $Tag.PadRight(10), $h.Label, $h.Target, $Suffix) }
+    } else {
+        Write-Event ("{0}: {1} hosts{2}" -f $Tag.PadRight(10), $Hosts_.Count, $Suffix)
+    }
+}
+
+function Set-HostsEnabled {
+    param([bool]$On)
+    $sel = @(Get-BulkHosts)
+    if ($sel.Count -eq 0) { Show-NothingPicked 'Enable / disable'; return }
+    $changed = @($sel | Where-Object { [bool]$_.Enabled -ne $On })
+    if ($changed.Count -eq 0) {
+        Write-Event ("HOSTS     : {0} host(s) already {1}" -f $sel.Count, $(if ($On) { 'enabled' } else { 'disabled' }))
         return
     }
-    foreach ($h in $sel) {
-        $h.Enabled = -not $h.Enabled
-        $h.StyleKey = ''
-        $h.FailCount = 0; $h.Acked = $false
-        $h.DownSince = $null; $h.Latency = $null; $h.LastChange = Get-Date
-        if ($h.Enabled) {
-            $h.Status = 'INIT'
-            Reset-HostStats $h            # loss % from before the outage is meaningless
-            Write-Event ("ENABLED   : {0} [{1}]" -f $h.Label, $h.Target)
-        } else {
-            $h.Status = 'OFF'
-            $h.Task = $null; $h.Ping = $null
-            Write-Event ("DISABLED  : {0} [{1}] - not monitored, no alarm" -f $h.Label, $h.Target)
-        }
-    }
-    Save-Config; Rebuild-Grid; Update-Alarm; Refresh-Banner
+    foreach ($h in $changed) { Apply-HostEnabled $h $On }
+    if ($On) { Write-BulkEvent 'ENABLED' $changed }
+    else     { Write-BulkEvent 'DISABLED' $changed ' - not monitored, no alarm' }
+    Save-Config; Rebuild-Grid; Update-Alarm; Refresh-Banner; Refresh-Status
     $script:CycleRunning = $false
     Start-CheckCycle
 }
 
-function Remove-SelectedHosts {
-    $sel = Get-SelectedHosts
-    if ($sel.Count -eq 0) { return }
-    $msg = if ($sel.Count -eq 1) { "Remove '$($sel[0].Label)'?" } else { "Remove $($sel.Count) hosts?" }
-    if ([System.Windows.Forms.MessageBox]::Show($msg, 'Confirm', 'YesNo', 'Question') -ne 'Yes') { return }
-    foreach ($h in $sel) {
-        $script:Hosts.Remove($h) | Out-Null
-        Write-Event ("REMOVED   : {0} [{1}]" -f $h.Label, $h.Target)
+function Toggle-SelectedHosts {
+    # a mixed bunch is not flipped one by one - that would leave the list in the
+    # same mixed state and tell nobody what happened. All on unless all were on.
+    $sel = @(Get-BulkHosts)
+    if ($sel.Count -eq 0) { Show-NothingPicked 'Enable / disable'; return }
+    $allOn = @($sel | Where-Object { -not $_.Enabled }).Count -eq 0
+    Set-HostsEnabled (-not $allOn)
+}
+
+# ---- Alarm on / off (per host) ----------------------------------------------
+function Set-HostsAlarm {
+    param([bool]$On)
+    $sel = @(Get-BulkHosts)
+    if ($sel.Count -eq 0) { Show-NothingPicked 'Alarm on / off'; return }
+    $changed = @($sel | Where-Object { [bool]$_.AlarmEnabled -ne $On })
+    if ($changed.Count -eq 0) {
+        Write-Event ("HOSTS     : alarm already {0} for {1} host(s)" -f $(if ($On) { 'on' } else { 'off' }), $sel.Count)
+        return
     }
-    Save-Config; Rebuild-Grid; Update-Alarm; Refresh-Banner
+    foreach ($h in $changed) {
+        $h.AlarmEnabled = $On
+        $h.StyleKey = ''
+        if ($On) { $h.Acked = $false }    # un-muting a host that is down must ring
+    }
+    if ($On) { Write-BulkEvent 'ALARM ON' $changed }
+    else     { Write-BulkEvent 'ALARM OFF' $changed ' - no sound, no notification' }
+    Save-Config; Refresh-Grid; Update-Alarm; Refresh-Banner
+}
+
+function Toggle-HostsAlarm {
+    $sel = @(Get-BulkHosts)
+    if ($sel.Count -eq 0) { Show-NothingPicked 'Alarm on / off'; return }
+    $allOn = @($sel | Where-Object { -not $_.AlarmEnabled }).Count -eq 0
+    Set-HostsAlarm (-not $allOn)
+}
+
+# Clicking the box in the row itself - one host, no menu needed
+function Toggle-HostAlarmRow {
+    param($h)
+    if (-not $h) { return }
+    $h.AlarmEnabled = -not $h.AlarmEnabled
+    $h.StyleKey = ''
+    if ($h.AlarmEnabled) {
+        $h.Acked = $false
+        Write-Event ("ALARM ON  : {0} [{1}]" -f $h.Label, $h.Target)
+    } else {
+        Write-Event ("ALARM OFF : {0} [{1}] - no sound, no notification" -f $h.Label, $h.Target)
+    }
+    Save-Config; Refresh-Grid; Update-Alarm; Refresh-Banner
+}
+
+function Remove-SelectedHosts {
+    $sel = @(Get-BulkHosts)
+    if ($sel.Count -eq 0) { Show-NothingPicked 'Remove hosts'; return }
+    if ($sel.Count -eq 1) {
+        $msg = "Remove '{0}'  [{1}] ?" -f $sel[0].Label, $sel[0].Target
+    } else {
+        # a bulk delete names what it is about to delete - "Remove 40 hosts?" is
+        # not something anybody can say yes to safely
+        $names = ($sel | Select-Object -First 12 | ForEach-Object { '   - {0}   [{1}]' -f $_.Label, $_.Target }) -join "`r`n"
+        if ($sel.Count -gt 12) { $names += ("`r`n   ... and {0} more" -f ($sel.Count - 12)) }
+        $msg = "Remove these {0} hosts?`r`n`r`n{1}`r`n`r`nThis cannot be undone." -f $sel.Count, $names
+    }
+    # default button is No: a stray Enter on a 40-host delete is unforgiving
+    $ans = [System.Windows.Forms.MessageBox]::Show($msg, 'Confirm removal',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning,
+        [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+    if ($ans -ne 'Yes') { return }
+    foreach ($h in $sel) { $script:Hosts.Remove($h) | Out-Null }
+    Write-BulkEvent 'REMOVED' $sel
+    Save-Config; Rebuild-Grid; Update-Alarm; Refresh-Banner; Refresh-Status
+}
+
+# ---- Acknowledge / reset / copy, for the picked hosts only -------------------
+function Confirm-AlarmSelected {
+    $sel = @(Get-BulkHosts)
+    if ($sel.Count -eq 0) { Show-NothingPicked 'Acknowledge'; return }
+    $down = @($sel | Where-Object { $_.Enabled -and $_.AlarmEnabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
+    if ($down.Count -eq 0) {
+        Write-Event ("ACK       : nothing to acknowledge among the {0} picked host(s)" -f $sel.Count)
+        return
+    }
+    foreach ($h in $down) { $h.Acked = $true; $h.StyleKey = '' }
+    Write-BulkEvent 'ACK' $down ' - acknowledged'
+    Update-Alarm; Refresh-Grid; Refresh-Banner
+}
+
+function Reset-SelectedStats {
+    $sel = @(Get-BulkHosts)
+    if ($sel.Count -eq 0) { Show-NothingPicked 'Reset statistics'; return }
+    foreach ($h in $sel) { Reset-HostStats $h; $h.StyleKey = '' }
+    Write-BulkEvent 'RESET' $sel ' - loss / latency history cleared'
+    Refresh-Grid; Refresh-Status
+}
+
+function Copy-SelectedHosts {
+    $sel = @(Get-BulkHosts)
+    if ($sel.Count -eq 0) { Show-NothingPicked 'Copy to clipboard'; return }
+    $lines = @($sel | ForEach-Object {
+        '{0},{1},{2},{3},{4}' -f $_.Label, $_.Target,
+            $(if ($_.Enabled) { 'monitored' } else { 'disabled' }),
+            $(if ($_.AlarmEnabled) { 'alarm' } else { 'muted' }),
+            $(if ($_.Enabled) { $_.Status } else { 'OFF' })
+    })
+    $text = (@('Name,Target,Monitoring,Alarm,Status') + $lines) -join "`r`n"
+    try {
+        [System.Windows.Forms.Clipboard]::SetText($text)
+        Write-Event ("COPIED    : {0} host(s) to the clipboard as CSV" -f $sel.Count)
+    } catch {
+        Write-Event ("COPY FAIL : {0}" -f $_.Exception.Message)
+    }
+}
+
+# ---- Bulk add ---------------------------------------------------------------
+# One host per line. "label,target", "label;target", "label<tab>target" or a
+# bare target. A last-octet range - 10.0.0.1-30 or 10.0.0.1-10.0.0.30 - expands
+# into one host per address, which is how a whole POP gets added in one paste.
+function Parse-HostLines {
+    param([string]$Text)
+    $out = New-Object System.Collections.ArrayList
+    foreach ($raw in ($Text -split "`r?`n")) {
+        $line = $raw.Trim()
+        if (-not $line -or $line.StartsWith('#')) { continue }
+        $parts = @($line -split '\s*[,;\t]\s*' | Where-Object { $_ -ne '' })
+        if ($parts.Count -ge 2) { $label = $parts[0]; $target = $parts[1] }
+        else                    { $label = '';        $target = $parts[0] }
+
+        $m = [regex]::Match($target, '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.)(\d{1,3})\s*-\s*(?:\1)?(\d{1,3})$')
+        if ($m.Success) {
+            $a = [int]$m.Groups[2].Value; $b = [int]$m.Groups[3].Value
+            if ($a -le $b -and $b -le 255 -and ($b - $a) -lt 256) {
+                for ($i = $a; $i -le $b; $i++) {
+                    $t = $m.Groups[1].Value + $i
+                    [void]$out.Add([pscustomobject]@{
+                        Label = $(if ($label) { '{0}{1}' -f $label, $i } else { $t }); Target = $t })
+                }
+                continue
+            }
+        }
+        if (-not $label) { $label = $target }
+        [void]$out.Add([pscustomobject]@{ Label = $label; Target = $target })
+    }
+    # no leading comma here: every caller already wraps the result in @(), and
+    # ",$array" on top of that hands back an array holding one array
+    $out.ToArray()
+}
+
+function Show-BulkAddDialog {
+    $s = $script:TextSize
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Add many hosts'
+    $dlg.FormBorderStyle = 'Sizable'
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.MinimizeBox = $false
+    $dlg.Font = UiFont
+    $dlg.ClientSize = New-Object System.Drawing.Size([int]($s * 40), [int]($s * 26))
+    $dlg.MinimumSize = New-Object System.Drawing.Size([int]($s * 30), [int]($s * 20))
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.AutoSize = $false
+    $lbl.Text = "One host per line:`r`n    name,10.0.0.1        name and address`r`n    10.0.0.1             address only (the name becomes the address)`r`n    POP-RTR,10.0.0.1-30  a whole range, one host per address"
+    $lbl.Location = New-Object System.Drawing.Point([int]($s*1.2), [int]($s*0.8))
+    $lbl.Size = New-Object System.Drawing.Size([int]($s*38), [int]($s*6.2))
+
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Multiline = $true; $box.ScrollBars = 'Vertical'; $box.WordWrap = $false
+    $box.Font = New-Object System.Drawing.Font('Consolas', [single]$s, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    $box.Location = New-Object System.Drawing.Point([int]($s*1.2), [int]($s*7.2))
+    $box.Size = New-Object System.Drawing.Size([int]($s*37.6), [int]($s*15))
+    $box.Anchor = 'Top,Left,Right,Bottom'
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = '&Add'; $ok.DialogResult = 'OK'
+    $ok.Location = New-Object System.Drawing.Point([int]($s*23), [int]($s*23))
+    $ok.Size = New-Object System.Drawing.Size([int]($s*7), [int]($s*2.6))
+    $ok.Anchor = 'Bottom,Right'
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'; $cancel.DialogResult = 'Cancel'
+    $cancel.Location = New-Object System.Drawing.Point([int]($s*31), [int]($s*23))
+    $cancel.Size = New-Object System.Drawing.Size([int]($s*7), [int]($s*2.6))
+    $cancel.Anchor = 'Bottom,Right'
+
+    $dlg.Controls.AddRange(@($lbl, $box, $ok, $cancel))
+    # NOT AcceptButton: Enter has to make a new line in a multi-line box
+    $dlg.CancelButton = $cancel
+    $r = $dlg.ShowDialog($form)
+    $text = $box.Text
+    $dlg.Dispose()
+    if ($r -ne 'OK') { return $null }
+    $text
+}
+
+function Add-ManyHosts {
+    $text = Show-BulkAddDialog
+    if ($null -eq $text) { return }
+    $wanted = @(Parse-HostLines $text)
+    if ($wanted.Count -eq 0) {
+        Show-Info 'Nothing to add - no usable lines.' 'Add many hosts'
+        return
+    }
+    $added = 0; $dupes = 0
+    foreach ($w in $wanted) {
+        if (@($script:Hosts | Where-Object { $_.Target -eq $w.Target }).Count -gt 0) { $dupes++; continue }
+        $script:Hosts.Add((New-HostState -Label $w.Label -Target $w.Target)) | Out-Null
+        $added++
+    }
+    Write-Event ("ADDED     : {0} host(s) from a pasted list{1}" -f $added,
+        $(if ($dupes -gt 0) { " ($dupes already in the list, skipped)" } else { '' }))
+    if ($added -eq 0) {
+        Show-Info ("Nothing added - all {0} were already in the list." -f $dupes) 'Add many hosts'
+        return
+    }
+    Save-Config; Rebuild-Grid; Update-Alarm; Refresh-Banner; Refresh-Status
+    $script:CycleRunning = $false
+    Start-CheckCycle
+    Show-Info ("Added {0} host(s).{1}" -f $added,
+        $(if ($dupes -gt 0) { "`r`n$dupes were already in the list and were skipped." } else { '' })) 'Add many hosts'
 }
 
 function Confirm-Alarm {
-    $down = @($script:Hosts | Where-Object { $_.Enabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
+    $down = @($script:Hosts | Where-Object { $_.Enabled -and $_.AlarmEnabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
     if ($down.Count -eq 0) { return }
     foreach ($h in $down) { $h.Acked = $true; $h.StyleKey = '' }
     Write-Event ("ACK       : alarm acknowledged ({0} host(s) still down)" -f $down.Count)
@@ -2048,8 +2406,35 @@ function Toggle-Pause {
 
 $cmEdit.Add_Click({ Edit-SelectedHost })
 $cmToggle.Add_Click({ Toggle-SelectedHosts })
+$cmAlarm.Add_Click({ Toggle-HostsAlarm })
 $cmRemove.Add_Click({ Remove-SelectedHosts })
+$cmTick.Add_Click({
+    $sel = @(Get-SelectedHosts)
+    if ($sel.Count -eq 0) { return }
+    $allOn = @($sel | Where-Object { -not $_.Sel }).Count -eq 0
+    foreach ($h in $sel) { $h.Sel = -not $allOn }
+    Refresh-Grid; Refresh-Status
+})
+$cmTickAll.Add_Click({ Set-AllTicks $true })
+$cmTickNon.Add_Click({ Set-AllTicks $false })
+$cmReset.Add_Click({ Reset-SelectedStats })
+$cmCopy.Add_Click({ Copy-SelectedHosts })
 $cmAck.Add_Click({ Confirm-Alarm })
+
+# The right-click menu says what it is about to do, for the rows it is about to
+# do it to: with a tick set live, "Disable" meaning something different from the
+# row under the cursor has to be visible before the click, not after.
+$ctx.Add_Opening({
+    $t = Get-TickCount
+    $n = if ($t -gt 0) { $t } else { @(Get-SelectedHosts).Count }
+    $what = if ($t -gt 0) { "$t ticked" } else { "$n selected" }
+    $cmToggle.Text = "&Disable / Enable  ($what)"
+    $cmAlarm.Text  = "Alarm on / o&ff  ($what)"
+    $cmRemove.Text = "&Remove  ($what)"
+    $cmReset.Text  = "Reset &statistics  ($what)"
+    $cmCopy.Text   = "&Copy to clipboard  ($what)"
+    $cmEdit.Enabled = (@(Get-SelectedHosts).Count -eq 1)
+})
 
 # ---- Notification settings dialog -------------------------------------------
 $miNotify.Add_Click({
@@ -2336,7 +2721,60 @@ $miNotify.Add_Click({
     }
     $dlg.Dispose()
 })
-$grid.Add_CellDoubleClick({ if ($_.RowIndex -ge 0) { Edit-SelectedHost } })
+$mFile.Add_DropDownOpening({
+    $t = Get-TickCount
+    $n = if ($t -gt 0) { $t } else { @(Get-SelectedHosts).Count }
+    $what = if ($t -gt 0) { "$t ticked" } else { "$n selected" }
+    $miEnable.Text  = "E&nable  ($what)"
+    $miDisable.Text = "&Disable  ($what)"
+    $miAlarmOn.Text = "Alarm &ON  ($what)"
+    $miAlarmOf.Text = "Alarm O&FF - silent  ($what)"
+    $miAckSel.Text  = "Ac&knowledge  ($what)"
+    $miResetSt.Text = "Reset &statistics  ($what)"
+    $miCopySel.Text = "&Copy to clipboard  ($what)"
+    $miRemove.Text  = "&Remove  ($what)"
+    $miTickNon.Enabled = ($t -gt 0)
+    $miTickInv.Enabled = ($script:Hosts.Count -gt 0)
+})
+
+# ---- Tick box + alarm box in the grid ----------------------------------------
+# The grid is read-only, so the check boxes are drawn but not interactive - the
+# click is handled here instead. CellMouseUp with an explicit left-button test:
+# CellClick would also fire on the right-click that opens the context menu, and
+# CellContentClick only counts a hit on the ~13px box itself, which is a mean
+# target. Anywhere in the cell works.
+$grid.Add_CellMouseUp({
+    if ($_.RowIndex -lt 0 -or $_.ColumnIndex -lt 0) { return }
+    if ($_.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+    $col = $grid.Columns[$_.ColumnIndex].Name
+    if ($col -ne 'cSel' -and $col -ne 'cAlarm') { return }
+    $h = $grid.Rows[$_.RowIndex].Tag
+    if (-not $h) { return }
+    if ($col -eq 'cSel') {
+        $h.Sel = -not $h.Sel
+        $grid.Rows[$_.RowIndex].Cells['cSel'].Value = [bool]$h.Sel
+        Refresh-Status
+    } else {
+        Toggle-HostAlarmRow $h
+    }
+})
+
+# Header of the tick column = tick / untick everything that is showing
+$grid.Add_ColumnHeaderMouseClick({
+    if ($_.ColumnIndex -lt 0) { return }
+    if ($_.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+    if ($grid.Columns[$_.ColumnIndex].Name -ne 'cSel') { return }
+    $shown = @($script:Visible)
+    $allOn = ($shown.Count -gt 0) -and (@($shown | Where-Object { -not $_.Sel }).Count -eq 0)
+    Set-AllTicks (-not $allOn)
+})
+
+$grid.Add_CellDoubleClick({
+    if ($_.RowIndex -lt 0) { return }
+    # a double click on a check box is two toggles, not a request to edit
+    if ($_.ColumnIndex -ge 0 -and $grid.Columns[$_.ColumnIndex].Name -in 'cSel','cAlarm') { return }
+    Edit-SelectedHost
+})
 
 # ---- Search ------------------------------------------------------------------
 $txtSearch.Add_TextChanged({ Refresh-Grid; Refresh-Status })
@@ -2783,8 +3221,9 @@ function Import-Settings {
         if ($cfg.Notify) { $script:Config.Notify = $cfg.Notify; Initialize-NotifyDefaults }
         $script:Hosts.Clear()
         foreach ($c in $incoming) {
-            $en = if ($null -eq $c.Enabled) { $true } else { [bool]$c.Enabled }
-            $h  = New-HostState -Label ([string]$c.Label) -Target ([string]$c.Target) -Enabled $en
+            $en = Get-SavedFlag $c 'Enabled'
+            $h  = New-HostState -Label ([string]$c.Label) -Target ([string]$c.Target) -Enabled $en `
+                                -AlarmEnabled (Get-SavedFlag $c 'Alarm')
             if (-not $en) { $h.Status = 'OFF' }
             $script:Hosts.Add($h)
         }
@@ -2806,8 +3245,9 @@ function Import-Settings {
         foreach ($c in $incoming) {
             $t = [string]$c.Target
             if (@($script:Hosts | Where-Object { $_.Target -eq $t }).Count -gt 0) { continue }
-            $en = if ($null -eq $c.Enabled) { $true } else { [bool]$c.Enabled }
-            $h  = New-HostState -Label ([string]$c.Label) -Target $t -Enabled $en
+            $en = Get-SavedFlag $c 'Enabled'
+            $h  = New-HostState -Label ([string]$c.Label) -Target $t -Enabled $en `
+                                -AlarmEnabled (Get-SavedFlag $c 'Alarm')
             if (-not $en) { $h.Status = 'OFF' }
             $script:Hosts.Add($h)
             $added++
@@ -2863,8 +3303,18 @@ function Invoke-UpdateCheck {
 
 # ---- Menu wiring -------------------------------------------------------------
 $miAdd.Add_Click({ $txtLabel.Focus() })
+$miAddMany.Add_Click({ Add-ManyHosts })
 $miEdit.Add_Click({ Edit-SelectedHost })
-$miToggle.Add_Click({ Toggle-SelectedHosts })
+$miAckSel.Add_Click({ Confirm-AlarmSelected })
+$miResetSt.Add_Click({ Reset-SelectedStats })
+$miCopySel.Add_Click({ Copy-SelectedHosts })
+$miTickAll.Add_Click({ Set-AllTicks $true })
+$miTickNon.Add_Click({ Set-AllTicks $false })
+$miTickInv.Add_Click({ Invert-Ticks })
+$miEnable.Add_Click({ Set-HostsEnabled $true })
+$miDisable.Add_Click({ Set-HostsEnabled $false })
+$miAlarmOn.Add_Click({ Set-HostsAlarm $true })
+$miAlarmOf.Add_Click({ Set-HostsAlarm $false })
 $miRemove.Add_Click({ Remove-SelectedHosts })
 $miExit.Add_Click({ $form.Close() })
 

@@ -83,9 +83,16 @@ Delete these two shortcuts and one folder:
 
 - **Add / edit / remove** hosts right in the window — the list is saved
   automatically. Edit with the **Edit** button or by **double-clicking a row**.
+  **Hosts → Add many hosts...** takes a pasted list, including IP ranges.
 - **Enable / Disable** any host. A disabled host is not pinged, shows greyed out
   as `DISABLED`, and can never raise the alarm — use it for kit that is down for
   maintenance instead of deleting it.
+- **Alarm on / off per host** — the **Alarm** tick box in the row. Off means the
+  host is still pinged and still shown, but it makes no sound and sends no
+  message. For a link you know is flapping and do not want to be woken by.
+- **Tick boxes** in the first column select as many hosts as you like, and every
+  action then applies to all of them at once — enable, disable, mute, acknowledge,
+  reset statistics, copy, delete. See [Bulk actions](#bulk-actions).
 - **Loss %** column shows rolling packet loss over the last N pings (N is the
   **Loss over** box, default 100). It is colour-graded — amber past 10%, red past
   50% — so a host that is still *UP* but dropping packets cannot be missed.
@@ -184,6 +191,67 @@ A custom file must be an uncompressed **.wav (PCM)** — Windows' built-in playe
 cannot play mp3. If the file is later deleted or moved, the alarm falls back to
 the default siren rather than going silent.
 
+## Bulk actions
+
+The first column is a **tick box**. Tick as many hosts as you want and every
+action below applies to all of them in one go.
+
+| How | |
+|---|---|
+| tick one host | click its box |
+| tick / untick **everything showing** | click the **tick-box column header** |
+| tick a group | type in **Search** first — *Tick all shown* only ticks what the filter is showing |
+| untick everything | **Hosts → Untick all** |
+| invert | **Hosts → Invert ticks** |
+
+The status bar shows `… | 4 ticked` so a tick made three screens up is never
+invisible, and every menu entry says what it is about to act on —
+`Disable  (4 ticked)`.
+
+**Nothing ticked?** The action falls back to the rows you have highlighted
+(click, `Ctrl`+click, `Shift`+click). Ticks win when both exist, because a tick
+survives sorting, searching and the twice-a-second refresh and a highlight
+does not.
+
+| Bulk action | Where | What it does |
+|---|---|---|
+| **Enable** / **Disable** | Hosts menu, right-click | starts / stops monitoring them |
+| **Alarm ON** / **Alarm OFF** | Hosts menu, right-click | mutes them without stopping monitoring |
+| **Acknowledge** | Hosts menu | acknowledges only those hosts (the toolbar **ACKNOWLEDGE** does all of them) |
+| **Reset statistics** | Hosts menu, right-click | clears loss % / latency history — use it after fixing a link |
+| **Copy to clipboard** | Hosts menu, right-click | CSV: name, address, monitoring, alarm, status |
+| **Remove** | Hosts menu, right-click | deletes them — the confirm box **lists what it is about to delete** and defaults to *No* |
+
+`Disable / Enable` on a mixed set turns them **all on** — flipping each one
+would leave the list just as mixed and tell you nothing.
+
+### Alarm on / off per host
+
+The **Alarm** column is a tick box on every row. Unticked means:
+
+- no alarm sound, no banner red, no ACKNOWLEDGE needed
+- **no email, no Telegram, no SMS, no command** — off means off
+- but it **is still pinged**, still logged, and the row still shows `DOWN (muted)`
+  in amber so nobody thinks it is healthy
+
+Un-muting a host that is currently down rings straight away — the mute does not
+quietly count as an acknowledgement.
+
+### Adding many hosts at once
+
+**Hosts → Add many hosts...** takes a paste, one host per line:
+
+```
+NIKETON-POP,10.0.0.1        name and address
+10.0.0.2                    address only (the name becomes the address)
+POP-RTR,10.0.0.10-30        a range: POP-RTR10 … POP-RTR30, one host each
+172.16.5.1-172.16.5.50      a range written out in full
+# lines starting with # are ignored
+```
+
+`,`, `;` and tab all work as the separator. Addresses already in the list are
+skipped, and the dialog reports how many were added and how many were duplicates.
+
 ## Small window / responsive layout
 
 The window can be dragged down to a small box in the corner of a screen, and it
@@ -194,7 +262,7 @@ rearranges itself as it shrinks rather than clipping:
 | first | **Since** is dropped |
 | then | **Down for** is dropped, headers shorten (`IP`, `ms`, `Loss`), the banner text gets smaller, the status bar switches to `UP 3  DOWN 0  off 0` |
 | then | **IP / Host** is dropped |
-| smallest | **ms** is dropped — **Name, Status and Loss %** always stay |
+| smallest | **ms** and **Alarm** are dropped — the tick box, **Name, Status and Loss %** always stay |
 
 Toolbar items that no longer fit move into the `»` dropdown, and **ACKNOWLEDGE**
 and **Pause** are pinned so they are never the ones that disappear. If the
@@ -363,7 +431,7 @@ Everything set once and forgotten lives in the **menu bar**:
 
 | Menu | Contains |
 |---|---|
-| **Hosts** | Add, Edit, Disable/Enable, Remove, Exit |
+| **Hosts** | Add, **Add many hosts...**, Edit, tick all/none/invert, **Enable / Disable**, **Alarm ON / OFF**, **Acknowledge**, **Reset statistics**, **Copy to clipboard**, **Remove**, Exit |
 | **View** | Text size (Small → TV), Always on top, Show event log, **Compact / Normal window size** |
 | **Monitoring** | Pause/Resume, Test alarm sound, **Alarm sound…**, **Monitoring settings…** (interval, timeout, fails→down, loss window) |
 | **Settings** | **Notifications…** (email / Telegram / SMS / offline command), **Export / Import hosts + settings**, Auto-update, Check for updates now |
