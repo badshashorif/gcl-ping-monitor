@@ -285,8 +285,8 @@ rearranges itself as it shrinks rather than clipping:
 
 | As it narrows | |
 |---|---|
-| first | **Since** is dropped |
-| then | **Down for** is dropped, headers shorten (`IP`, `ms`, `Loss`), the banner text gets smaller, the status bar switches to `UP 3  DOWN 0  off 0` |
+| first | **Since** is dropped and the headers shorten (`IP`, `Snd`, `ms`, `Loss`, `Down`) |
+| then | **Down** is dropped, the banner text gets smaller, the status bar switches to `UP 3  DOWN 0  off 0`, and the toolbar button shortens to **Bulk** |
 | then | **IP / Host** is dropped |
 | smallest | **ms** and **Sound** are dropped — the tick box, **Name, Status and Loss %** always stay |
 

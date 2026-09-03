@@ -1599,6 +1599,11 @@ $null = $grid.Columns.Add('cDown',   'Down for')
 # Fill mode refuses to shrink a column below its MinimumWidth, and the default is
 # wide enough to push the last column off the right edge in a small window
 foreach ($c in $grid.Columns) { $c.MinimumWidth = 22 }
+# No column sorts. The list re-sorts itself every cycle (down hosts to the top),
+# so a user sort would be undone within half a second - and an Automatic sort
+# mode silently reserves room for a sort arrow in every header, which is what
+# was clipping "Status" to "Statu" in a narrow window.
+foreach ($c in $grid.Columns) { $c.SortMode = 'NotSortable' }
 # the two check boxes keep a fixed width instead of a share of it - a tick box
 # that grows with the window would look like a mistake
 $grid.Columns['cSel'].AutoSizeMode   = 'None'
@@ -1663,7 +1668,7 @@ function Apply-TextSize {
         # wide enough for the bold "Alarm" header, which is what sets the size -
         # a clipped header ("Alarr") is worse than a slightly wide column. In a
         # narrow window the header is already the short "Alm", so ask the tier.
-        $grid.Columns['cAlarm'].Width = [int]($s * $(if ($script:RespTier -ge 2) { 4.0 } else { 5.6 }))
+        $grid.Columns['cAlarm'].Width = [int]($s * $(if ($script:RespTier -ge 1) { 4.0 } else { 5.6 }))
     } catch { }
     foreach ($r in $grid.Rows) { $r.Height = [int]($s * 2.5) }
 
@@ -1713,30 +1718,37 @@ function Update-Responsive {
             if ($tier -ge 4) { $hide += 'cLat'; $hide += 'cAlarm' }
             foreach ($c in $grid.Columns) { $c.Visible = ($hide -notcontains $c.Name) }
 
-            # short headers + a different share of the width once space is tight:
-            # "Latency" as a header is wider than any value it ever shows
-            if ($tier -ge 2) {
+            # Short headers + a different share of the width once space is tight.
+            # This kicks in from tier 1, not tier 2: the two fixed-width check
+            # box columns take ~9 text units that the fill columns used to
+            # share, so "Latency" and "Down for" were clipping to "Later" and
+            # "Dowr" one tier earlier than they used to.
+            if ($tier -ge 1) {
                 $grid.Columns['cTarget'].HeaderText = 'IP'
                 $grid.Columns['cLat'].HeaderText    = 'ms'
                 $grid.Columns['cLoss'].HeaderText   = 'Loss'
                 $grid.Columns['cAlarm'].HeaderText  = 'Snd'
+                $grid.Columns['cDown'].HeaderText   = 'Down'
                 $grid.Columns['cAlarm'].Width       = [int]($u * 4.0)
                 $grid.Columns['cLabel'].FillWeight  = 132
                 $grid.Columns['cTarget'].FillWeight = 96
                 $grid.Columns['cStatus'].FillWeight = 64
                 $grid.Columns['cLat'].FillWeight    = 60
                 $grid.Columns['cLoss'].FillWeight   = 58
+                $grid.Columns['cDown'].FillWeight   = 62
             } else {
                 $grid.Columns['cTarget'].HeaderText = 'IP / Host'
                 $grid.Columns['cLat'].HeaderText    = 'Latency'
                 $grid.Columns['cLoss'].HeaderText   = 'Loss %'
                 $grid.Columns['cAlarm'].HeaderText  = 'Sound'
+                $grid.Columns['cDown'].HeaderText   = 'Down for'
                 $grid.Columns['cAlarm'].Width       = [int]($u * 5.6)
                 $grid.Columns['cLabel'].FillWeight  = 130
                 $grid.Columns['cTarget'].FillWeight = 120
                 $grid.Columns['cStatus'].FillWeight = 80
                 $grid.Columns['cLat'].FillWeight    = 62
                 $grid.Columns['cLoss'].FillWeight   = 62
+                $grid.Columns['cDown'].FillWeight   = 70
             }
 
             # the banner is the biggest text on screen - it shrinks first
@@ -1917,7 +1929,7 @@ function Refresh-Grid {
         # in a narrow window the header already says "ms" - the suffix would only
         # push a 3-digit latency out of the column
         $row.Cells['cLat'].Value    = if ($h.Enabled -and $h.Status -eq 'UP' -and $null -ne $h.Latency) {
-            if ($script:RespTier -ge 2) { "$($h.Latency)" } else { "$($h.Latency) ms" }
+            if ($script:RespTier -ge 1) { "$($h.Latency)" } else { "$($h.Latency) ms" }
         } else { '' }
         # today needs no date - that is what keeps this column readable at TV size
         $row.Cells['cSince'].Value  = if ($h.LastChange) {
