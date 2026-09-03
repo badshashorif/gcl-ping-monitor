@@ -88,9 +88,10 @@ Delete these two shortcuts and one folder:
 - **Enable / Disable** any host. A disabled host is not pinged, shows greyed out
   as `DISABLED`, and can never raise the alarm — use it for kit that is down for
   maintenance instead of deleting it.
-- **Alarm on / off per host** — the **Alarm** tick box in the row. Off means the
-  host is still pinged and still shown, but it makes no sound and sends no
-  message. For a link you know is flapping and do not want to be woken by.
+- **Alarm on / off per host** — the **Alarm** tick box in the row. Off silences
+  the *desk*: no sound, no red banner, nothing to acknowledge — but the host is
+  still pinged and **email / Telegram / SMS still go out**. For a link that
+  flaps at night: you get the message, the room stays quiet.
 - **Tick boxes** in the first column select as many hosts as you like, and the
   **Bulk select** button on the toolbar then applies one action to all of them —
   enable, disable, mute, acknowledge, reset statistics, copy, delete. The check
@@ -223,7 +224,7 @@ does not.
 | Bulk action | Where | What it does |
 |---|---|---|
 | **Enable** / **Disable** | Bulk select, Hosts menu, right-click | starts / stops monitoring them |
-| **Alarm ON** / **Alarm OFF** | Bulk select, Hosts menu, right-click | mutes them without stopping monitoring |
+| **Alarm ON** / **Alarm OFF** | Bulk select, Hosts menu, right-click | silences the sound only - monitoring and notifications carry on |
 | **Acknowledge** | Bulk select, Hosts menu | acknowledges only those hosts (the toolbar **ACKNOWLEDGE** does all of them) |
 | **Reset statistics** | Bulk select, Hosts menu, right-click | clears loss % / latency history — use it after fixing a link |
 | **Copy to clipboard** | Bulk select, Hosts menu, right-click | CSV: name, address, monitoring, alarm, status |
@@ -234,12 +235,24 @@ would leave the list just as mixed and tell you nothing.
 
 ### Alarm on / off per host
 
-The **Alarm** column is a tick box on every row. Unticked means:
+The **Alarm** column is a tick box on every row. It controls **the noise in the
+room, not whether anyone is told.** Unticked means:
 
-- no alarm sound, no banner red, no ACKNOWLEDGE needed
-- **no email, no Telegram, no SMS, no command** — off means off
-- but it **is still pinged**, still logged, and the row still shows `DOWN (muted)`
+- no alarm sound, no recovery sound, no red banner, nothing to ACKNOWLEDGE
+- **email, Telegram, SMS and the offline command still fire** exactly as before
+- it **is still pinged**, still logged, and the row still shows `DOWN (muted)`
   in amber so nobody thinks it is healthy
+
+There are three levels, and they are deliberately different things:
+
+| | Pinged | Sound + banner | Notification |
+|---|---|---|---|
+| normal | yes | yes | yes |
+| **Alarm off** | yes | **no** | **yes** |
+| **Disabled** | no | no | no |
+
+So: mute the desk for a link that flaps at night and still get the message;
+**disable** the host when you want the tool to forget about it completely.
 
 Un-muting a host that is currently down rings straight away — the mute does not
 quietly count as an acknowledgement.

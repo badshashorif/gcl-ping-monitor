@@ -721,8 +721,9 @@ function Add-Notification {
     param([ValidateSet('DOWN','UP')][string]$Kind, $Host_)
     $n = $script:Config.Notify
     if (-not (Test-NotifyEnabled)) { return }
-    # "Alarm off" on a host means off completely: no sound AND no message
-    if (-not $Host_.AlarmEnabled) { return }
+    # NOTE: a host with the alarm off still sends its message. "Alarm off"
+    # silences the DESK - no sound, no red banner, no acknowledge - it does not
+    # stop the tool telling anybody. Stopping everything is what Disable is for.
     if ($Kind -eq 'DOWN' -and -not $n.OnDown)    { return }
     if ($Kind -eq 'UP'   -and -not $n.OnRecover) { return }
     # DownSince is still set at this point - Process-Result clears it right after
@@ -1325,7 +1326,7 @@ $miTickInv = New-Mnu '&Invert ticks'
 $miEnable  = New-Mnu 'E&nable ticked'
 $miDisable = New-Mnu '&Disable ticked'
 $miAlarmOn = New-Mnu 'Alarm &ON for ticked'
-$miAlarmOf = New-Mnu 'Alarm O&FF for ticked  (silent)'
+$miAlarmOf = New-Mnu 'Alarm O&FF for ticked  (no sound)'
 $miAckSel  = New-Mnu 'Ac&knowledge ticked'
 $miResetSt = New-Mnu 'Reset &statistics for ticked'
 $miCopySel = New-Mnu '&Copy ticked to clipboard'
@@ -1454,7 +1455,7 @@ $tbTickInv = New-Mnu '&Invert ticks'
 $tbEnable  = New-Mnu 'E&nable ticked'
 $tbDisable = New-Mnu '&Disable ticked'
 $tbAlarmOn = New-Mnu 'Alarm &ON for ticked'
-$tbAlarmOf = New-Mnu 'Alarm O&FF for ticked  (silent)'
+$tbAlarmOf = New-Mnu 'Alarm O&FF for ticked  (no sound)'
 $tbAck     = New-Mnu 'Ac&knowledge ticked'
 $tbReset   = New-Mnu 'Reset &statistics for ticked'
 $tbCopy    = New-Mnu '&Copy ticked to clipboard'
@@ -1573,7 +1574,7 @@ $null = $grid.Columns.Add((New-ChkCol 'cSel' '' 'BULK SELECT - tick hosts here, 
 $null = $grid.Columns.Add('cLabel',  'Name')
 $null = $grid.Columns.Add('cTarget', 'IP / Host')
 $null = $grid.Columns.Add('cStatus', 'Status')
-$null = $grid.Columns.Add((New-ChkCol 'cAlarm' 'Alarm' 'Alarm on / off for this host. Off = still monitored, but no sound and no notification.  Click to toggle.'))
+$null = $grid.Columns.Add((New-ChkCol 'cAlarm' 'Alarm' 'Alarm on / off for this host.  OFF = no sound and no red banner, but it is still monitored and email / Telegram / SMS still go out.  (To stop everything, disable the host.)  Click to toggle.'))
 $null = $grid.Columns.Add('cLat',    'Latency')
 $null = $grid.Columns.Add('cLoss',   'Loss %')
 $null = $grid.Columns.Add('cSince',  'Since')
@@ -2249,7 +2250,7 @@ function Set-HostsAlarm {
         if ($On) { $h.Acked = $false }    # un-muting a host that is down must ring
     }
     if ($On) { Write-BulkEvent 'ALARM ON' $changed }
-    else     { Write-BulkEvent 'ALARM OFF' $changed ' - no sound, no notification' }
+    else     { Write-BulkEvent 'ALARM OFF' $changed ' - no sound; notifications still sent' }
     Save-Config; Refresh-Grid; Update-Alarm; Refresh-Banner
 }
 
@@ -2270,7 +2271,7 @@ function Toggle-HostAlarmRow {
         $h.Acked = $false
         Write-Event ("ALARM ON  : {0} [{1}]" -f $h.Label, $h.Target)
     } else {
-        Write-Event ("ALARM OFF : {0} [{1}] - no sound, no notification" -f $h.Label, $h.Target)
+        Write-Event ("ALARM OFF : {0} [{1}] - no sound; notifications still sent" -f $h.Label, $h.Target)
     }
     Save-Config; Refresh-Grid; Update-Alarm; Refresh-Banner
 }
@@ -2786,7 +2787,7 @@ $mFile.Add_DropDownOpening({
     $miEnable.Text  = "E&nable  ($what)"
     $miDisable.Text = "&Disable  ($what)"
     $miAlarmOn.Text = "Alarm &ON  ($what)"
-    $miAlarmOf.Text = "Alarm O&FF - silent  ($what)"
+    $miAlarmOf.Text = "Alarm O&FF - no sound  ($what)"
     $miAckSel.Text  = "Ac&knowledge  ($what)"
     $miResetSt.Text = "Reset &statistics  ($what)"
     $miCopySel.Text = "&Copy to clipboard  ($what)"
@@ -2889,7 +2890,7 @@ $btnBulk.Add_DropDownOpening({
     $tbEnable.Text  = "E&nable  ($what)"
     $tbDisable.Text = "&Disable  ($what)"
     $tbAlarmOn.Text = "Alarm &ON  ($what)"
-    $tbAlarmOf.Text = "Alarm O&FF - silent  ($what)"
+    $tbAlarmOf.Text = "Alarm O&FF - no sound  ($what)"
     $tbAck.Text     = "Ac&knowledge  ($what)"
     $tbReset.Text   = "Reset &statistics  ($what)"
     $tbCopy.Text    = "&Copy to clipboard  ($what)"
