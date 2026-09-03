@@ -671,7 +671,14 @@ $script:AlarmActive = $false
 # the caller re-wraps it (alarm fires when nothing is down). Assigning
 # "@( ... | Where-Object ... )" inline is correct for 0, 1 and N.
 
+# $script:AlarmLoud is set by Update-Alarm: true when at least one of the hosts
+# currently down still has its Alarm box ticked. Gating here rather than at each
+# call site means nothing can accidentally make a noise for a muted host.
+# -Force is for the "Test alarm sound" button, which must always play.
+$script:AlarmLoud = $false
 function Play-Alarm {
+    param([switch]$Force)
+    if (-not $Force -and -not $script:AlarmLoud) { return }
     try { if ($script:Player) { $script:Player.Play(); return } } catch { }
     try { [System.Media.SystemSounds]::Hand.Play() } catch { }
 }
@@ -1176,11 +1183,18 @@ $script:AlarmMuted   = $false
 $script:AlarmSet     = @()          # targets currently down and un-acknowledged
 
 function Update-Alarm {
-    $down   = @($script:Hosts | Where-Object { $_.Enabled -and $_.AlarmEnabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
+    # A host with the alarm off is STILL an alarm - red banner, red row, it has
+    # to be acknowledged, and it is still reported. The only thing its switch
+    # controls is the noise. So the alarm set is every down host, and a second,
+    # smaller set decides whether anything is audible.
+    $down   = @($script:Hosts | Where-Object { $_.Enabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
     $active = $down.Count -gt 0
+    $loud   = @($down | Where-Object { $_.AlarmEnabled })
+    $script:AlarmLoud = $loud.Count -gt 0
 
-    # anything in the down set that was not there last time re-arms the sound
-    $now = @($down | ForEach-Object { $_.Target })
+    # a down host that was not there last time re-arms the sound - but only a
+    # host that is allowed to make one, otherwise nothing to re-arm
+    $now = @($loud | ForEach-Object { $_.Target })
     $fresh = @($now | Where-Object { $script:AlarmSet -notcontains $_ })
     $script:AlarmSet = $now
     if ($fresh.Count -gt 0 -and $script:AlarmActive) {
@@ -1190,8 +1204,8 @@ function Update-Alarm {
         if ($script:AlarmMuted) {
             $script:AlarmMuted = $false
             Write-Event ('ALARM     : re-armed - {0} newly down' -f ($fresh -join ', '))
-            Play-Alarm
         }
+        Play-Alarm
     }
 
     if ($script:btnAck) {
@@ -1208,7 +1222,9 @@ function Update-Alarm {
     if ($active -eq $script:AlarmActive) { return }
     $script:AlarmActive = $active
     if ($active) {
-        $src = if ($script:Player) { Split-Path $script:AlarmWavPath -Leaf } else { 'system sound' }
+        $src = if (-not $script:AlarmLoud) { 'off - Sound unticked for these host(s)' }
+               elseif ($script:Player) { Split-Path $script:AlarmWavPath -Leaf }
+               else { 'system sound' }
         $script:AlarmOnSince = Get-Date
         $script:AlarmMuted   = $false
         Write-Event ("ALARM     : ON  ({0} host(s) down, sound={1})" -f $down.Count, $src)
@@ -1224,6 +1240,7 @@ function Update-Alarm {
 function Update-AlarmAutoStop {
     # called from the alarm timer, once a second-ish
     if (-not $script:AlarmActive -or $script:AlarmMuted) { return }
+    if (-not $script:AlarmLoud) { return }            # nothing is sounding to silence
     $mins = [double]$script:Config.AlarmAutoStopMin
     if ($mins -le 0) { return }                       # 0 = keep sounding forever
     if (-not $script:AlarmOnSince) { return }
@@ -1325,8 +1342,8 @@ $miTickNon = New-Mnu 'Untick a&ll'
 $miTickInv = New-Mnu '&Invert ticks'
 $miEnable  = New-Mnu 'E&nable ticked'
 $miDisable = New-Mnu '&Disable ticked'
-$miAlarmOn = New-Mnu 'Alarm &ON for ticked'
-$miAlarmOf = New-Mnu 'Alarm O&FF for ticked  (no sound)'
+$miAlarmOn = New-Mnu 'Sound &ON for ticked'
+$miAlarmOf = New-Mnu 'Sound O&FF for ticked  (silent)'
 $miAckSel  = New-Mnu 'Ac&knowledge ticked'
 $miResetSt = New-Mnu 'Reset &statistics for ticked'
 $miCopySel = New-Mnu '&Copy ticked to clipboard'
@@ -1454,8 +1471,8 @@ $tbTickNon = New-Mnu 'Untick a&ll'
 $tbTickInv = New-Mnu '&Invert ticks'
 $tbEnable  = New-Mnu 'E&nable ticked'
 $tbDisable = New-Mnu '&Disable ticked'
-$tbAlarmOn = New-Mnu 'Alarm &ON for ticked'
-$tbAlarmOf = New-Mnu 'Alarm O&FF for ticked  (no sound)'
+$tbAlarmOn = New-Mnu 'Sound &ON for ticked'
+$tbAlarmOf = New-Mnu 'Sound O&FF for ticked  (silent)'
 $tbAck     = New-Mnu 'Ac&knowledge ticked'
 $tbReset   = New-Mnu 'Reset &statistics for ticked'
 $tbCopy    = New-Mnu '&Copy ticked to clipboard'
@@ -1495,7 +1512,7 @@ $ctx = New-Object System.Windows.Forms.ContextMenuStrip
 $ctx.Font = UiFont
 $cmEdit    = New-Mnu '&Edit host...'
 $cmToggle  = New-Mnu '&Disable / Enable'
-$cmAlarm   = New-Mnu 'Alarm on / o&ff'
+$cmAlarm   = New-Mnu 'Sound on / o&ff'
 $cmRemove  = New-Mnu '&Remove'
 $cmTick    = New-Mnu '&Tick / untick this host'
 $cmTickAll = New-Mnu 'Tick &all shown'
@@ -1574,7 +1591,7 @@ $null = $grid.Columns.Add((New-ChkCol 'cSel' '' 'BULK SELECT - tick hosts here, 
 $null = $grid.Columns.Add('cLabel',  'Name')
 $null = $grid.Columns.Add('cTarget', 'IP / Host')
 $null = $grid.Columns.Add('cStatus', 'Status')
-$null = $grid.Columns.Add((New-ChkCol 'cAlarm' 'Alarm' 'Alarm on / off for this host.  OFF = no sound and no red banner, but it is still monitored and email / Telegram / SMS still go out.  (To stop everything, disable the host.)  Click to toggle.'))
+$null = $grid.Columns.Add((New-ChkCol 'cAlarm' 'Sound' 'Sound on / off for this host.  OFF = this host makes no noise - the row and the banner still go red, it still has to be acknowledged, and email / Telegram / SMS still go out.  (To stop everything, disable the host.)  Click to toggle.'))
 $null = $grid.Columns.Add('cLat',    'Latency')
 $null = $grid.Columns.Add('cLoss',   'Loss %')
 $null = $grid.Columns.Add('cSince',  'Since')
@@ -1702,7 +1719,7 @@ function Update-Responsive {
                 $grid.Columns['cTarget'].HeaderText = 'IP'
                 $grid.Columns['cLat'].HeaderText    = 'ms'
                 $grid.Columns['cLoss'].HeaderText   = 'Loss'
-                $grid.Columns['cAlarm'].HeaderText  = 'Alm'
+                $grid.Columns['cAlarm'].HeaderText  = 'Snd'
                 $grid.Columns['cAlarm'].Width       = [int]($u * 4.0)
                 $grid.Columns['cLabel'].FillWeight  = 132
                 $grid.Columns['cTarget'].FillWeight = 96
@@ -1713,7 +1730,7 @@ function Update-Responsive {
                 $grid.Columns['cTarget'].HeaderText = 'IP / Host'
                 $grid.Columns['cLat'].HeaderText    = 'Latency'
                 $grid.Columns['cLoss'].HeaderText   = 'Loss %'
-                $grid.Columns['cAlarm'].HeaderText  = 'Alarm'
+                $grid.Columns['cAlarm'].HeaderText  = 'Sound'
                 $grid.Columns['cAlarm'].Width       = [int]($u * 5.6)
                 $grid.Columns['cLabel'].FillWeight  = 130
                 $grid.Columns['cTarget'].FillWeight = 120
@@ -1877,11 +1894,20 @@ function Refresh-Grid {
                 'UP'   { $statusText = 'UP';           $bg = $colUpBg;   $fg = $colUpFg;   $bold = $false }
                 'WARN' { $statusText = 'checking...';  $bg = $colWarnBg; $fg = $colWarnFg; $bold = $false }
                 'DOWN' {
-                    # a muted host is down without being an alarm - say so in the
-                    # cell, because the Alarm column is hidden in a small window
-                    if (-not $h.AlarmEnabled) { $statusText = 'DOWN (muted)'; $bg = $colAckBg; $fg = $colAckFg; $bold = $true }
-                    elseif ($h.Acked) { $statusText = 'DOWN (ack)'; $bg = $colAckBg;  $fg = $colAckFg;  $bold = $true }
-                    else              { $statusText = 'DOWN';       $bg = $colDownBg; $fg = $colDownFg; $bold = $true }
+                    # a muted host is just as red - only the noise is off. The
+                    # cell says which, because the Alarm column is dropped in a
+                    # small window
+                    if ($h.Acked) { $statusText = 'DOWN (ack)'; $bg = $colAckBg; $fg = $colAckFg; $bold = $true }
+                    elseif (-not $h.AlarmEnabled) {
+                        # the Sound column sits right next to Status and already
+                        # shows an empty box, so the word stays plain "DOWN" -
+                        # "DOWN (no sound)" does not fit the column and truncates
+                        # to "DOWN (n...". Only in the smallest window, where the
+                        # Sound column is dropped, does a bare * have to carry it.
+                        $statusText = if ($script:RespTier -ge 4) { 'DOWN *' } else { 'DOWN' }
+                        $bg = $colDownBg; $fg = $colDownFg; $bold = $true
+                    }
+                    else          { $statusText = 'DOWN';       $bg = $colDownBg; $fg = $colDownFg; $bold = $true }
                 }
                 default { $statusText = '-';           $bg = $colInitBg; $fg = $colInitFg; $bold = $false }
             }
@@ -1948,9 +1974,9 @@ function Refresh-Grid {
 function Refresh-Banner {
     $active  = @($script:Hosts | Where-Object { $_.Enabled })
     $down    = @($active | Where-Object { $_.Status -eq 'DOWN' })
-    # only a host that is allowed to raise an alarm turns the banner red -
-    # a muted host is still listed, but in the calmer "acknowledged" colour
-    $unacked = @($down   | Where-Object { $_.AlarmEnabled -and -not $_.Acked })
+    # a muted host still turns the banner red - its switch controls the sound,
+    # nothing else
+    $unacked = @($down   | Where-Object { -not $_.Acked })
     if ($down.Count -gt 0) {
         $names = ($down | Select-Object -First 6 | ForEach-Object { $_.Label }) -join ',  '
         if ($down.Count -gt 6) { $names += '  ...' }
@@ -2249,8 +2275,8 @@ function Set-HostsAlarm {
         $h.StyleKey = ''
         if ($On) { $h.Acked = $false }    # un-muting a host that is down must ring
     }
-    if ($On) { Write-BulkEvent 'ALARM ON' $changed }
-    else     { Write-BulkEvent 'ALARM OFF' $changed ' - no sound; notifications still sent' }
+    if ($On) { Write-BulkEvent 'SOUND ON' $changed }
+    else     { Write-BulkEvent 'SOUND OFF' $changed ' - silent; banner, acknowledge and notifications unchanged' }
     Save-Config; Refresh-Grid; Update-Alarm; Refresh-Banner
 }
 
@@ -2269,9 +2295,9 @@ function Toggle-HostAlarmRow {
     $h.StyleKey = ''
     if ($h.AlarmEnabled) {
         $h.Acked = $false
-        Write-Event ("ALARM ON  : {0} [{1}]" -f $h.Label, $h.Target)
+        Write-Event ("SOUND ON  : {0} [{1}]" -f $h.Label, $h.Target)
     } else {
-        Write-Event ("ALARM OFF : {0} [{1}] - no sound; notifications still sent" -f $h.Label, $h.Target)
+        Write-Event ("SOUND OFF : {0} [{1}] - silent; banner, acknowledge and notifications unchanged" -f $h.Label, $h.Target)
     }
     Save-Config; Refresh-Grid; Update-Alarm; Refresh-Banner
 }
@@ -2303,7 +2329,7 @@ function Remove-SelectedHosts {
 function Confirm-AlarmSelected {
     $sel = @(Get-BulkHosts)
     if ($sel.Count -eq 0) { Show-NothingPicked 'Acknowledge'; return }
-    $down = @($sel | Where-Object { $_.Enabled -and $_.AlarmEnabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
+    $down = @($sel | Where-Object { $_.Enabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
     if ($down.Count -eq 0) {
         Write-Event ("ACK       : nothing to acknowledge among the {0} picked host(s)" -f $sel.Count)
         return
@@ -2447,7 +2473,7 @@ function Add-ManyHosts {
 }
 
 function Confirm-Alarm {
-    $down = @($script:Hosts | Where-Object { $_.Enabled -and $_.AlarmEnabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
+    $down = @($script:Hosts | Where-Object { $_.Enabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
     if ($down.Count -eq 0) { return }
     foreach ($h in $down) { $h.Acked = $true; $h.StyleKey = '' }
     Write-Event ("ACK       : alarm acknowledged ({0} host(s) still down)" -f $down.Count)
@@ -2488,7 +2514,7 @@ $ctx.Add_Opening({
     $n = if ($t -gt 0) { $t } else { @(Get-SelectedHosts).Count }
     $what = if ($t -gt 0) { "$t ticked" } else { "$n selected" }
     $cmToggle.Text = "&Disable / Enable  ($what)"
-    $cmAlarm.Text  = "Alarm on / o&ff  ($what)"
+    $cmAlarm.Text  = "Sound on / o&ff  ($what)"
     $cmRemove.Text = "&Remove  ($what)"
     $cmReset.Text  = "Reset &statistics  ($what)"
     $cmCopy.Text   = "&Copy to clipboard  ($what)"
@@ -2786,8 +2812,8 @@ $mFile.Add_DropDownOpening({
     $what = if ($t -gt 0) { "$t ticked" } else { "$n selected" }
     $miEnable.Text  = "E&nable  ($what)"
     $miDisable.Text = "&Disable  ($what)"
-    $miAlarmOn.Text = "Alarm &ON  ($what)"
-    $miAlarmOf.Text = "Alarm O&FF - no sound  ($what)"
+    $miAlarmOn.Text = "Sound &ON  ($what)"
+    $miAlarmOf.Text = "Sound O&FF - silent  ($what)"
     $miAckSel.Text  = "Ac&knowledge  ($what)"
     $miResetSt.Text = "Reset &statistics  ($what)"
     $miCopySel.Text = "&Copy to clipboard  ($what)"
@@ -2889,8 +2915,8 @@ $btnBulk.Add_DropDownOpening({
     $what = if ($t -gt 0) { "$t ticked" } else { "$n selected" }
     $tbEnable.Text  = "E&nable  ($what)"
     $tbDisable.Text = "&Disable  ($what)"
-    $tbAlarmOn.Text = "Alarm &ON  ($what)"
-    $tbAlarmOf.Text = "Alarm O&FF - no sound  ($what)"
+    $tbAlarmOn.Text = "Sound &ON  ($what)"
+    $tbAlarmOf.Text = "Sound O&FF - silent  ($what)"
     $tbAck.Text     = "Ac&knowledge  ($what)"
     $tbReset.Text   = "Reset &statistics  ($what)"
     $tbCopy.Text    = "&Copy to clipboard  ($what)"
@@ -2899,7 +2925,7 @@ $btnBulk.Add_DropDownOpening({
 })
 
 function Test-AlarmSound {
-    Play-Alarm
+    Play-Alarm -Force
     $src = if ($script:Player) { Split-Path $script:AlarmWavPath -Leaf } else { 'system sound (Windows sounds may be off!)' }
     Write-Event ("TEST      : played alarm - source: {0}" -f $src)
 }

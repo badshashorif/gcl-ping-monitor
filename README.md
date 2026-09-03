@@ -88,13 +88,14 @@ Delete these two shortcuts and one folder:
 - **Enable / Disable** any host. A disabled host is not pinged, shows greyed out
   as `DISABLED`, and can never raise the alarm — use it for kit that is down for
   maintenance instead of deleting it.
-- **Alarm on / off per host** — the **Alarm** tick box in the row. Off silences
-  the *desk*: no sound, no red banner, nothing to acknowledge — but the host is
-  still pinged and **email / Telegram / SMS still go out**. For a link that
-  flaps at night: you get the message, the room stays quiet.
+- **Sound on / off per host** — the **Sound** tick box in the row. Unticked, the
+  host makes **no noise** — and that is the only difference. The banner still
+  goes red, it still has to be acknowledged, and email / Telegram / SMS still go
+  out. For the one link that flaps overnight: you still see it and still get the
+  message, the room just stays quiet. See [Sound on / off per host](#sound-on--off-per-host).
 - **Tick boxes** in the first column select as many hosts as you like, and the
   **Bulk select** button on the toolbar then applies one action to all of them —
-  enable, disable, mute, acknowledge, reset statistics, copy, delete. The check
+  enable, disable, silence, acknowledge, reset statistics, copy, delete. The check
   box in that column's **header** ticks or unticks everything on screen.
   See [Bulk actions](#bulk-actions).
 - **Loss %** column shows rolling packet loss over the last N pings (N is the
@@ -224,7 +225,7 @@ does not.
 | Bulk action | Where | What it does |
 |---|---|---|
 | **Enable** / **Disable** | Bulk select, Hosts menu, right-click | starts / stops monitoring them |
-| **Alarm ON** / **Alarm OFF** | Bulk select, Hosts menu, right-click | silences the sound only - monitoring and notifications carry on |
+| **Sound ON** / **Sound OFF** | Bulk select, Hosts menu, right-click | silences the sound only - monitoring and notifications carry on |
 | **Acknowledge** | Bulk select, Hosts menu | acknowledges only those hosts (the toolbar **ACKNOWLEDGE** does all of them) |
 | **Reset statistics** | Bulk select, Hosts menu, right-click | clears loss % / latency history — use it after fixing a link |
 | **Copy to clipboard** | Bulk select, Hosts menu, right-click | CSV: name, address, monitoring, alarm, status |
@@ -233,29 +234,34 @@ does not.
 `Disable / Enable` on a mixed set turns them **all on** — flipping each one
 would leave the list just as mixed and tell you nothing.
 
-### Alarm on / off per host
+### Sound on / off per host
 
-The **Alarm** column is a tick box on every row. It controls **the noise in the
-room, not whether anyone is told.** Unticked means:
+The **Sound** column is a tick box on every row. It controls **exactly one
+thing: whether that host is allowed to make a noise.** Nothing else changes.
 
-- no alarm sound, no recovery sound, no red banner, nothing to ACKNOWLEDGE
-- **email, Telegram, SMS and the offline command still fire** exactly as before
-- it **is still pinged**, still logged, and the row still shows `DOWN (muted)`
-  in amber so nobody thinks it is healthy
+Unticked, a host that goes down still:
 
-There are three levels, and they are deliberately different things:
+- turns the **banner red** and the **row red**
+- lights **ACKNOWLEDGE** and has to be acknowledged like any other
+- flashes the taskbar
+- sends **email / Telegram / SMS / the offline command**
+- is pinged and logged exactly as before
 
-| | Pinged | Sound + banner | Notification |
-|---|---|---|---|
-| normal | yes | yes | yes |
-| **Alarm off** | yes | **no** | **yes** |
-| **Disabled** | no | no | no |
+The only difference: **no alarm sound and no recovery sound for that host.** If
+some *other* host that still has Sound ticked is down, the alarm sounds
+normally — silencing one host never silences the rest.
 
-So: mute the desk for a link that flaps at night and still get the message;
-**disable** the host when you want the tool to forget about it completely.
+| | Pinged | Red banner + ACK | Sound | Notification |
+|---|---|---|---|---|
+| normal | yes | yes | yes | yes |
+| **Sound off** | yes | yes | **no** | yes |
+| **Disabled** | no | no | no | no |
 
-Un-muting a host that is currently down rings straight away — the mute does not
-quietly count as an acknowledgement.
+So: silence the one link that flaps overnight and still see it and still get
+the message; **disable** a host when you want the tool to forget it completely.
+
+Ticking Sound back on for a host that is currently down starts the alarm
+immediately — silencing is not a quiet acknowledgement.
 
 ### Adding many hosts at once
 
@@ -282,7 +288,7 @@ rearranges itself as it shrinks rather than clipping:
 | first | **Since** is dropped |
 | then | **Down for** is dropped, headers shorten (`IP`, `ms`, `Loss`), the banner text gets smaller, the status bar switches to `UP 3  DOWN 0  off 0` |
 | then | **IP / Host** is dropped |
-| smallest | **ms** and **Alarm** are dropped — the tick box, **Name, Status and Loss %** always stay |
+| smallest | **ms** and **Sound** are dropped — the tick box, **Name, Status and Loss %** always stay |
 
 Toolbar items that no longer fit move into the `»` dropdown, and **ACKNOWLEDGE**
 and **Pause** are pinned so they are never the ones that disappear. **Bulk
@@ -459,7 +465,7 @@ Everything set once and forgotten lives in the **menu bar**:
 
 | Menu | Contains |
 |---|---|
-| **Hosts** | Add, **Add many hosts...**, Edit, tick all/none/invert, **Enable / Disable**, **Alarm ON / OFF**, **Acknowledge**, **Reset statistics**, **Copy to clipboard**, **Remove**, Exit |
+| **Hosts** | Add, **Add many hosts...**, Edit, tick all/none/invert, **Enable / Disable**, **Sound ON / OFF**, **Acknowledge**, **Reset statistics**, **Copy to clipboard**, **Remove**, Exit |
 | **View** | Text size (Small → TV), Always on top, Show event log, **Compact / Normal window size** |
 | **Monitoring** | Pause/Resume, Test alarm sound, **Alarm sound…**, **Monitoring settings…** (interval, timeout, fails→down, loss window) |
 | **Settings** | **Notifications…** (email / Telegram / SMS / offline command), **Export / Import hosts + settings**, Auto-update, Check for updates now |
