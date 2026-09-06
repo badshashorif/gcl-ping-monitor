@@ -3,3 +3,8 @@ config.json
 events.log
 *.log
 .version
+
+# ntfy server secrets - never commit
+ntfy-server/.env
+ntfy-server/monitor.token
+ntfy-server/monitor.token.raw
