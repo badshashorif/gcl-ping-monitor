@@ -185,13 +185,48 @@ Set-Default $n.Command 'PerHost'    $false
 Set-Default $n.Command 'TimeoutSec' 60
 Set-Default $n.Command 'Modem'      ''     # modem name as shown by Windows -> {modem}
 Set-Default $n.Command 'ModemPort'  ''     # its COM port                   -> {port}
+# ntfy - the phone channel. Email and Telegram deliver a NOTIFICATION; ntfy is
+# the only one that can deliver an ALARM: priority 5 ("urgent") makes the
+# Android app ring through Do Not Disturb and vibrate continuously until it is
+# swiped away. That is the whole reason it exists here, so the two priorities
+# are separate settings - a recovery must never be as loud as an outage.
+Set-Default $n 'Ntfy' ([pscustomobject]@{})
+Set-Default $n.Ntfy 'Enabled'      $false
+Set-Default $n.Ntfy 'Server'       'https://ntfy.sh'
+Set-Default $n.Ntfy 'Topic'        ''
+Set-Default $n.Ntfy 'TokenEnc'     ''      # optional; self-hosted with auth
+Set-Default $n.Ntfy 'UserEnc'      ''      # optional; basic auth alternative
+Set-Default $n.Ntfy 'DownPriority' 5       # urgent - bypasses Do Not Disturb
+Set-Default $n.Ntfy 'UpPriority'   3       # default - a normal notification
+Set-Default $n.Ntfy 'ClickUrl'     ''      # tapping the notification opens this
 }
 Initialize-NotifyDefaults
+
+# ---- web dashboard ----------------------------------------------------------
+# Serves the same view over HTTP so a browser or a phone on the LAN sees exactly
+# what the desk sees. Off by default: turning it on opens a port.
+function Initialize-WebDefaults {
+if ($null -eq $script:Config.Web) {
+    $script:Config | Add-Member -NotePropertyName Web -NotePropertyValue ([pscustomobject]@{}) -Force
+}
+$w = $script:Config.Web
+Set-Default $w 'Enabled'  $false
+Set-Default $w 'Port'     8080
+# 'any' needs a one-off URL reservation (the Settings dialog offers to make it);
+# 'local' is 127.0.0.1 only and always works without administrator.
+Set-Default $w 'Bind'     'any'
+Set-Default $w 'TokenEnc' ''
+Set-Default $w 'AllowAck' $true
+}
+Initialize-WebDefaults
 
 # ---------------------------------------------------------------------------
 #  Runtime state
 # ---------------------------------------------------------------------------
 $script:Hosts        = New-Object System.Collections.Generic.List[object]
+# declared here, not down in the web section, so the startup lines written long
+# before the server exists still reach the dashboard's log panel
+$script:WebLogRing   = New-Object System.Collections.ArrayList
 $script:CycleRunning = $false
 $script:Paused       = $false
 $script:LastCheck    = $null
@@ -288,6 +323,12 @@ function Write-Event {
     param([string]$Message)
     $line = ('{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
     try { Add-Content -Path $script:LogPath -Value $line -Encoding UTF8 } catch { }
+    # the last few lines are mirrored to the web dashboard. A ring, not the file:
+    # the page must not make the server read a 10 MB log once a second.
+    if ($null -ne $script:WebLogRing) {
+        [void]$script:WebLogRing.Add($line)
+        while ($script:WebLogRing.Count -gt 60) { $script:WebLogRing.RemoveAt(0) }
+    }
     if ($script:txtLog) {
         $script:txtLog.AppendText($line + [Environment]::NewLine)
         if ($script:txtLog.Lines.Count -gt 400) {
@@ -718,7 +759,7 @@ function Test-NotifyEnabled {
     # replaces the whole Notify object, and it may not have every channel yet
     $n = $script:Config.Notify
     if (-not $n) { return $false }
-    foreach ($ch in 'Email','Telegram','Sms','Command') {
+    foreach ($ch in 'Email','Telegram','Sms','Command','Ntfy') {
         if ($n.$ch -and $n.$ch.Enabled) { return $true }
     }
     $false
@@ -961,6 +1002,66 @@ $script:NotifySender = {
         }
     }
 
+    # ---- ntfy: the phone alarm ------------------------------------------------
+    # Everything that makes this ring rather than merely appear is a HEADER, and
+    # every one of them has to be ASCII. ntfy reads its headers as latin-1, so a
+    # Bengali or emoji character in Title comes out as mojibake on the phone -
+    # the body is UTF-8 and safe, the headers are not. Hence Title is built from
+    # the ASCII subject and the emoji live in the body only.
+    if ($Cfg.NtfyEnabled -and $Cfg.NtfyTopic) {
+        try {
+            $base = ([string]$Cfg.NtfyServer).TrimEnd('/')
+            if (-not $base) { $base = 'https://ntfy.sh' }
+            $uri  = '{0}/{1}' -f $base, ([string]$Cfg.NtfyTopic).Trim('/')
+
+            $isDown = ([string]$Subject).StartsWith('[CRITICAL]')
+            $pri    = if ($isDown) { [int]$Cfg.NtfyDownPri } else { [int]$Cfg.NtfyUpPri }
+            if ($pri -lt 1 -or $pri -gt 5) { $pri = if ($isDown) { 5 } else { 3 } }
+
+            # Tags are what the Android app turns into the icon and, for
+            # "rotating_light", what most users bind a custom alarm sound to.
+            $tags = if ($isDown) { 'rotating_light,warning' } else { 'white_check_mark' }
+
+            # Strip the "[CRITICAL] " / "[OK] " marker: priority already carries
+            # it and the phone only shows about 40 characters of the title.
+            $title = [regex]::Replace([string]$Subject, '^\[(CRITICAL|OK)\]\s*', '')
+            $title = [regex]::Replace($title, '[^\x20-\x7E]', '?')
+            if ($title.Length -gt 90) { $title = $title.Substring(0, 87) + '...' }
+
+            $hdr = @{
+                'Title'    = $title
+                'Priority' = [string]$pri
+                'Tags'     = $tags
+            }
+            if ($Cfg.NtfyClick) { $hdr['Click'] = [string]$Cfg.NtfyClick }
+            if ($Cfg.NtfyToken) {
+                $hdr['Authorization'] = 'Bearer ' + [string]$Cfg.NtfyToken
+            } elseif ($Cfg.NtfyUser) {
+                # ntfy basic auth wants "user:pass" base64'd, and the app stores
+                # the pair as one string so that is how it is kept here too
+                $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$Cfg.NtfyUser))
+                $hdr['Authorization'] = 'Basic ' + $b64
+            }
+
+            # POST the body as raw UTF-8 bytes. Handing Invoke-WebRequest a
+            # string lets it re-encode with the default code page, which is what
+            # turns the emoji in Format-NotifyBody into "?" on the phone.
+            $bytes = [Text.Encoding]::UTF8.GetBytes([string]$BodyLong)
+            $null = Invoke-WebRequest -Uri $uri -Method Post -Body $bytes -Headers $hdr `
+                        -ContentType 'text/plain; charset=utf-8' -UseBasicParsing -TimeoutSec 25
+            Log ('NOTIFY    : ntfy sent to {0} (priority {1})' -f $uri, $pri)
+        } catch {
+            $detail = $_.Exception.Message
+            try {
+                $rs = $_.Exception.Response.GetResponseStream()
+                $sr = New-Object System.IO.StreamReader($rs)
+                $txt = $sr.ReadToEnd()
+                if ($txt) { $detail = $detail + ' | ' + (($txt -replace '\s+', ' ').Trim()) }
+            } catch { }
+            Log ('NOTIFY err: ntfy - {0}' -f $detail)
+        }
+    }
+
     if ($Cfg.SmsEnabled) {
         foreach ($raw in ($Cfg.SmsNumbers -split '[;,]')) {
             $num = $raw.Trim()
@@ -1097,6 +1198,14 @@ function Send-Notification {
         CmdTimeout   = [int]$n.Command.TimeoutSec
         CmdModem     = [string]$n.Command.Modem
         CmdModemPort = [string]$n.Command.ModemPort
+        NtfyEnabled  = [bool]$n.Ntfy.Enabled
+        NtfyServer   = [string]$n.Ntfy.Server
+        NtfyTopic    = [string]$n.Ntfy.Topic
+        NtfyToken    = (Unprotect-Secret ([string]$n.Ntfy.TokenEnc))
+        NtfyUser     = (Unprotect-Secret ([string]$n.Ntfy.UserEnc))
+        NtfyDownPri  = [int]$n.Ntfy.DownPriority
+        NtfyUpPri    = [int]$n.Ntfy.UpPriority
+        NtfyClick    = [string]$n.Ntfy.ClickUrl
     }
     try {
         $ps = [PowerShell]::Create()
@@ -1110,6 +1219,48 @@ function Send-Notification {
         [void]$ps.BeginInvoke()
     } catch {
         Write-Event ("NOTIFY err: could not start sender - {0}" -f $_.Exception.Message)
+    }
+}
+
+# Fires one ntfy message and nothing else, from the values typed in the dialog
+# rather than from the saved config - so "test" tests what is on screen. Reuses
+# the real sender with every other channel switched off, because a test that
+# goes down a different code path proves nothing about the real one.
+function Send-NtfyTest {
+    param([string]$Server, [string]$Topic, [string]$Token, [int]$Priority = 5)
+    if (-not $Topic) {
+        Show-Info 'Type a topic first - that is the name your phone subscribes to.' 'ntfy test'
+        return
+    }
+    if (-not $Server) { $Server = 'https://ntfy.sh' }
+    $cfg = @{
+        EmailEnabled = $false; TgEnabled = $false; SmsEnabled = $false; CmdEnabled = $false
+        NtfyEnabled  = $true
+        NtfyServer   = $Server
+        NtfyTopic    = $Topic
+        NtfyToken    = $Token
+        NtfyUser     = ''
+        NtfyDownPri  = $Priority
+        NtfyUpPri    = $Priority
+        NtfyClick    = ''
+    }
+    $body = ('GCL Ping Monitor test from {0}' -f (Get-MonitorLabel)) + [Environment]::NewLine +
+            ('Sent {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) + [Environment]::NewLine +
+            'If this arrived silently, set a custom sound for the topic in the ntfy app.'
+    try {
+        $ps = [PowerShell]::Create()
+        [void]$ps.AddScript($script:NotifySender)
+        [void]$ps.AddArgument($script:LogPath)
+        [void]$ps.AddArgument(('[CRITICAL] Ping Monitor test - {0}' -f $script:MonitorName))
+        [void]$ps.AddArgument($body)
+        [void]$ps.AddArgument($body)
+        [void]$ps.AddArgument($cfg)
+        [void]$ps.AddArgument(@())
+        [void]$ps.BeginInvoke()
+        Write-Event ('NTFY      : test queued to {0}/{1} (priority {2})' -f $Server.TrimEnd('/'), $Topic, $Priority)
+        Show-Info ("Test sent to {0}/{1}`r`n`r`nWatch the log panel for 'NOTIFY : ntfy sent' or an error." -f $Server.TrimEnd('/'), $Topic) 'ntfy test'
+    } catch {
+        Write-Event ('NTFY  err : {0}' -f $_.Exception.Message)
     }
 }
 
@@ -1378,11 +1529,12 @@ $miMonSet  = New-Mnu '&Monitoring settings...'
 [void]$mMon.DropDownItems.AddRange(@($miPause, (New-Sep), $miTest, $miSound, (New-Sep), $miMonSet))
 
 $miNotify  = New-Mnu '&Notifications...'
+$miWeb     = New-Mnu '&Web dashboard  (browser / phone)...'
 $miExport  = New-Mnu '&Export hosts + settings...'
 $miImport  = New-Mnu '&Import hosts + settings...'
 $miAuto    = New-Mnu 'Auto-&update' -Checkable -Checked:([bool]$script:Config.AutoUpdate)
 $miUpdate  = New-Mnu '&Check for updates now'
-[void]$mSet.DropDownItems.AddRange(@($miNotify, (New-Sep), $miExport, $miImport, (New-Sep), $miAuto, $miUpdate))
+[void]$mSet.DropDownItems.AddRange(@($miNotify, $miWeb, (New-Sep), $miExport, $miImport, (New-Sep), $miAuto, $miUpdate))
 
 $miAbout   = New-Mnu '&About'
 $miFolder  = New-Mnu 'Open &data folder'
@@ -2538,7 +2690,7 @@ $miNotify.Add_Click({
     $n = $script:Config.Notify
     $s = $script:TextSize
     $dlg = New-Object System.Windows.Forms.Form
-    $dlg.Text = 'Notifications - email / Telegram / SMS / command'
+    $dlg.Text = 'Notifications - email / Telegram / phone / SMS / command'
     $dlg.StartPosition = 'CenterParent'
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
@@ -2640,6 +2792,52 @@ $miNotify.Add_Click({
     $tInfo.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]($script:rowY + $s))
     $pTg.Controls.Add($tInfo)
     $tabs.TabPages.Add($pTg)
+
+    # ---------- ntfy (phone alarm) ----------
+    # The only channel that can wake a locked phone with a real alarm. Priority
+    # 5 in the Android app bypasses Do Not Disturb and vibrates continuously.
+    $pNt = New-Object System.Windows.Forms.TabPage; $pNt.Text = 'Phone (ntfy)'; $pNt.BackColor = 'White'
+    $script:rowY = [int]($s * 1.2)
+    $nEn   = NChk $pNt 'Send phone alarms via ntfy' $n.Ntfy.Enabled
+    $nSrv  = NTxt $n.Ntfy.Server;   NRow $pNt 'Server' $nSrv 30
+    $nTop  = NTxt $n.Ntfy.Topic;    NRow $pNt 'Topic' $nTop 30
+    $nTok  = NTxt '' -Pass;         NRow $pNt 'Token (optional)' $nTok
+    if ($n.Ntfy.TokenEnc) { $nTok.Text = '********' }
+    $nDp = New-Object System.Windows.Forms.ComboBox; $nDp.DropDownStyle = 'DropDownList'
+    $nUp = New-Object System.Windows.Forms.ComboBox; $nUp.DropDownStyle = 'DropDownList'
+    $priText = @('1 - min (silent)','2 - low','3 - default','4 - high','5 - urgent (ignores Do Not Disturb)')
+    [void]$nDp.Items.AddRange($priText); [void]$nUp.Items.AddRange($priText)
+    $nDp.SelectedIndex = [Math]::Min([Math]::Max([int]$n.Ntfy.DownPriority, 1), 5) - 1
+    $nUp.SelectedIndex = [Math]::Min([Math]::Max([int]$n.Ntfy.UpPriority,   1), 5) - 1
+    NRow $pNt 'DOWN priority' $nDp 30
+    NRow $pNt 'RECOVER priority' $nUp 30
+
+    $nTest = New-Object System.Windows.Forms.Button
+    $nTest.Text = 'Send a test to my phone'
+    $nTest.AutoSize = $true
+    $nTest.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]$script:rowY)
+    $pNt.Controls.Add($nTest)
+    $script:rowY += [int]($s * 3.0)
+    # Tests what is TYPED IN THE BOX, not what is saved - otherwise the first
+    # test after typing a topic silently checks the previous one.
+    $nTest.Add_Click({
+        $tok = if ($nTok.Text -eq '********') { Unprotect-Secret ([string]$n.Ntfy.TokenEnc) } else { $nTok.Text.Trim() }
+        Send-NtfyTest -Server $nSrv.Text.Trim() -Topic $nTop.Text.Trim() -Token $tok `
+                      -Priority ($nDp.SelectedIndex + 1)
+    })
+
+    $nInfo = New-Object System.Windows.Forms.Label
+    $nInfo.Text = "This is the channel that makes your PHONE ring, not just buzz." + [Environment]::NewLine +
+                  "1. Install ""ntfy"" from the Play Store (or F-Droid / App Store)." + [Environment]::NewLine +
+                  "2. Subscribe to the SAME server + topic you type above." + [Environment]::NewLine +
+                  "3. In the app: the topic -> Settings -> set a loud custom sound." + [Environment]::NewLine +
+                  "Treat the topic name as a password - anyone who knows it can read" + [Environment]::NewLine +
+                  "your alerts on a public server. Use your own server for real use."
+    $nInfo.AutoSize = $true
+    $nInfo.ForeColor = [System.Drawing.Color]::FromArgb(90,94,100)
+    $nInfo.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]($script:rowY))
+    $pNt.Controls.Add($nInfo)
+    $tabs.TabPages.Add($pNt)
 
     # ---------- SMS ----------
     $pSms = New-Object System.Windows.Forms.TabPage; $pSms.Text = 'SMS'; $pSms.BackColor = 'White'
@@ -2784,6 +2982,13 @@ $miNotify.Add_Click({
         $n.Command.Modem = $mdm
         $mm = [regex]::Match($mdm, '(?i)\bCOM\d+\b')
         $n.Command.ModemPort = $(if ($mm.Success) { $mm.Value.ToUpper() } else { '' })
+
+        $n.Ntfy.Enabled = [bool]$nEn.Checked
+        $n.Ntfy.Server  = $nSrv.Text.Trim()
+        $n.Ntfy.Topic   = $nTop.Text.Trim().Trim('/')
+        if ($nTok.Text -ne '********') { $n.Ntfy.TokenEnc = Protect-Secret $nTok.Text.Trim() }
+        $n.Ntfy.DownPriority = $nDp.SelectedIndex + 1
+        $n.Ntfy.UpPriority   = $nUp.SelectedIndex + 1
     }
 
     $bTest.Add_Click({
@@ -2814,7 +3019,171 @@ $miNotify.Add_Click({
         if ($n.Telegram.Enabled) { $on += 'telegram' }
         if ($n.Sms.Enabled)      { $on += 'sms' }
         if ($n.Command.Enabled)  { $on += 'command' }
+        if ($n.Ntfy.Enabled)     { $on += 'ntfy' }
         Write-Event ('NOTIFY    : settings saved - channels: {0}' -f $(if ($on.Count) { $on -join ', ' } else { 'none' }))
+    }
+    $dlg.Dispose()
+})
+
+# ---- Web dashboard settings -------------------------------------------------
+$miWeb.Add_Click({
+    $w = $script:Config.Web
+    $s = $script:TextSize
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Web dashboard - see the monitor in a browser or on your phone'
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $dlg.Font = UiFont
+    $dlg.ClientSize = New-Object System.Drawing.Size([int]($s * 54), [int]($s * 40))
+
+    $y = [int]($s * 1.2)
+
+    $chkOn = New-Object System.Windows.Forms.CheckBox
+    $chkOn.Text = 'Serve the dashboard over HTTP'; $chkOn.AutoSize = $true
+    $chkOn.Checked = [bool]$w.Enabled
+    $chkOn.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]$y)
+    $dlg.Controls.Add($chkOn)
+    $y += [int]($s * 2.9)
+
+    $lblP = New-Object System.Windows.Forms.Label
+    $lblP.Text = 'Port'; $lblP.AutoSize = $true
+    $lblP.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]($y + $s*0.4))
+    $numP = New-Object System.Windows.Forms.NumericUpDown
+    $numP.Minimum = 1; $numP.Maximum = 65535
+    $numP.Value = [Math]::Min([Math]::Max([int]$w.Port, 1), 65535)
+    $numP.Width = [int]($s * 8)
+    $numP.Location = New-Object System.Drawing.Point([int]($s*13), [int]$y)
+    $dlg.Controls.AddRange(@($lblP, $numP))
+    $y += [int]($s * 2.9)
+
+    $lblB = New-Object System.Windows.Forms.Label
+    $lblB.Text = 'Reachable from'; $lblB.AutoSize = $true
+    $lblB.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]($y + $s*0.4))
+    $cboB = New-Object System.Windows.Forms.ComboBox
+    $cboB.DropDownStyle = 'DropDownList'
+    [void]$cboB.Items.AddRange(@(
+        'Any PC or phone on the network',
+        'This PC only  (localhost)'))
+    $cboB.SelectedIndex = $(if ([string]$w.Bind -eq 'local') { 1 } else { 0 })
+    $cboB.Width = [int]($s * 30)
+    $cboB.Location = New-Object System.Drawing.Point([int]($s*13), [int]$y)
+    $dlg.Controls.AddRange(@($lblB, $cboB))
+    $y += [int]($s * 2.9)
+
+    $chkAck = New-Object System.Windows.Forms.CheckBox
+    $chkAck.Text = 'Allow Acknowledge from the browser'; $chkAck.AutoSize = $true
+    $chkAck.Checked = [bool]$w.AllowAck
+    $chkAck.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]$y)
+    $dlg.Controls.Add($chkAck)
+    $y += [int]($s * 3.0)
+
+    # The URL, ready to be copied into a bookmark or sent to a phone. Selectable
+    # rather than a Label on purpose - the token is 20 characters nobody wants to
+    # retype off a screen.
+    $lblU = New-Object System.Windows.Forms.Label
+    $lblU.Text = 'Open this on the other device:'; $lblU.AutoSize = $true
+    $lblU.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]$y)
+    $dlg.Controls.Add($lblU)
+    $y += [int]($s * 1.9)
+
+    $txtU = New-Object System.Windows.Forms.TextBox
+    $txtU.Multiline = $true; $txtU.ReadOnly = $true; $txtU.ScrollBars = 'Vertical'
+    $txtU.Width = [int]($s * 50); $txtU.Height = [int]($s * 5.5)
+    $txtU.BackColor = [System.Drawing.Color]::FromArgb(246,247,249)
+    $refreshUrls = {
+        # show what the CURRENT boxes would produce, not what is saved
+        $port = [int]$numP.Value
+        $tok  = Get-WebToken
+        $u = @()
+        if ($cboB.SelectedIndex -eq 1) {
+            $u += ('http://localhost:{0}/?t={1}' -f $port, $tok)
+        } else {
+            if ($script:MonitorIp) { $u += ('http://{0}:{1}/?t={2}' -f $script:MonitorIp, $port, $tok) }
+            $u += ('http://{0}:{1}/?t={2}' -f $script:MonitorName.ToLower(), $port, $tok)
+        }
+        $txtU.Text = ($u -join [Environment]::NewLine)
+    }
+    & $refreshUrls
+    $numP.Add_ValueChanged($refreshUrls)
+    $cboB.Add_SelectedIndexChanged($refreshUrls)
+    $txtU.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]$y)
+    $dlg.Controls.Add($txtU)
+    $y += [int]($s * 6.4)
+
+    $btnCopy = New-Object System.Windows.Forms.Button
+    $btnCopy.Text = 'Copy link'; $btnCopy.AutoSize = $true
+    $btnCopy.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]$y)
+    $btnCopy.Add_Click({
+        try {
+            $first = @($txtU.Lines | Where-Object { $_ })[0]
+            [System.Windows.Forms.Clipboard]::SetText([string]$first)
+            Write-Event 'WEB       : dashboard link copied to the clipboard'
+        } catch { }
+    })
+    $btnOpen = New-Object System.Windows.Forms.Button
+    $btnOpen.Text = 'Open in browser'; $btnOpen.AutoSize = $true
+    $btnOpen.Location = New-Object System.Drawing.Point([int]($s*10), [int]$y)
+    $btnOpen.Add_Click({
+        $first = @($txtU.Lines | Where-Object { $_ })[0]
+        if ($first) { try { Start-Process $first } catch { } }
+    })
+    $btnAcl = New-Object System.Windows.Forms.Button
+    $btnAcl.Text = 'Allow access from other PCs...'; $btnAcl.AutoSize = $true
+    $btnAcl.Location = New-Object System.Drawing.Point([int]($s*24), [int]$y)
+    $btnAcl.Add_Click({
+        if (Add-WebUrlAcl) {
+            Show-Info "Permission granted for port $([int]$numP.Value).`r`n`r`nTurn the dashboard off and on again (or restart the tool) to bind to the network." 'Web dashboard'
+        } else {
+            Show-Info "Nothing was changed - the administrator prompt was refused or netsh failed.`r`n`r`nThe dashboard will still work on this PC (localhost)." 'Web dashboard'
+        }
+    })
+    $btnNew = New-Object System.Windows.Forms.Button
+    $btnNew.Text = 'New token'; $btnNew.AutoSize = $true
+    $btnNew.Location = New-Object System.Drawing.Point([int]($s*44), [int]$y)
+    $btnNew.Add_Click({
+        $ans = [System.Windows.Forms.MessageBox]::Show(
+            "Generate a new access token?`r`n`r`nEvery bookmark and every phone using the old link will stop working and has to be given the new one.",
+            'New token', 'YesNo', 'Warning', 'Button2')
+        if ($ans -eq 'Yes') { [void](Reset-WebToken); & $refreshUrls }
+    })
+    $dlg.Controls.AddRange(@($btnCopy, $btnOpen, $btnAcl, $btnNew))
+    $y += [int]($s * 3.2)
+
+    $info = New-Object System.Windows.Forms.Label
+    $info.Text =
+        "The page shows the same hosts, the same red banner and the same" + [Environment]::NewLine +
+        "Acknowledge button. On a phone: open the link, then browser menu ->" + [Environment]::NewLine +
+        """Add to Home screen"" to get an app icon." + [Environment]::NewLine + [Environment]::NewLine +
+        "The browser can only make a sound while the page is OPEN - tap the" + [Environment]::NewLine +
+        "Sound button once to allow it. For an alarm that wakes a locked phone," + [Environment]::NewLine +
+        "use Settings -> Notifications -> Phone (ntfy)." + [Environment]::NewLine + [Environment]::NewLine +
+        "Anyone with the link can read your monitoring. Keep it inside the" + [Environment]::NewLine +
+        "office network - do not forward this port to the internet."
+    $info.AutoSize = $true
+    $info.ForeColor = [System.Drawing.Color]::FromArgb(90,94,100)
+    $info.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]$y)
+    $dlg.Controls.Add($info)
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = '&Save'; $ok.DialogResult = 'OK'; $ok.AutoSize = $true
+    $ok.Location = New-Object System.Drawing.Point([int]($s*38), [int]($s*36.5))
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'; $cancel.DialogResult = 'Cancel'; $cancel.AutoSize = $true
+    $cancel.Location = New-Object System.Drawing.Point([int]($s*45), [int]($s*36.5))
+    $dlg.Controls.AddRange(@($ok, $cancel))
+    $dlg.AcceptButton = $ok; $dlg.CancelButton = $cancel
+
+    if ($dlg.ShowDialog($form) -eq 'OK') {
+        $w.Enabled  = [bool]$chkOn.Checked
+        $w.Port     = [int]$numP.Value
+        $w.Bind     = $(if ($cboB.SelectedIndex -eq 1) { 'local' } else { 'any' })
+        $w.AllowAck = [bool]$chkAck.Checked
+        Save-Config
+        # restart rather than reconfigure: the port and the binding are fixed at
+        # Start() and there is no way to change them on a live HttpListener
+        Stop-WebServer
+        if ($w.Enabled) { Start-WebServer } else { Write-Event 'WEB       : dashboard turned off' }
     }
     $dlg.Dispose()
 })
@@ -3371,6 +3740,15 @@ function Import-Settings {
             if ($null -ne $cfg.$p) { $script:Config.$p = $cfg.$p }
         }
         if ($cfg.Notify) { $script:Config.Notify = $cfg.Notify; Initialize-NotifyDefaults }
+        # The web port travels, the access token deliberately does not: it is
+        # DPAPI-sealed to the machine that wrote it, so importing one would leave
+        # the dashboard with a token nobody here can read. A fresh one is made
+        # the first time the server starts.
+        if ($cfg.Web) {
+            $script:Config.Web = $cfg.Web
+            Initialize-WebDefaults
+            $script:Config.Web.TokenEnc = ''
+        }
         $script:Hosts.Clear()
         foreach ($c in $incoming) {
             $en = Get-SavedFlag $c 'Enabled'
@@ -3522,6 +3900,715 @@ function Restart-Self {
 
 $btnRestartNow.Add_Click({ Restart-Self })
 
+
+# The page. One file, no CDN, no framework: it has to load on a phone sitting on
+# an isolated management VLAN with no route to the internet, which is exactly
+# when it is needed most.
+$script:WebPage = @'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>GCL Ping Monitor</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<style>
+:root{
+  --bg:#0f1115; --card:#171a21; --line:#252a34; --fg:#e6e9ef; --dim:#8b93a3;
+  --up:#22c55e; --down:#ef4444; --warn:#f59e0b; --off:#4b5563; --accent:#3b82f6;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--fg);
+  font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  -webkit-text-size-adjust:100%;
+}
+.wrap{max-width:1100px;margin:0 auto;padding:10px}
+
+/* the banner is the whole point - it has to be readable across a room */
+#banner{
+  border-radius:12px; padding:16px 18px; margin-bottom:10px;
+  font-weight:700; letter-spacing:.4px; text-align:center;
+  font-size:clamp(17px,4.6vw,30px); line-height:1.25;
+  background:var(--card); border:1px solid var(--line);
+  transition:background .15s;
+}
+#banner.ok{background:#10331d;border-color:#1c5c33;color:#7ef0a6}
+#banner.down{background:var(--down);border-color:#b91c1c;color:#fff}
+#banner.down.flash{background:#7f1d1d}
+#banner.lost{background:#3a2a08;border-color:#a16207;color:#fbbf24}
+#banner small{display:block;font-size:.52em;font-weight:500;opacity:.85;margin-top:4px;letter-spacing:0}
+
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+button{
+  font:inherit;font-weight:600;color:var(--fg);background:var(--card);
+  border:1px solid var(--line);border-radius:9px;padding:10px 14px;cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+}
+button:active{transform:translateY(1px)}
+button[disabled]{opacity:.4;cursor:default}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.danger{background:var(--down);border-color:var(--down);color:#fff}
+button.on{background:#14532d;border-color:#166534;color:#86efac}
+.spacer{flex:1}
+.pill{font-size:12px;color:var(--dim);white-space:nowrap}
+
+table{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden}
+th,td{padding:9px 10px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);font-weight:600}
+tr:last-child td{border-bottom:none}
+td.name{white-space:normal;font-weight:600;word-break:break-word}
+td.ip{color:var(--dim);font-family:ui-monospace,Consolas,monospace;font-size:13px}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+.badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:700}
+.s-UP{background:#0d3320;color:#4ade80}
+.s-DOWN{background:var(--down);color:#fff}
+.s-WARN{background:#3a2a08;color:#fbbf24}
+.s-OFF{background:#20242c;color:var(--off)}
+.s-INIT{background:#20242c;color:var(--dim)}
+tr.down td{background:#2a1212}
+tr.down.acked td{background:#2a2412}
+.mute{color:var(--dim);font-size:12px}
+
+/* On a phone the table becomes one card per host - a 9-column grid squeezed
+   into 380px is unreadable, and unreadable is the same as broken here. */
+@media (max-width:640px){
+  thead{display:none}
+  table,tbody,tr,td{display:block;width:100%}
+  table{background:none}
+  tr{background:var(--card);border:1px solid var(--line);border-radius:12px;margin-bottom:8px;padding:10px 12px}
+  td{border:none;padding:2px 0;white-space:normal}
+  td.num{text-align:left}
+  td[data-k]:before{content:attr(data-k) " ";color:var(--dim);font-size:12px}
+  /* a healthy host has no "down for" value, and a card listing an empty
+     labelled row for every field it does not have is mostly noise */
+  td:empty{display:none}
+  td.name{font-size:17px}
+  td.name:before{content:none}
+  tr.down td,tr.down.acked td{background:none}
+  tr.down{border-color:var(--down);background:#2a1212}
+  tr.down.acked{background:#2a2412;border-color:#a16207}
+}
+#log{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-top:10px;
+     font:12px/1.5 ui-monospace,Consolas,monospace;color:var(--dim);max-height:230px;overflow:auto;white-space:pre-wrap}
+footer{color:var(--dim);font-size:12px;margin:12px 2px 24px;display:flex;flex-wrap:wrap;gap:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="banner">connecting&hellip;</div>
+
+  <div class="bar">
+    <button id="ack" class="danger" hidden>ACKNOWLEDGE</button>
+    <button id="snd">&#128263; Sound off</button>
+    <button id="wake" title="Stop the phone screen turning off">&#9728; Keep awake</button>
+    <span class="spacer"></span>
+    <span class="pill" id="counts"></span>
+  </div>
+
+  <table id="tbl">
+    <thead><tr>
+      <th>Name</th><th>IP / Host</th><th>Status</th><th style="text-align:right">ms</th>
+      <th style="text-align:right">Loss</th><th>Since</th><th>Down for</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <div id="log"></div>
+  <footer>
+    <span id="fmon"></span><span id="fver"></span><span id="fchk"></span>
+  </footer>
+</div>
+
+<script>
+"use strict";
+var S = null, fails = 0, flash = false;
+
+/* ---- the access token ---------------------------------------------------
+   The server also sets a cookie, but the page must not DEPEND on one: an
+   installed home-screen app, a browser told to drop site data, or the page
+   opened inside a frame will not send it, and the symptom is a dashboard stuck
+   on "connecting" with no clue why. So the token is taken from the ?t= in the
+   link, kept locally, and sent as a header on every request thereafter.       */
+var tok = "";
+try {
+  var m = /[?&]t=([^&]+)/.exec(location.search);
+  if (m) { tok = decodeURIComponent(m[1]); localStorage.setItem("tok", tok); }
+  else { tok = localStorage.getItem("tok") || ""; }
+} catch (e) { if (m) { tok = decodeURIComponent(m[1]); } }
+
+function api(path, opts) {
+  opts = opts || {};
+  opts.cache = "no-store";
+  if (tok) { opts.headers = { "X-Token": tok }; }
+  return fetch(path, opts);
+}
+
+/* ---- alarm -------------------------------------------------------------
+   A browser will not make a noise until the user has interacted with the page,
+   so the sound button is not a preference, it is the unlock. The tone is
+   generated rather than fetched for the same reason the desktop tool generates
+   its .wav: no file to be missing, and nothing to load over a dead link.      */
+var ac = null, soundOn = false, beeping = false, stopAt = 0;
+try { soundOn = localStorage.getItem("snd") === "1"; } catch (e) {}
+
+function ensureAudio() {
+  if (!ac) {
+    var C = window.AudioContext || window.webkitAudioContext;
+    if (!C) return false;
+    ac = new C();
+  }
+  if (ac.state === "suspended") { ac.resume(); }
+  return true;
+}
+
+/* two-tone siren, one burst; called repeatedly while the alarm is up */
+function burst() {
+  if (!ac) return;
+  var t0 = ac.currentTime;
+  var g = ac.createGain();
+  g.connect(ac.destination);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(0.30, t0 + 0.02);
+  g.gain.setValueAtTime(0.30, t0 + 0.55);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.62);
+  var o = ac.createOscillator();
+  o.type = "square";
+  o.frequency.setValueAtTime(760, t0);
+  o.frequency.setValueAtTime(560, t0 + 0.3);
+  o.connect(g);
+  o.start(t0);
+  o.stop(t0 + 0.65);
+}
+
+function alarmTick() {
+  var want = soundOn && S && S.alarm && S.alarm.active && S.alarm.loud && !S.alarm.muted;
+  if (want && ac) burst();
+  if (want && navigator.vibrate) { try { navigator.vibrate([250, 120, 250]); } catch (e) {} }
+}
+setInterval(alarmTick, 1400);
+
+var bSnd = document.getElementById("snd");
+function paintSnd() {
+  /* Bell and muted-speaker emoji, written as \u escapes on purpose: the whole
+     .ps1 is kept pure ASCII because it ships without a BOM and Windows
+     PowerShell 5.1 reads such a file as ANSI - a literal emoji in the source
+     would reach the browser as mojibake. Same reason Format-NotifyBody builds
+     its emoji with ConvertFromUtf32 instead of typing them. */
+  bSnd.textContent = soundOn ? "\uD83D\uDD14 Sound on" : "\uD83D\uDD07 Sound off";
+  bSnd.className = soundOn ? "on" : "";
+}
+bSnd.onclick = function () {
+  soundOn = !soundOn;
+  try { localStorage.setItem("snd", soundOn ? "1" : "0"); } catch (e) {}
+  if (soundOn) { if (ensureAudio()) burst(); }
+  paintSnd();
+};
+paintSnd();
+
+/* ---- keep the screen on (phone on a desk showing the dashboard) ---- */
+var wl = null, wantWake = false, bWake = document.getElementById("wake");
+if (!("wakeLock" in navigator)) bWake.hidden = true;
+
+/* Android drops the lock whenever the tab is hidden and does NOT give it back,
+   so the wanted state and the held lock are tracked separately and re-acquired
+   on every return to the foreground. */
+function acquireWake() {
+  if (wl || !wantWake || !("wakeLock" in navigator)) return;
+  navigator.wakeLock.request("screen").then(function (s) {
+    wl = s;
+    s.addEventListener("release", function () { wl = null; });
+  }).catch(function () {});
+}
+bWake.onclick = function () {
+  wantWake = !wantWake;
+  bWake.className = wantWake ? "on" : "";
+  if (wantWake) { acquireWake(); }
+  else if (wl) { wl.release(); wl = null; }
+};
+document.addEventListener("visibilitychange", function () {
+  if (document.visibilityState === "visible") { acquireWake(); poll(); }
+});
+
+/* ---- acknowledge ---- */
+document.getElementById("ack").onclick = function () {
+  var b = this; b.disabled = true;
+  api("/api/ack", { method: "POST" })
+    .then(function () { setTimeout(poll, 250); })
+    .catch(function () {})
+    .then(function () { b.disabled = false; });
+};
+
+/* ---- render ---- */
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+  });
+}
+
+function render() {
+  var b = document.getElementById("banner");
+  var downs = S.hosts.filter(function (h) { return h.status === "DOWN"; });
+  var unacked = downs.filter(function (h) { return !h.acked; });
+
+  b.className = downs.length ? "down" : "ok";
+  if (downs.length) {
+    flash = !flash;
+    if (flash && unacked.length) b.className = "down flash";
+    var names = downs.slice(0, 4).map(function (h) { return h.label || h.target; }).join(", ");
+    if (downs.length > 4) names += " +" + (downs.length - 4) + " more";
+    b.innerHTML = esc(downs.length + (downs.length === 1 ? " HOST DOWN" : " HOSTS DOWN")) +
+                  "<small>" + esc(names) + "</small>";
+  } else {
+    b.innerHTML = "ALL OK<small>" + esc(S.counts.up + " up" +
+      (S.counts.off ? ", " + S.counts.off + " disabled" : "") +
+      (S.paused ? " - PAUSED" : "")) + "</small>";
+  }
+
+  var ack = document.getElementById("ack");
+  ack.hidden = !(S.canAck && unacked.length);
+
+  document.getElementById("counts").textContent =
+    "UP " + S.counts.up + "   DOWN " + S.counts.down + "   off " + S.counts.off;
+
+  var out = "";
+  for (var i = 0; i < S.hosts.length; i++) {
+    var h = S.hosts[i];
+    var cls = (h.status === "DOWN" ? "down" : "") + (h.acked ? " acked" : "");
+    out += '<tr class="' + cls + '">' +
+      '<td class="name">' + esc(h.label || h.target) +
+        (h.sound ? "" : ' <span class="mute" title="sound off for this host">&#128263;</span>') + "</td>" +
+      '<td class="ip" data-k="">' + esc(h.target) + "</td>" +
+      '<td data-k=""><span class="badge s-' + esc(h.status) + '">' + esc(h.status) +
+        (h.acked ? " ack" : "") + "</span></td>" +
+      '<td class="num" data-k="ms">' + (h.rtt == null ? "-" : h.rtt) + "</td>" +
+      '<td class="num" data-k="loss">' + h.loss + "%</td>" +
+      '<td data-k="since">' + esc(h.since) + "</td>" +
+      '<td data-k="down for">' + esc(h.downFor) + "</td></tr>";
+  }
+  document.getElementById("rows").innerHTML = out;
+
+  var lg = document.getElementById("log");
+  lg.textContent = (S.log || []).join("\n");
+
+  document.getElementById("fmon").textContent = S.monitor;
+  document.getElementById("fver").textContent = "v:" + S.version;
+  document.getElementById("fchk").textContent = S.checked ? "last check " + S.checked : "";
+  document.title = (downs.length ? "(" + downs.length + " DOWN) " : "") + "GCL Ping Monitor";
+}
+
+/* ---- poll --------------------------------------------------------------
+   A monitoring page that quietly stops updating is worse than one that is
+   plainly broken, so a failed poll is shown as loudly as an outage.          */
+function poll() {
+  api("/api/status")
+    .then(function (r) {
+      if (r.status === 401) { throw new Error("401"); }
+      if (!r.ok) throw new Error(r.status);
+      return r.json();
+    })
+    .then(function (j) {
+      fails = 0;
+      if (!j.ready) return;
+      S = j;
+      render();
+    })
+    .catch(function (e) {
+      fails++;
+      if (fails < 2) return;
+      var b = document.getElementById("banner");
+      b.className = "lost";
+      /* A rejected token and a dead PC look identical if both just say
+         "no connection" - and on a monitoring screen that is the difference
+         between "fix your link" and "go and look at the rack". */
+      if (String(e && e.message) === "401") {
+        b.innerHTML = "LINK NO LONGER VALID<small>the access token was changed - open the current link from Settings &rarr; Web dashboard</small>";
+        document.title = "(link expired) GCL Ping Monitor";
+      } else {
+        b.innerHTML = "NO CONNECTION TO THE MONITOR<small>the PC or the network may be down - this page is not updating</small>";
+        document.title = "(offline) GCL Ping Monitor";
+      }
+    });
+}
+poll();
+setInterval(poll, 2000);
+
+if ("serviceWorker" in navigator) {
+  try { navigator.serviceWorker.register("/sw.js"); } catch (e) {}
+}
+</script>
+</body>
+</html>
+'@
+# ---------------------------------------------------------------------------
+#  Web dashboard  (browser on the LAN, and a phone)
+# ---------------------------------------------------------------------------
+#  HttpListener blocks, and this is a single-threaded WinForms app, so the
+#  server lives in its own runspace. The two sides share exactly one object - a
+#  synchronized hashtable - and they only ever exchange STRINGS through it:
+#
+#      UI  -> web :  $script:Web.Status     a JSON snapshot, rebuilt each second
+#      web -> UI  :  $script:Web.Commands   'ack' / 'pause' / 'resume', drained
+#                                           by the UI timer on the UI thread
+#
+#  Nothing in the web runspace ever touches a host object or a control, which is
+#  the only reason this is safe. Keep it that way: the moment the handler starts
+#  reading $script:Hosts directly it is reading a List<T> from two threads.
+#
+#  The JSON shape is deliberately a small, versioned contract ("v": 1) rather
+#  than a dump of the internal state, because the plan is to move the polling
+#  engine off Windows later - when that happens this page must not have to change.
+# ---------------------------------------------------------------------------
+
+$script:Web = [hashtable]::Synchronized(@{
+    Running   = $false
+    Listener  = $null
+    PS        = $null
+    Runspace  = $null
+    Status    = '{"v":1,"ready":false}'
+    Commands  = (New-Object System.Collections.ArrayList)
+    Messages  = (New-Object System.Collections.ArrayList)   # log lines back from the runspace
+    Token     = ''
+    AllowAck  = $true
+    Prefix    = ''
+    Stop      = $false
+    Hits      = 0
+})
+$script:WebLastPush = [datetime]::MinValue
+
+function Get-WebPort {
+    $p = [int]$script:Config.Web.Port
+    if ($p -lt 1 -or $p -gt 65535) { $p = 8080 }
+    $p
+}
+
+# The token is what stops the rest of the office reading the dashboard. It is
+# generated once, DPAPI-sealed like every other secret, and shown in the
+# Settings dialog so it can be copied into a bookmark.
+function Get-WebToken {
+    $t = Unprotect-Secret ([string]$script:Config.Web.TokenEnc)
+    if ($t) { return $t }
+    # one random byte PER CHARACTER. An earlier version drew 16 bytes for 20
+    # characters and wrapped the index, which made the last four characters a
+    # literal repeat of the first four - visible in every token it produced.
+    $bytes = New-Object byte[] 20
+    ([System.Security.Cryptography.RNGCryptoServiceProvider]::Create()).GetBytes($bytes)
+    # base32-ish: no look-alike characters, because this gets typed on a phone
+    $abc = '23456789abcdefghjkmnpqrstuvwxyz'
+    $t = -join (0..19 | ForEach-Object { $abc[$bytes[$_] % $abc.Length] })
+    $script:Config.Web.TokenEnc = Protect-Secret $t
+    Save-Config
+    $t
+}
+
+function Reset-WebToken {
+    $script:Config.Web.TokenEnc = ''
+    $new = Get-WebToken
+    $script:Web.Token = $new
+    Write-Event 'WEB       : access token replaced - old bookmarks stop working'
+    $new
+}
+
+function Get-WebUrls {
+    $port = Get-WebPort
+    $tok  = Get-WebToken
+    $urls = @()
+    if ([string]$script:Config.Web.Bind -eq 'local') {
+        $urls += ('http://localhost:{0}/?t={1}' -f $port, $tok)
+    } else {
+        if ($script:MonitorIp) { $urls += ('http://{0}:{1}/?t={2}' -f $script:MonitorIp, $port, $tok) }
+        $urls += ('http://{0}:{1}/?t={2}' -f $script:MonitorName.ToLower(), $port, $tok)
+        $urls += ('http://localhost:{0}/?t={1}' -f $port, $tok)
+    }
+    $urls
+}
+
+# One JSON snapshot of everything the page shows. Built on the UI thread, handed
+# over as an immutable string - see the note at the top of this section.
+function Update-WebStatus {
+    if (-not $script:Web.Running) { return }
+    $now = Get-Date
+    if (($now - $script:WebLastPush).TotalMilliseconds -lt 900) { return }
+    $script:WebLastPush = $now
+
+    $rows = @()
+    foreach ($h in $script:Hosts) {
+        $rows += [pscustomobject]@{
+            label   = [string]$h.Label
+            target  = [string]$h.Target
+            status  = [string]$(if (-not $h.Enabled) { 'OFF' } else { $h.Status })
+            enabled = [bool]$h.Enabled
+            sound   = [bool]$h.AlarmEnabled
+            acked   = [bool]$h.Acked
+            rtt     = $(if ($null -ne $h.Latency) { [int]$h.Latency } else { $null })
+            loss    = [int](Get-LossPercent $h)
+            since   = $(if ($h.LastChange) { $h.LastChange.ToString('HH:mm:ss') } else { '' })
+            downFor = $(if ($h.Status -eq 'DOWN' -and $h.DownSince) { Format-Duration ($now - $h.DownSince) } else { '' })
+        }
+    }
+    $active = @($script:Hosts | Where-Object { $_.Enabled })
+    $obj = [pscustomobject]@{
+        v       = 1
+        ready   = $true
+        monitor = Get-MonitorLabel
+        version = [string]$script:Version
+        time    = $now.ToString('HH:mm:ss')
+        checked = $(if ($script:LastCheck) { $script:LastCheck.ToString('HH:mm:ss') } else { '' })
+        paused  = [bool]$script:Paused
+        canAck  = [bool]$script:Web.AllowAck
+        alarm   = [pscustomobject]@{
+            active = [bool]$script:AlarmActive
+            loud   = [bool]$script:AlarmLoud
+            muted  = [bool]$script:AlarmMuted
+        }
+        counts  = [pscustomobject]@{
+            total = $script:Hosts.Count
+            up    = @($active | Where-Object { $_.Status -eq 'UP' }).Count
+            down  = @($active | Where-Object { $_.Status -eq 'DOWN' }).Count
+            off   = $script:Hosts.Count - $active.Count
+        }
+        hosts   = $rows
+        log     = @($script:WebLogRing)
+    }
+    try {
+        # -Compress matters: this string is rebuilt every second and pretty JSON
+        # for 60 hosts is several times the size for no reader benefit
+        $script:Web.Status = ($obj | ConvertTo-Json -Depth 5 -Compress)
+    } catch { }
+}
+
+# Anything the browser asked for, applied on the UI thread where it is safe.
+function Invoke-WebCommands {
+    if ($script:Web.Messages.Count -gt 0) {
+        $msgs = @($script:Web.Messages.ToArray()); $script:Web.Messages.Clear()
+        foreach ($m in $msgs) { Write-Event $m }
+    }
+    if ($script:Web.Commands.Count -eq 0) { return }
+    $cmds = @($script:Web.Commands.ToArray()); $script:Web.Commands.Clear()
+    foreach ($c in $cmds) {
+        switch ([string]$c) {
+            'ack'    { Confirm-Alarm;                       Write-Event 'WEB       : acknowledged from a browser' }
+            'pause'  { if (-not $script:Paused) { Toggle-Pause; Write-Event 'WEB       : paused from a browser' } }
+            'resume' { if ($script:Paused)      { Toggle-Pause; Write-Event 'WEB       : resumed from a browser' } }
+        }
+    }
+}
+
+function Add-WebUrlAcl {
+    # Binding anything other than 127.0.0.1 needs a one-off HTTP.SYS reservation,
+    # which needs administrator. Rather than demanding the whole app run
+    # elevated - a monitoring tool that sits on a desk all day should not - this
+    # elevates a single netsh call and comes straight back.
+    $port = Get-WebPort
+    $me   = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
+    $cmd  = 'netsh http add urlacl url=http://+:{0}/ user="{1}" ; ' -f $port, $me
+    $cmd += 'netsh advfirewall firewall delete rule name="GCL Ping Monitor web" ; '
+    $cmd += 'netsh advfirewall firewall add rule name="GCL Ping Monitor web" dir=in action=allow protocol=TCP localport={0} profile=any' -f $port
+    try {
+        $p = Start-Process powershell -Verb RunAs -Wait -PassThru -WindowStyle Hidden `
+                -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command', $cmd
+        if ($p.ExitCode -eq 0) {
+            Write-Event ('WEB       : URL reservation + firewall rule created for port {0}' -f $port)
+            return $true
+        }
+        Write-Event ('WEB   err : netsh returned {0}' -f $p.ExitCode)
+    } catch {
+        # the user clicking "No" on the UAC prompt lands here - not an error
+        Write-Event ('WEB   err : could not elevate - {0}' -f $_.Exception.Message)
+    }
+    $false
+}
+
+function Stop-WebServer {
+    if (-not $script:Web.Running -and -not $script:Web.Listener) { return }
+    $script:Web.Stop = $true
+    # Close(), not Stop(): Stop() lets the blocked GetContext() sit there until
+    # the next request arrives, so the runspace would outlive the window.
+    try { if ($script:Web.Listener) { $script:Web.Listener.Close() } } catch { }
+    try { if ($script:Web.PS) { $script:Web.PS.Dispose() } } catch { }
+    try { if ($script:Web.Runspace) { $script:Web.Runspace.Close(); $script:Web.Runspace.Dispose() } } catch { }
+    $script:Web.Listener = $null; $script:Web.PS = $null; $script:Web.Runspace = $null
+    if ($script:Web.Running) { Write-Event 'WEB       : dashboard stopped' }
+    $script:Web.Running = $false
+}
+
+function Start-WebServer {
+    param([switch]$Quiet)
+    Stop-WebServer
+    $port = Get-WebPort
+    $script:Web.Stop     = $false
+    $script:Web.Token    = Get-WebToken
+    $script:Web.AllowAck = [bool]$script:Config.Web.AllowAck
+    $local = ([string]$script:Config.Web.Bind -eq 'local')
+
+    $listener = New-Object System.Net.HttpListener
+    $prefix = if ($local) { 'http://localhost:{0}/' -f $port } else { 'http://+:{0}/' -f $port }
+    $listener.Prefixes.Add($prefix)
+    try {
+        $listener.Start()
+    } catch [System.Net.HttpListenerException] {
+        $code = $_.Exception.ErrorCode
+        try { $listener.Close() } catch { }
+        if ($code -eq 5 -and -not $local) {
+            # ERROR_ACCESS_DENIED - no URL reservation. Fall back to loopback so
+            # the tool still works, and say exactly what to click to fix it.
+            Write-Event ('WEB   err : port {0} needs a one-off permission (Settings -> Web dashboard -> Allow access from other PCs). Listening on localhost only for now.' -f $port)
+            $script:Config.Web.Bind = 'local'
+            Start-WebServer -Quiet:$Quiet
+            return
+        }
+        if ($code -eq 32 -or $code -eq 183) {
+            Write-Event ('WEB   err : port {0} is already in use by another program - pick a different port.' -f $port)
+        } else {
+            Write-Event ('WEB   err : could not listen on {0} - {1}' -f $prefix, $_.Exception.Message)
+        }
+        $script:Web.Running = $false
+        return
+    } catch {
+        try { $listener.Close() } catch { }
+        Write-Event ('WEB   err : could not listen on {0} - {1}' -f $prefix, $_.Exception.Message)
+        $script:Web.Running = $false
+        return
+    }
+
+    $script:Web.Listener = $listener
+    $script:Web.Prefix   = $prefix
+    $script:Web.Running  = $true
+
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.ApartmentState = 'MTA'
+    $rs.ThreadOptions  = 'ReuseThread'
+    $rs.Open()
+    $rs.SessionStateProxy.SetVariable('Web',  $script:Web)
+    $rs.SessionStateProxy.SetVariable('Page', $script:WebPage)
+    $ps = [PowerShell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($script:WebWorker)
+    [void]$ps.BeginInvoke()
+    $script:Web.PS = $ps; $script:Web.Runspace = $rs
+
+    Update-WebStatus
+    if (-not $Quiet) {
+        Write-Event ('WEB       : dashboard on {0}  (token required)' -f (@(Get-WebUrls)[0]))
+    }
+}
+
+# The request loop. Runs in its own runspace with NOTHING from the main script
+# in scope except $Web and $Page - if it needs anything else, pass it in.
+$script:WebWorker = {
+    $listener = $Web.Listener
+    function Reply {
+        param($ctx, [int]$code, [string]$type, $body, $extraHeaders)
+        try {
+            $res = $ctx.Response
+            $res.StatusCode  = $code
+            $res.ContentType = $type
+            # every response is generated here and never cached: a stale
+            # dashboard is worse than no dashboard
+            $res.Headers['Cache-Control'] = 'no-store'
+            $res.Headers['X-Content-Type-Options'] = 'nosniff'
+            if ($extraHeaders) { foreach ($k in $extraHeaders.Keys) { $res.Headers[$k] = [string]$extraHeaders[$k] } }
+            $bytes = if ($body -is [byte[]]) { $body } else { [Text.Encoding]::UTF8.GetBytes([string]$body) }
+            $res.ContentLength64 = $bytes.Length
+            $res.OutputStream.Write($bytes, 0, $bytes.Length)
+            $res.OutputStream.Close()
+        } catch { }
+    }
+
+    while (-not $Web.Stop) {
+        $ctx = $null
+        try { $ctx = $listener.GetContext() }
+        catch { break }          # Close() from the UI thread lands here - that is the exit
+        if (-not $ctx) { continue }
+        try {
+            $req  = $ctx.Request
+            $path = $req.Url.AbsolutePath.TrimEnd('/')
+            if (-not $path) { $path = '/' }
+
+            # ---- authentication ----
+            # The token may arrive three ways: in the query string (the link he
+            # bookmarks), in a cookie (set from that link, so the URL can then be
+            # clean), or in a header (for anything scripted against the API).
+            $want = [string]$Web.Token
+            $got  = ''
+            try { if ($req.QueryString['t']) { $got = [string]$req.QueryString['t'] } } catch { }
+            if (-not $got) { try { $c = $req.Cookies['gclpm']; if ($c) { $got = [string]$c.Value } } catch { } }
+            if (-not $got) { try { $got = [string]$req.Headers['X-Token'] } catch { } }
+            $ok = ($want -eq '') -or ($got -eq $want)
+
+            if (-not $ok) {
+                Reply $ctx 401 'text/html; charset=utf-8' '<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><body style="font:16px system-ui;background:#111;color:#ddd;padding:2em"><h2>GCL Ping Monitor</h2><p>Access token required.</p><p style="color:#888">Open the link from Settings &rarr; Web dashboard.</p></body>'
+                continue
+            }
+
+            switch -Regex ($path) {
+                '^/api/status$' {
+                    Reply $ctx 200 'application/json; charset=utf-8' $Web.Status
+                    break
+                }
+                '^/api/(ack|pause|resume)$' {
+                    $what = $Matches[1]
+                    if ($what -eq 'ack' -and -not $Web.AllowAck) {
+                        Reply $ctx 403 'application/json' '{"ok":false,"error":"read-only"}'
+                        break
+                    }
+                    if ($req.HttpMethod -ne 'POST') {
+                        Reply $ctx 405 'application/json' '{"ok":false,"error":"POST only"}'
+                        break
+                    }
+                    [void]$Web.Commands.Add($what)
+                    Reply $ctx 200 'application/json' '{"ok":true}'
+                    break
+                }
+                '^/manifest\.webmanifest$' {
+                    # start_url carries the token so the installed icon opens
+                    # straight into the dashboard without a login step
+                    $tok = [string]$Web.Token
+                    $m = '{"name":"GCL Ping Monitor","short_name":"Ping Mon","start_url":"/?t=' + $tok +
+                         '","scope":"/","display":"standalone","background_color":"#0f1115","theme_color":"#0f1115",' +
+                         '"icons":[{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]}'
+                    Reply $ctx 200 'application/manifest+json; charset=utf-8' $m
+                    break
+                }
+                '^/icon\.svg$' {
+                    $svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192"><rect width="192" height="192" rx="34" fill="#0f1115"/><circle cx="96" cy="96" r="52" fill="none" stroke="#22c55e" stroke-width="12"/><circle cx="96" cy="96" r="20" fill="#22c55e"/></svg>'
+                    Reply $ctx 200 'image/svg+xml; charset=utf-8' $svg
+                    break
+                }
+                '^/sw\.js$' {
+                    # Deliberately a no-op service worker. It exists only so
+                    # Android offers "Install app"; caching a monitoring page
+                    # would be actively harmful.
+                    Reply $ctx 200 'application/javascript; charset=utf-8' "self.addEventListener('fetch',function(){});"
+                    break
+                }
+                '^/favicon\.ico$' { Reply $ctx 404 'text/plain' 'no'; break }
+                default {
+                    if ($path -ne '/') { Reply $ctx 404 'text/plain; charset=utf-8' 'Not found'; break }
+                    $extra = @{}
+                    # Move the token out of the URL into a cookie on first visit,
+                    # so a screenshot or a shoulder-surfer does not hand it over.
+                    try {
+                        if ($req.QueryString['t']) {
+                            $extra['Set-Cookie'] = 'gclpm={0}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly' -f $Web.Token
+                        }
+                    } catch { }
+                    $Web.Hits = [int]$Web.Hits + 1
+                    Reply $ctx 200 'text/html; charset=utf-8' $Page $extra
+                    break
+                }
+            }
+        } catch {
+            try { [void]$Web.Messages.Add('WEB   err : ' + $_.Exception.Message) } catch { }
+            try { $ctx.Response.Abort() } catch { }
+        }
+    }
+}
+
 # ---------------------------------------------------------------------------
 #  Timers
 # ---------------------------------------------------------------------------
@@ -3540,6 +4627,11 @@ $script:uiTimer.Add_Tick({
         Update-Alarm
         Refresh-Banner
         Refresh-Status
+        # the browser side rides on this tick: commands first (so an
+        # acknowledge made on a phone is applied before the snapshot is taken
+        # and the phone does not see its own click bounce back)
+        Invoke-WebCommands
+        Update-WebStatus
     } catch { Write-Event "ERR ui: $($_.Exception.Message)" }
 })
 
@@ -3628,6 +4720,7 @@ $form.Add_Shown({
     $script:AlarmTimer.Start()
     $script:notifyTimer.Start()
     if (-not $script:IsGitCheckout) { $script:updateTimer.Start() }
+    if ([bool]$script:Config.Web.Enabled) { Start-WebServer }
     Start-CheckCycle
 })
 
@@ -3635,6 +4728,7 @@ $form.Add_FormClosing({
     try {
         $script:checkTimer.Stop(); $script:uiTimer.Stop(); $script:AlarmTimer.Stop()
         $script:updateTimer.Stop(); $script:notifyTimer.Stop()
+        try { Stop-WebServer } catch { }
         try { Send-QueuedNotifications } catch { }
         Stop-Alarm
         Save-Config

@@ -3,6 +3,10 @@
 Windows desktop ping monitor for the support desk. No admin rights, no installer
 bundle, no dependencies beyond what Windows already ships.
 
+It also serves its own [web dashboard](#web-dashboard--browser-and-phone) so a
+browser or a phone on the network sees the same screen, and it can send a
+[real alarm to a phone](#phone-alarm-ntfy) that rings with the screen locked.
+
 ## Supported Windows versions
 
 Needs **Windows PowerShell 3.0+** and **.NET Framework 4.5+** — both already
@@ -128,6 +132,11 @@ Delete these two shortcuts and one folder:
 - Only **one copy** can run at a time. Launching it again just brings the
   existing window to the front (two copies would each have their own alarm, so
   acknowledging one would leave the other sounding).
+- **A browser or a phone can watch the same view** over the network, with the
+  same banner and a working Acknowledge button, and a phone can be given a real
+  alarm that rings with the screen locked. See
+  [Web dashboard](#web-dashboard--browser-and-phone) and
+  [Phone alarm (ntfy)](#phone-alarm-ntfy).
 - Every state change (DOWN / RECOVERED / ACK / ADD / EDIT / DISABLE / …) is
   written to the event log and shown in the dark panel at the bottom.
 
@@ -306,15 +315,126 @@ gives the smallest possible window. Two shortcuts:
 The window's size and position are remembered, so a small corner window stays
 small across restarts and updates.
 
-## Notifications (Email / Telegram / SMS / Command)
+## Web dashboard — browser and phone
 
-**Settings → Notifications...** opens the settings. All four channels are off by
+**Settings → Web dashboard (browser / phone)...** turns on a small built-in web
+server so the *same* view opens in a browser on any PC or phone on the office
+network. It is **off by default** — switching it on opens a port.
+
+The page shows the same hosts, the same red banner, the same log tail and the
+same **ACKNOWLEDGE** button. Acknowledging on a phone silences the alarm on the
+desk PC, and vice versa.
+
+| Setting | What it does |
+|---|---|
+| **Serve the dashboard over HTTP** | Master on / off |
+| **Port** | Default 8080 |
+| **Reachable from** | *Any PC or phone on the network*, or *This PC only (localhost)* |
+| **Allow Acknowledge from the browser** | Untick to make the page strictly read-only |
+| **Copy link** / **Open in browser** | The full link including the access token |
+| **Allow access from other PCs...** | One-off Windows permission — see below |
+| **New token** | Replaces the token; every old bookmark stops working |
+
+### Getting it onto a phone
+
+1. Turn it on, then **Copy link** — it looks like
+   `http://172.30.172.55:8080/?t=pbjc5fjy93f2dcjj3st5`
+2. Send that link to the phone (it has to be on the same network).
+3. Open it, then browser menu → **Add to Home screen**. You get an app icon that
+   opens straight into the dashboard.
+
+Tap **Sound** once to allow the alarm — browsers refuse to make any noise until
+the user has interacted with the page, so this is an unlock, not a preference.
+**Keep awake** stops the phone screen turning off, for a handset propped on the
+desk.
+
+> The browser can only make a sound **while the page is open**. For an alarm that
+> wakes a locked phone, use [Phone alarm (ntfy)](#phone-alarm-ntfy) instead — the
+> two are meant to be used together.
+
+### "Allow access from other PCs" and why it exists
+
+Windows lets a non-administrator program listen on `localhost` freely, but
+listening on the *network* needs a one-off reservation in HTTP.SYS. Rather than
+make the whole tool run as administrator, the button elevates a single command
+and comes straight back:
+
+```
+netsh http add urlacl url=http://+:8080/ user="DOMAIN\you"
+netsh advfirewall firewall add rule name="GCL Ping Monitor web" dir=in action=allow protocol=TCP localport=8080
+```
+
+If you skip it, the tool does **not** fail — it logs
+`WEB err : port 8080 needs a one-off permission ...`, falls back to localhost
+and keeps running. Turn the dashboard off and on again after granting it.
+
+### Security
+
+- The link contains a 20-character **access token**; without it every request is
+  refused with `401`. The token is stored DPAPI-encrypted like every other
+  secret, and the browser keeps it after the first visit so the URL can be clean.
+- The token is **not** included in an exported backup — DPAPI seals it to this
+  machine, so a fresh one is generated on the PC that imports it.
+- **Anyone with the link can read your monitoring.** Keep it inside the office
+  network. Do not port-forward it to the internet — there is no HTTPS and no
+  user accounts. If you need it from outside, put it behind a VPN.
+- Host names and IPs are HTML-escaped, so a host named `<script>` cannot do
+  anything.
+
+### If the page stops updating
+
+It says so, loudly, instead of quietly freezing:
+
+| Banner | Meaning |
+|---|---|
+| **NO CONNECTION TO THE MONITOR** | The PC or the network is unreachable — the page is showing stale data |
+| **LINK NO LONGER VALID** | The token was changed; get the current link from Settings |
+
+## Phone alarm (ntfy)
+
+Email and Telegram deliver a *notification*. **ntfy** is the only channel here
+that delivers an **alarm**: on Android it can ring through Do Not Disturb, vibrate
+continuously, and use a loud sound you choose — with the phone locked and the app
+closed.
+
+**Settings → Notifications... → Phone (ntfy)**
+
+| Field | Notes |
+|---|---|
+| **Server** | `https://ntfy.sh` (public) or your own, e.g. `https://ntfy.example.com` |
+| **Topic** | Any name — **treat it as a password**, anyone who knows it can read your alerts on a public server |
+| **Token** | Optional; needed for a self-hosted server with authentication |
+| **DOWN priority** | Default **5 — urgent**: ignores Do Not Disturb |
+| **RECOVER priority** | Default **3 — default**: a normal notification |
+
+**Send a test to my phone** posts immediately, using whatever is typed in the
+boxes rather than what was last saved.
+
+On the phone:
+
+1. Install **ntfy** from the Play Store, F-Droid or the App Store.
+2. Subscribe to the same server + topic.
+3. Open the topic → its settings → set a **custom sound**. This is the step that
+   turns a notification into an alarm — do not skip it.
+
+Two priorities, not one, on purpose: a recovery at 5 would wake you up at 3am to
+tell you everything is fine.
+
+> The alert body is UTF-8 and carries the status emoji. The *title* is forced to
+> plain ASCII because ntfy reads headers as latin-1 and would otherwise show
+> mojibake on the phone.
+
+
+## Notifications (Email / Telegram / phone / SMS / Command)
+
+**Settings → Notifications...** opens the settings. All five channels are off by
 default; turn on any combination.
 
 | Tab | What you need |
 |---|---|
 | **Email** | SMTP server, port, **Security**, username, password, From, To (comma separated) |
 | **Telegram** | Bot token from [@BotFather](https://t.me/BotFather) and a chat ID (get it from `https://api.telegram.org/bot<TOKEN>/getUpdates`; group ids start with `-100`) |
+| **Phone (ntfy)** | A server and a topic — see [Phone alarm (ntfy)](#phone-alarm-ntfy) |
 | **SMS** | Your gateway's HTTP URL plus the phone numbers |
 | **Command (offline)** | A local program to run — see [below](#command-offline--gsm-modem) |
 
@@ -468,7 +588,7 @@ Everything set once and forgotten lives in the **menu bar**:
 | **Hosts** | Add, **Add many hosts...**, Edit, tick all/none/invert, **Enable / Disable**, **Sound ON / OFF**, **Acknowledge**, **Reset statistics**, **Copy to clipboard**, **Remove**, Exit |
 | **View** | Text size (Small → TV), Always on top, Show event log, **Compact / Normal window size** |
 | **Monitoring** | Pause/Resume, Test alarm sound, **Alarm sound…**, **Monitoring settings…** (interval, timeout, fails→down, loss window) |
-| **Settings** | **Notifications…** (email / Telegram / SMS / offline command), **Export / Import hosts + settings**, Auto-update, Check for updates now |
+| **Settings** | **Notifications…** (email / Telegram / phone / SMS / offline command), **Web dashboard…**, **Export / Import hosts + settings**, Auto-update, Check for updates now |
 | **Help** | About, Open data folder, Open project page |
 
 **Right-click any row** for Edit / Disable-Enable / Remove / Acknowledge.
@@ -490,6 +610,11 @@ The importer also accepts a plain `config.json` copied from
 > the **same Windows user on the same machine**. Moving the file to another PC
 > carries the hosts and settings but not the secrets — re-enter those in
 > Notifications there. That is deliberate.
+>
+> The **web dashboard access token** is the same: the port and the on/off state
+> come across, the token does not. The importing PC generates its own, so get a
+> fresh link from **Settings → Web dashboard** there rather than reusing the old
+> bookmark.
 
 ## Files
 
