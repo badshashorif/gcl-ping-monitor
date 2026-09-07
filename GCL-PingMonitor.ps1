@@ -3968,6 +3968,14 @@ button[disabled]{opacity:.4;cursor:default}
 button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 button.danger{background:var(--down);border-color:var(--down);color:#fff}
 button.on{background:#14532d;border-color:#166534;color:#86efac}
+/* A browser will not make a noise until the page has been tapped once, so a
+   phone can sit there showing a red banner in total silence and look broken.
+   While that is the situation, the button stops being a quiet toggle and
+   starts demanding the tap. */
+button.needsound{background:var(--warn);border-color:var(--warn);color:#111;
+                 animation:beg 1s ease-in-out infinite}
+@keyframes beg{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.72;transform:scale(1.045)}}
+@media (prefers-reduced-motion:reduce){button.needsound{animation:none}}
 .spacer{flex:1}
 .pill{font-size:12px;color:var(--dim);white-space:nowrap}
 
@@ -4113,8 +4121,16 @@ function paintSnd() {
      PowerShell 5.1 reads such a file as ANSI - a literal emoji in the source
      would reach the browser as mojibake. Same reason Format-NotifyBody builds
      its emoji with ConvertFromUtf32 instead of typing them. */
-  bSnd.textContent = soundOn ? "\uD83D\uDD14 Sound on" : "\uD83D\uDD07 Sound off";
-  bSnd.className = soundOn ? "on" : "";
+  /* Three states, not two. The third is the one that matters: something is
+     down, and this page is silent only because nobody has tapped it yet. */
+  var begging = !soundOn && S && S.alarm && S.alarm.active && S.alarm.loud;
+  if (begging) {
+    bSnd.textContent = "\uD83D\uDD07 TAP FOR SOUND";
+    bSnd.className = "needsound";
+  } else {
+    bSnd.textContent = soundOn ? "\uD83D\uDD14 Sound on" : "\uD83D\uDD07 Sound off";
+    bSnd.className = soundOn ? "on" : "";
+  }
 }
 bSnd.onclick = function () {
   soundOn = !soundOn;
@@ -4185,6 +4201,10 @@ function render() {
 
   var ack = document.getElementById("ack");
   ack.hidden = !(S.canAck && unacked.length);
+
+  /* repainted every poll, not just on click: whether the button has to beg for
+     a tap depends on the alarm, which changes underneath it */
+  paintSnd();
 
   document.getElementById("counts").textContent =
     "UP " + S.counts.up + "   DOWN " + S.counts.down + "   off " + S.counts.off;
