@@ -18,6 +18,21 @@ cd "$(dirname "$0")"
 die() { echo "ERROR: $*" >&2; exit 1; }
 say() { echo "==> $*"; }
 
+# Bootstrap .env on a first run. The two account passwords are GENERATED here
+# rather than typed or pasted: nobody ever needs to know them (the phones use
+# the 'phone' account, the monitor uses a token), so a password that only this
+# file has ever seen is strictly better than one someone chose.
+if [ ! -f .env ]; then
+  [ -n "${NTFY_DOMAIN:-}" ] || die "no .env yet - run this with NTFY_DOMAIN=ntfy.example.net (and optionally NTFY_TOPIC=...)"
+  say "creating .env"
+  cp .env.example .env
+  chmod 600 .env
+  sed -i "s|^NTFY_DOMAIN=.*|NTFY_DOMAIN=${NTFY_DOMAIN}|" .env
+  [ -n "${NTFY_TOPIC:-}" ] && sed -i "s|^NTFY_TOPIC=.*|NTFY_TOPIC=${NTFY_TOPIC}|" .env
+  sed -i "s|^NTFY_MONITOR_PASS=.*|NTFY_MONITOR_PASS=$(openssl rand -base64 24)|" .env
+  sed -i "s|^NTFY_PHONE_PASS=.*|NTFY_PHONE_PASS=$(openssl rand -base64 24)|" .env
+fi
+
 [ -f .env ] || die "no .env - copy .env.example to .env and fill it in"
 # shellcheck disable=SC1091
 set -a; . ./.env; set +a
@@ -144,7 +159,14 @@ cat <<EOF
   then: docker compose up -d --force-recreate
 
   On each phone: install ntfy, Settings -> Manage users -> Add user
-      https://$NTFY_DOMAIN   user 'phone'
+      Server   https://$NTFY_DOMAIN
+      User     phone
+      Password $NTFY_PHONE_PASS
   then subscribe to '$NTFY_TOPIC' with "Use another server" ticked.
+
+  That password is read-only on the topic and is meant to be shared with the
+  team - it can see alerts and cannot send them. It is in .env (mode 600) if
+  you need it again. The 'monitor' password is not needed by anyone: the ping
+  monitor authenticates with the token instead, so it can be left unknown.
 
 EOF
