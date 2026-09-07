@@ -338,7 +338,7 @@ desk PC, and vice versa.
 ### Getting it onto a phone
 
 1. Turn it on, then **Copy link** — it looks like
-   `http://172.30.172.55:8080/?t=pbjc5fjy93f2dcjj3st5`
+   `http://192.168.1.50:8080/?t=xxxxxxxxxxxxxxxxxxxx`
 2. Send that link to the phone (it has to be on the same network).
 3. Open it, then browser menu → **Add to Home screen**. You get an app icon that
    opens straight into the dashboard.
@@ -584,7 +584,7 @@ Arguments:  /c C:\scripts\send-alert.bat {phone} "{message}"
 ```
 
 With **Run once per host** on, `{message}` becomes
-`ACCESS_RTR_6 [122.99.103.227] is now DOWN` — one SMS per host, the same shape
+`CORE_RTR [192.0.2.10] is now DOWN` — one SMS per host, the same shape
 as The Dude's `[Device.Name] is now [Service.Status]`. With it off, one run gets
 the whole batch (`[PC] DOWN: a, b | UP: c`).
 
