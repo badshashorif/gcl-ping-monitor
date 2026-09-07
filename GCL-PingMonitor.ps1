@@ -224,6 +224,32 @@ Set-Default $w 'AllowAck' $true
 }
 Initialize-WebDefaults
 
+# Viewer mode: let the Linux server do the pinging and the alerting, and use
+# this window as what it is actually good at - a loud screen on a desk.
+#
+# The point is that a monitor which only runs while somebody's PC is switched
+# on is not a monitor. With this on, the PC can be rebooted, moved or turned
+# off for the night and nothing stops being watched.
+#
+# The alarm still sounds HERE, because that is the part a server cannot do.
+function Initialize-RemoteDefaults {
+if ($null -eq $script:Config.Remote) {
+    $script:Config | Add-Member -NotePropertyName Remote -NotePropertyValue ([pscustomobject]@{}) -Force
+}
+$r = $script:Config.Remote
+Set-Default $r 'Enabled'  $false
+# e.g. https://ping.monitor.grameencybernet.net  - no trailing slash, no token
+Set-Default $r 'Url'      ''
+# DPAPI-encrypted like every other secret here, so config.json never holds it
+Set-Default $r 'TokenEnc' ''
+}
+Initialize-RemoteDefaults
+
+function Test-RemoteMode {
+    $r = $script:Config.Remote
+    [bool]($r -and $r.Enabled -and [string]$r.Url)
+}
+
 # ---------------------------------------------------------------------------
 #  Runtime state
 # ---------------------------------------------------------------------------
@@ -257,6 +283,10 @@ function New-HostState {
         Ping       = $null
         SyncError  = $null
         StyleKey   = ''          # cached row style so we only restyle on change
+        # In viewer mode the loss figure is the SERVER's, measured over its own
+        # window. Recomputing it here from a history this PC never collected
+        # would be a different number wearing the same label.
+        RemoteLoss = $null
         Hist       = (New-Object System.Collections.Generic.Queue[bool])  # rolling ping results
         Lost       = 0           # failures currently inside Hist
         TotSent    = 0           # lifetime counters, for the tooltip
@@ -286,6 +316,7 @@ function Add-PingSample {
 
 function Get-LossPercent {
     param($h)
+    if ($null -ne $h.RemoteLoss) { return [int]$h.RemoteLoss }
     if ($h.Hist.Count -eq 0) { return $null }
     [int][Math]::Round(($h.Lost * 100.0) / $h.Hist.Count)
 }
@@ -305,13 +336,18 @@ function Get-SavedFlag {
     [bool]$Entry.$Name
 }
 
-foreach ($c in @($script:Config.Hosts)) {
-    if ($c -and $c.Target) {
-        $en = Get-SavedFlag $c 'Enabled'
-        $h  = New-HostState -Label ([string]$c.Label) -Target ([string]$c.Target) -Enabled $en `
-                            -AlarmEnabled (Get-SavedFlag $c 'Alarm')
-        if (-not $en) { $h.Status = 'OFF' }
-        $script:Hosts.Add($h)
+# Not in viewer mode: there the server's list is the list, and loading these
+# first would show a screenful of hosts for a few seconds and then log every one
+# of them being taken away again.
+if (-not (Test-RemoteMode)) {
+    foreach ($c in @($script:Config.Hosts)) {
+        if ($c -and $c.Target) {
+            $en = Get-SavedFlag $c 'Enabled'
+            $h  = New-HostState -Label ([string]$c.Label) -Target ([string]$c.Target) -Enabled $en `
+                                -AlarmEnabled (Get-SavedFlag $c 'Alarm')
+            if (-not $en) { $h.Status = 'OFF' }
+            $script:Hosts.Add($h)
+        }
     }
 }
 
@@ -447,9 +483,15 @@ function Save-Config {
             }
             $script:Config.WinMax = ($form.WindowState -eq 'Maximized')
         }
-        $script:Config.Hosts = @($script:Hosts | ForEach-Object {
-            [pscustomobject]@{ Label = $_.Label; Target = $_.Target; Enabled = [bool]$_.Enabled; Alarm = [bool]$_.AlarmEnabled }
-        })
+        # In viewer mode the list on screen is the SERVER's, and it is not this
+        # PC's to keep. Writing it here would quietly replace the local list,
+        # and turning viewer mode off again would then come back to whatever the
+        # server happened to be watching - with the PC's own hosts gone for good.
+        if (-not (Test-RemoteMode)) {
+            $script:Config.Hosts = @($script:Hosts | ForEach-Object {
+                [pscustomobject]@{ Label = $_.Label; Target = $_.Target; Enabled = [bool]$_.Enabled; Alarm = [bool]$_.AlarmEnabled }
+            })
+        }
         $script:Config | ConvertTo-Json -Depth 5 | Set-Content -Path $script:ConfigPath -Encoding UTF8
     } catch { }
 }
@@ -458,6 +500,11 @@ function Save-Config {
 #  Ping cycle (fully async - all hosts fire concurrently, UI never blocks)
 # ---------------------------------------------------------------------------
 function Start-CheckCycle {
+    # In viewer mode this PC sends no ICMP at all - it asks the server what it
+    # found. Note there is no $script:Paused test on this path: pausing is the
+    # server's state now, and a viewer that stopped fetching could not see it
+    # being un-paused from somebody else's phone.
+    if (Test-RemoteMode) { Start-RemoteSync; return }
     if ($script:CycleRunning -or $script:Paused) { return }
     if ($script:Hosts.Count -eq 0) { return }
     $script:CycleRunning = $true
@@ -522,6 +569,7 @@ function Process-Result {
 }
 
 function Poll-Results {
+    if (Test-RemoteMode) { Poll-RemoteSync; return }
     if (-not $script:CycleRunning) { return }
     $pending = $false
     foreach ($h in $script:Hosts) {
@@ -552,6 +600,241 @@ function Poll-Results {
         $script:LastCheck    = Get-Date
     }
 }
+
+# ---------------------------------------------------------------------------
+#  Viewer mode - the engine is the Linux server, this window is the screen
+# ---------------------------------------------------------------------------
+#  Nothing here pings anything. The server does that, and it also sends the
+#  email / Telegram / ntfy alerts - which is why Add-Notification is switched
+#  off below. Two engines watching the same hosts through the same channels is
+#  two of every message for one outage.
+#
+#  The fetch is asynchronous for the same reason the pings are: a server that
+#  has stopped answering must not freeze the window. That is exactly the moment
+#  somebody is staring at it.
+
+$script:RemoteTask    = $null
+$script:RemoteClient  = $null
+$script:RemoteFails   = 0
+$script:RemoteError   = ''
+$script:RemoteMonitor = ''
+$script:RemoteLastOk  = $null
+
+# How many failed fetches before the screen stops claiming to know anything.
+# Two, not one: a single dropped request on a busy link is not an outage, and
+# blanking the board every time one packet is lost teaches people to ignore it.
+$script:RemoteFailLimit = 2
+
+function Get-RemoteBase {
+    ([string]$script:Config.Remote.Url).Trim().TrimEnd('/')
+}
+
+function Get-RemoteToken {
+    Unprotect-Secret ([string]$script:Config.Remote.TokenEnc)
+}
+
+function New-RemoteClient {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls } catch { }
+    $wc = New-Object System.Net.WebClient
+    $tok = Get-RemoteToken
+    # the header, never the query string: a token in a URL ends up in proxy
+    # logs and in anything that screenshots the address bar
+    if ($tok) { $wc.Headers.Add('X-Token', $tok) }
+    $wc.Headers.Add('Cache-Control', 'no-store')
+    $wc
+}
+
+# The server sends "1m 35s" / "1h 2m" / "2d 4h" - the same vocabulary
+# Format-Duration produces here. Turning it back into a start time keeps every
+# downstream caller (the grid, the tooltip, the notification text) unchanged.
+function ConvertFrom-DurationText {
+    param([string]$Text)
+    if (-not $Text) { return $null }
+    $total = 0.0
+    $found = $false
+    foreach ($m in [regex]::Matches($Text, '(\d+(?:\.\d+)?)\s*([dhms])')) {
+        $n = [double]$m.Groups[1].Value
+        switch ($m.Groups[2].Value) {
+            'd' { $total += $n * 86400 }
+            'h' { $total += $n * 3600 }
+            'm' { $total += $n * 60 }
+            's' { $total += $n }
+        }
+        $found = $true
+    }
+    if (-not $found) { return $null }
+    $total
+}
+
+# "17:29:10" -> a DateTime today. Just after midnight the server's timestamp can
+# read as later than now, which would show a change "in the future"; assume it
+# was yesterday rather than print something impossible.
+function ConvertFrom-ClockText {
+    param([string]$Text)
+    if (-not $Text) { return $null }
+    try {
+        $t = [datetime]::ParseExact($Text, 'HH:mm:ss', $null)
+        $d = (Get-Date).Date.Add($t.TimeOfDay)
+        if ($d -gt (Get-Date).AddMinutes(1)) { $d = $d.AddDays(-1) }
+        $d
+    } catch { $null }
+}
+
+function Start-RemoteSync {
+    if ($script:RemoteTask) { return }        # one in flight is enough
+    $base = Get-RemoteBase
+    if (-not $base) { return }
+    try {
+        $script:RemoteClient = New-RemoteClient
+        $script:RemoteTask   = $script:RemoteClient.DownloadStringTaskAsync(($base + '/api/status'))
+    } catch {
+        $script:RemoteTask = $null
+        Set-RemoteFailure $_.Exception.Message
+    }
+}
+
+function Set-RemoteFailure {
+    param([string]$Message)
+    $script:RemoteFails++
+    $script:RemoteError = $Message
+    if ($script:RemoteFails -eq $script:RemoteFailLimit) {
+        Write-Event ('REMOTE err: {0} - {1}' -f (Get-RemoteBase), $Message)
+    }
+    if ($script:RemoteFails -ge $script:RemoteFailLimit) {
+        # Do NOT leave the last known good picture on screen looking current.
+        # A board that still says ALL OK when nothing is being received is
+        # worse than a board that says it has lost contact.
+        foreach ($h in $script:Hosts) {
+            if ($h.Status -ne 'INIT') { $h.Status = 'INIT'; $h.StyleKey = '' }
+            $h.Latency = $null
+        }
+    }
+}
+
+function Poll-RemoteSync {
+    if (-not $script:RemoteTask) { return }
+    if (-not $script:RemoteTask.IsCompleted) { return }
+
+    $json = $null
+    if ($script:RemoteTask.IsFaulted) {
+        $ex = $script:RemoteTask.Exception
+        $msg = if ($ex -and $ex.GetBaseException()) { $ex.GetBaseException().Message } else { 'request failed' }
+        Set-RemoteFailure $msg
+    } else {
+        try { $json = $script:RemoteTask.Result } catch { Set-RemoteFailure $_.Exception.Message }
+    }
+
+    $script:RemoteTask = $null
+    if ($script:RemoteClient) { try { $script:RemoteClient.Dispose() } catch { }; $script:RemoteClient = $null }
+
+    if ($null -eq $json) { $script:LastCheck = $script:RemoteLastOk; return }
+
+    try {
+        $snap = $json | ConvertFrom-Json
+    } catch {
+        Set-RemoteFailure 'the server sent something that is not JSON'
+        return
+    }
+    Apply-RemoteSnapshot $snap
+}
+
+function Apply-RemoteSnapshot {
+    param($Snap)
+    if ($null -eq $Snap -or $null -eq $Snap.hosts) {
+        Set-RemoteFailure 'the reply had no host list in it'
+        return
+    }
+    if ($script:RemoteFails -ge $script:RemoteFailLimit) {
+        Write-Event ('REMOTE    : back in contact with {0}' -f (Get-RemoteBase))
+    }
+    $script:RemoteFails  = 0
+    $script:RemoteError  = ''
+    $script:RemoteLastOk = Get-Date
+    $script:LastCheck    = $script:RemoteLastOk
+    $script:RemoteMonitor = [string]$Snap.monitor
+    $script:Paused        = [bool]$Snap.paused
+
+    $now  = Get-Date
+    $seen = New-Object System.Collections.Generic.HashSet[string]
+
+    foreach ($r in @($Snap.hosts)) {
+        $target = [string]$r.target
+        if (-not $target) { continue }
+        [void]$seen.Add($target.ToLowerInvariant())
+
+        $h = $script:Hosts | Where-Object { $_.Target -eq $target } | Select-Object -First 1
+        if ($null -eq $h) {
+            $h = New-HostState -Label ([string]$r.label) -Target $target
+            $script:Hosts.Add($h)
+            Write-Event ('REMOTE    : added {0} [{1}] from the server' -f $r.label, $target)
+        }
+
+        $prev = $h.Status
+        $h.Label        = [string]$r.label
+        $h.Enabled      = [bool]$r.enabled
+        $h.AlarmEnabled = [bool]$r.sound
+        $h.Acked        = [bool]$r.acked
+        $h.Latency      = if ($null -ne $r.rtt) { [int]$r.rtt } else { $null }
+        $h.RemoteLoss   = if ($null -ne $r.loss) { [int]$r.loss } else { $null }
+        # OFF is how the server reports a host it is not watching; this window
+        # has always shown that as Enabled = false plus a greyed row
+        $h.Status       = if ([string]$r.status -eq 'OFF') { 'INIT' } else { [string]$r.status }
+
+        $lc = ConvertFrom-ClockText ([string]$r.since)
+        if ($lc) { $h.LastChange = $lc }
+
+        if ($h.Status -eq 'DOWN') {
+            $secs = ConvertFrom-DurationText ([string]$r.downFor)
+            $h.DownSince = if ($null -ne $secs) { $now.AddSeconds(-$secs) } else { $h.DownSince }
+            if (-not $h.DownSince) { $h.DownSince = $now }
+        } else {
+            $h.DownSince = $null
+        }
+
+        # The noise is this window's whole job, so the transitions still have to
+        # be noticed here - they just come from the server's opinion rather than
+        # from a ping sent by this PC.
+        if ($prev -ne $h.Status) {
+            $h.StyleKey = ''
+            if ($h.Status -eq 'DOWN' -and $prev -ne 'DOWN') {
+                Write-Event ('DOWN      : {0} [{1}] - no reply' -f $h.Label, $h.Target)
+            }
+            elseif ($h.Status -eq 'UP' -and $prev -eq 'DOWN') {
+                Write-Event ('RECOVERED : {0} [{1}]' -f $h.Label, $h.Target)
+                if ($h.AlarmEnabled) { Play-UpSound }
+            }
+        }
+    }
+
+    # A host removed on the server has to disappear here too, or the desk goes
+    # on showing a device nobody is watching any more.
+    for ($i = $script:Hosts.Count - 1; $i -ge 0; $i--) {
+        $h = $script:Hosts[$i]
+        if (-not $seen.Contains($h.Target.ToLowerInvariant())) {
+            Write-Event ('REMOTE    : {0} [{1}] is no longer on the server' -f $h.Label, $h.Target)
+            $script:Hosts.RemoveAt($i)
+        }
+    }
+    Rebuild-Grid
+}
+
+function Send-RemoteCommand {
+    param([ValidateSet('ack','pause','resume')][string]$Command)
+    $base = Get-RemoteBase
+    if (-not $base) { return }
+    try {
+        $wc = New-RemoteClient
+        # fire and forget: the next status fetch is what confirms it, and
+        # waiting for a reply would freeze the window on the one click that is
+        # always made in a hurry
+        [void]$wc.UploadStringTaskAsync(($base + '/api/' + $Command), 'POST', '')
+        Write-Event ('REMOTE    : {0} sent to the server' -f $Command)
+    } catch {
+        Write-Event ('REMOTE err: {0} - {1}' -f $Command, $_.Exception.Message)
+    }
+}
+
+function Send-RemoteAck { Send-RemoteCommand 'ack' }
 
 # ---------------------------------------------------------------------------
 #  Alarm
@@ -771,6 +1054,11 @@ function Test-NotifyEnabled {
 
 function Add-Notification {
     param([ValidateSet('DOWN','UP')][string]$Kind, $Host_)
+    # In viewer mode the server has already sent this. Sending it again from
+    # here means two emails, two Telegram messages and two phone alarms for one
+    # outage - and the second one arrives just as somebody has silenced the
+    # first, which is how people learn to ignore alerts.
+    if (Test-RemoteMode) { return }
     $n = $script:Config.Notify
     if (-not (Test-NotifyEnabled)) { return }
     # NOTE: a host with the alarm off still sends its message. "Alarm off"
@@ -1340,6 +1628,11 @@ function Send-QueuedNotifications {
 $script:LastNotifySent = $null
 
 function Send-DownReminder {
+    # This one calls Send-Notification directly rather than going through
+    # Add-Notification, so it needs its own viewer-mode gate - the server is
+    # already repeating these, and two reminders about one outage are worse
+    # than none.
+    if (Test-RemoteMode) { return }
     $every = [int]$script:Config.Notify.RepeatMin
     if ($every -le 0) { return }
     if (-not (Test-NotifyEnabled)) { return }
@@ -1604,11 +1897,12 @@ $miMonSet  = New-Mnu '&Monitoring settings...'
 
 $miNotify  = New-Mnu '&Notifications...'
 $miWeb     = New-Mnu '&Web dashboard  (browser / phone)...'
+$miRemote  = New-Mnu '&Monitor server  (viewer mode)...'
 $miExport  = New-Mnu '&Export hosts + settings...'
 $miImport  = New-Mnu '&Import hosts + settings...'
 $miAuto    = New-Mnu 'Auto-&update' -Checkable -Checked:([bool]$script:Config.AutoUpdate)
 $miUpdate  = New-Mnu '&Check for updates now'
-[void]$mSet.DropDownItems.AddRange(@($miNotify, $miWeb, (New-Sep), $miExport, $miImport, (New-Sep), $miAuto, $miUpdate))
+[void]$mSet.DropDownItems.AddRange(@($miNotify, $miWeb, $miRemote, (New-Sep), $miExport, $miImport, (New-Sep), $miAuto, $miUpdate))
 
 $miAbout   = New-Mnu '&About'
 $miFolder  = New-Mnu 'Open &data folder'
@@ -2210,6 +2504,15 @@ function Refresh-Grid {
 }
 
 function Refresh-Banner {
+    # Losing contact with the server is not "all quiet". Whatever was on screen
+    # is now a photograph of the past, and a green ALL UP banner over stale data
+    # is the most dangerous thing this window can display.
+    if ((Test-RemoteMode) -and $script:RemoteFails -ge $script:RemoteFailLimit) {
+        $ago = if ($script:RemoteLastOk) { Format-Duration ((Get-Date) - $script:RemoteLastOk) } else { 'ever' }
+        $lblBanner.Text = ('NO CONTACT WITH THE MONITOR SERVER   -   last reply {0} ago' -f $ago)
+        $lblBanner.BackColor = [System.Drawing.Color]::FromArgb(184, 118, 0)
+        return
+    }
     $active  = @($script:Hosts | Where-Object { $_.Enabled })
     $down    = @($active | Where-Object { $_.Status -eq 'DOWN' })
     # a muted host still turns the banner red - its switch controls the sound,
@@ -2272,7 +2575,11 @@ function Refresh-Status {
     $upd = if ($script:UpdatePending) { '  |  update ready - restart' }
            elseif ($script:LastUpdateCheck) { '  |  upd chk ' + $script:LastUpdateCheck.ToString('HH:mm') }
            else { '' }
-    $lblClock.Text = $(if ($script:LastCheck) { 'last check ' + $script:LastCheck.ToString('HH:mm:ss') } else { 'no check yet' }) + $upd
+    # Say whose numbers these are. Somebody looking at this screen has to be
+    # able to tell whether it is watching the network or watching a server that
+    # is watching the network - they fail in completely different ways.
+    $src = if (Test-RemoteMode) { '  |  viewer: ' + $(if ($script:RemoteMonitor) { $script:RemoteMonitor } else { Get-RemoteBase }) } else { '' }
+    $lblClock.Text = $(if ($script:LastCheck) { 'last check ' + $script:LastCheck.ToString('HH:mm:ss') } else { 'no check yet' }) + $src + $upd
 }
 
 # ---------------------------------------------------------------------------
@@ -2284,6 +2591,7 @@ function Refresh-Status {
 # were all pinned. It uses the same dialog as Edit instead; the fields are
 # bigger, properly labelled, and Enter / Esc work.
 function Add-Host {
+    if (Block-IfRemote "The host list") { return }
     $r = Show-HostDialog -Name '' -Target '' -Title 'Add host'
     if (-not $r) { return }
     $target = $r.Target
@@ -2354,6 +2662,7 @@ function Show-HostDialog {
 }
 
 function Edit-SelectedHost {
+    if (Block-IfRemote "The host list") { return }
     $sel = @($grid.SelectedRows | ForEach-Object { $_.Tag } | Where-Object { $_ })
     if ($sel.Count -ne 1) {
         [System.Windows.Forms.MessageBox]::Show('Select exactly one host to edit.', 'Edit host', 'OK', 'Information') | Out-Null
@@ -2412,6 +2721,19 @@ function Get-BulkHosts {
 function Show-Info {
     param([string]$Text, [string]$Title)
     [System.Windows.Forms.MessageBox]::Show($Text, $Title, 'OK', 'Information') | Out-Null
+}
+
+# In viewer mode the host list belongs to the server. Editing it here would
+# look like it worked and then vanish on the next fetch a few seconds later,
+# which is a worse answer than saying no.
+function Block-IfRemote {
+    param([string]$What = 'This')
+    if (-not (Test-RemoteMode)) { return $false }
+    Show-Info ("$What is decided by the monitor server while viewer mode is on." + [Environment]::NewLine + [Environment]::NewLine +
+               'Edit the host list in a browser at:' + [Environment]::NewLine +
+               ('    {0}/hosts' -f (Get-RemoteBase)) + [Environment]::NewLine + [Environment]::NewLine +
+               'Changes there appear here within a few seconds.') 'Viewer mode'
+    $true
 }
 
 function Show-NothingPicked {
@@ -2474,6 +2796,7 @@ function Write-BulkEvent {
 
 function Set-HostsEnabled {
     param([bool]$On)
+    if (Block-IfRemote "Which hosts are watched") { return }
     $sel = @(Get-BulkHosts)
     if ($sel.Count -eq 0) { Show-NothingPicked 'Enable / disable'; return }
     $changed = @($sel | Where-Object { [bool]$_.Enabled -ne $On })
@@ -2501,6 +2824,7 @@ function Toggle-SelectedHosts {
 # ---- Alarm on / off (per host) ----------------------------------------------
 function Set-HostsAlarm {
     param([bool]$On)
+    if (Block-IfRemote "The per-host sound switch") { return }
     $sel = @(Get-BulkHosts)
     if ($sel.Count -eq 0) { Show-NothingPicked 'Alarm on / off'; return }
     $changed = @($sel | Where-Object { [bool]$_.AlarmEnabled -ne $On })
@@ -2528,6 +2852,7 @@ function Toggle-HostsAlarm {
 # Clicking the box in the row itself - one host, no menu needed
 function Toggle-HostAlarmRow {
     param($h)
+    if (Block-IfRemote "The per-host sound switch") { return }
     if (-not $h) { return }
     $h.AlarmEnabled = -not $h.AlarmEnabled
     $h.StyleKey = ''
@@ -2541,6 +2866,7 @@ function Toggle-HostAlarmRow {
 }
 
 function Remove-SelectedHosts {
+    if (Block-IfRemote "The host list") { return }
     $sel = @(Get-BulkHosts)
     if ($sel.Count -eq 0) { Show-NothingPicked 'Remove hosts'; return }
     if ($sel.Count -eq 1) {
@@ -2574,10 +2900,18 @@ function Confirm-AlarmSelected {
     }
     foreach ($h in $down) { $h.Acked = $true; $h.StyleKey = '' }
     Write-BulkEvent 'ACK' $down ' - acknowledged'
+    # The server acknowledges everything at once - it has no per-host ack - so
+    # in viewer mode a partial acknowledgement cannot be expressed. Say so,
+    # rather than let the next fetch quietly undo the selection somebody made.
+    if (Test-RemoteMode) {
+        Write-Event 'ACK       : the server acknowledges all down hosts, not a selection'
+        Send-RemoteAck
+    }
     Update-Alarm; Refresh-Grid; Refresh-Banner
 }
 
 function Reset-SelectedStats {
+    if (Block-IfRemote "Ping statistics") { return }
     $sel = @(Get-BulkHosts)
     if ($sel.Count -eq 0) { Show-NothingPicked 'Reset statistics'; return }
     foreach ($h in $sel) { Reset-HostStats $h; $h.StyleKey = '' }
@@ -2638,6 +2972,7 @@ function Parse-HostLines {
 }
 
 function Show-BulkAddDialog {
+    if (Block-IfRemote "The host list") { return }
     $s = $script:TextSize
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = 'Add many hosts'
@@ -2715,11 +3050,19 @@ function Confirm-Alarm {
     if ($down.Count -eq 0) { return }
     foreach ($h in $down) { $h.Acked = $true; $h.StyleKey = '' }
     Write-Event ("ACK       : alarm acknowledged ({0} host(s) still down)" -f $down.Count)
+    # Acknowledging here has to reach the server, or the phones go on being
+    # reminded about something the desk has already picked up - and the next
+    # fetch would overwrite this window's own acknowledgement anyway.
+    if (Test-RemoteMode) { Send-RemoteAck }
     Update-Alarm; Refresh-Grid; Refresh-Banner
 }
 
 function Toggle-Pause {
     $script:Paused = -not $script:Paused
+    # Pausing is the server's state in viewer mode - the next fetch overwrites
+    # whatever is set here, so it has to be told, or the button appears to do
+    # nothing for four seconds and then springs back.
+    if (Test-RemoteMode) { Send-RemoteCommand $(if ($script:Paused) { 'pause' } else { 'resume' }) }
     $btnPause.Text = if ($script:Paused) { 'Resume' } else { 'Pause' }
     $miPause.Text  = if ($script:Paused) { '&Resume monitoring' } else { '&Pause monitoring' }
     Write-Event ('MONITOR   : {0}' -f $(if ($script:Paused) { 'paused' } else { 'resumed' }))
@@ -3112,6 +3455,152 @@ $miNotify.Add_Click({
         Write-Event ('NOTIFY    : settings saved - channels: {0}' -f $(if ($on.Count) { $on -join ', ' } else { 'none' }))
     }
     $dlg.Dispose()
+})
+
+# ---- Monitor server (viewer mode) -------------------------------------------
+#  Hand the pinging and the alerting to the Linux server, and keep this window
+#  for the thing a server in a rack cannot do: make a noise in the office.
+$miRemote.Add_Click({
+    $r = $script:Config.Remote
+    $s = $script:TextSize
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Monitor server - let a server do the watching'
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $dlg.Font = UiFont
+    $dlg.ClientSize = New-Object System.Drawing.Size([int]($s * 56), [int]($s * 33))
+
+    $y = [int]($s * 1.2)
+
+    $lblWhy = New-Object System.Windows.Forms.Label
+    $lblWhy.Text = ('A monitor that only runs while this PC is on is not a monitor.' + [Environment]::NewLine +
+                    'With this on, the server does the pinging and sends the alerts.' + [Environment]::NewLine +
+                    'This window becomes the screen and the alarm - which is the part' + [Environment]::NewLine +
+                    'a server in a rack cannot do.')
+    $lblWhy.AutoSize = $true
+    $lblWhy.ForeColor = [System.Drawing.Color]::FromArgb(90,90,90)
+    $lblWhy.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]$y)
+    $dlg.Controls.Add($lblWhy)
+    $y += [int]($s * 6.4)
+
+    $chkOn = New-Object System.Windows.Forms.CheckBox
+    $chkOn.Text = 'Viewer mode - show the server instead of pinging from here'
+    $chkOn.AutoSize = $true
+    $chkOn.Checked = [bool]$r.Enabled
+    $chkOn.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]$y)
+    $dlg.Controls.Add($chkOn)
+    $y += [int]($s * 3.0)
+
+    $lblU = New-Object System.Windows.Forms.Label
+    $lblU.Text = 'Server'; $lblU.AutoSize = $true
+    $lblU.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]($y + $s*0.4))
+    $txtU = New-Object System.Windows.Forms.TextBox
+    $txtU.Text = [string]$r.Url
+    $txtU.Width = [int]($s * 42)
+    $txtU.Location = New-Object System.Drawing.Point([int]($s*8), [int]$y)
+    $dlg.Controls.AddRange(@($lblU, $txtU))
+    $y += [int]($s * 2.9)
+
+    $lblT = New-Object System.Windows.Forms.Label
+    $lblT.Text = 'Token'; $lblT.AutoSize = $true
+    $lblT.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]($y + $s*0.4))
+    $txtT = New-Object System.Windows.Forms.TextBox
+    $txtT.UseSystemPasswordChar = $true
+    $txtT.Text = Get-RemoteToken
+    $txtT.Width = [int]($s * 42)
+    $txtT.Location = New-Object System.Drawing.Point([int]($s*8), [int]$y)
+    $dlg.Controls.AddRange(@($lblT, $txtT))
+    $y += [int]($s * 2.5)
+
+    $lblHint = New-Object System.Windows.Forms.Label
+    $lblHint.Text = 'The t=... value from the dashboard link. Stored encrypted, like every other secret here.'
+    $lblHint.AutoSize = $true
+    $lblHint.ForeColor = [System.Drawing.Color]::FromArgb(120,120,120)
+    $lblHint.Location = New-Object System.Drawing.Point([int]($s*8), [int]$y)
+    $dlg.Controls.Add($lblHint)
+    $y += [int]($s * 3.0)
+
+    $lblRes = New-Object System.Windows.Forms.Label
+    $lblRes.AutoSize = $true
+    $lblRes.MaximumSize = New-Object System.Drawing.Size([int]($s*52), 0)
+    $lblRes.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]$y)
+    $dlg.Controls.Add($lblRes)
+
+    $btnTest = New-Object System.Windows.Forms.Button
+    $btnTest.Text = 'Test'
+    $btnTest.Width = [int]($s * 7)
+    $btnTest.Location = New-Object System.Drawing.Point([int]($s*1.0), [int]($dlg.ClientSize.Height - $s*3.2))
+    # A synchronous call is right HERE and nowhere else: the person just pressed
+    # Test and is waiting for an answer, and the timeout is short.
+    $btnTest.Add_Click({
+        $lblRes.ForeColor = [System.Drawing.Color]::FromArgb(90,90,90)
+        $lblRes.Text = 'Asking...'
+        $dlg.Refresh()
+        $u = ([string]$txtU.Text).Trim().TrimEnd('/')
+        if (-not $u) { $lblRes.Text = 'Fill in the server address first.'; return }
+        try {
+            try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls } catch { }
+            $resp = Invoke-RestMethod -Uri ($u + '/api/status') -Headers @{ 'X-Token' = [string]$txtT.Text } -TimeoutSec 8
+            $n = @($resp.hosts).Count
+            $lblRes.ForeColor = [System.Drawing.Color]::FromArgb(20,120,50)
+            $lblRes.Text = ('OK - {0}, {1} host(s), {2} down' -f $resp.monitor, $n, $resp.counts.down)
+        } catch {
+            $lblRes.ForeColor = [System.Drawing.Color]::FromArgb(180,30,30)
+            $m = $_.Exception.Message
+            # 401 is by far the most common one and the message alone does not
+            # say which of the two fields is wrong
+            if ($m -match '401|Unauthorized') { $m = 'The server refused the token (401). Check the Token field.' }
+            $lblRes.Text = $m
+        }
+    })
+    $dlg.Controls.Add($btnTest)
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = 'Save'; $btnOk.DialogResult = 'OK'
+    $btnOk.Width = [int]($s * 7)
+    $btnOk.Location = New-Object System.Drawing.Point([int]($dlg.ClientSize.Width - $s*15.5), [int]($dlg.ClientSize.Height - $s*3.2))
+    $btnNo = New-Object System.Windows.Forms.Button
+    $btnNo.Text = 'Cancel'; $btnNo.DialogResult = 'Cancel'
+    $btnNo.Width = [int]($s * 7)
+    $btnNo.Location = New-Object System.Drawing.Point([int]($dlg.ClientSize.Width - $s*8), [int]($dlg.ClientSize.Height - $s*3.2))
+    $dlg.Controls.AddRange(@($btnOk, $btnNo))
+    $dlg.AcceptButton = $btnOk; $dlg.CancelButton = $btnNo
+
+    if ($dlg.ShowDialog($form) -ne 'OK') { $dlg.Dispose(); return }
+
+    $was = Test-RemoteMode
+    $r.Url      = ([string]$txtU.Text).Trim().TrimEnd('/')
+    $r.TokenEnc = Protect-Secret ([string]$txtT.Text)
+    $r.Enabled  = [bool]$chkOn.Checked
+    $dlg.Dispose()
+    Save-Config
+    $now = Test-RemoteMode
+
+    if ($was -ne $now) {
+        # a mode change means the host list on screen belongs to somebody else
+        # now, so start from the right source rather than blending the two
+        $script:RemoteFails = 0
+        $script:RemoteTask  = $null
+        $script:Hosts.Clear()
+        if (-not $now) {
+            foreach ($c in @($script:Config.Hosts)) {
+                if ($c -and $c.Target) {
+                    $en = Get-SavedFlag $c 'Enabled'
+                    $h  = New-HostState -Label ([string]$c.Label) -Target ([string]$c.Target) -Enabled $en `
+                                        -AlarmEnabled (Get-SavedFlag $c 'Alarm')
+                    if (-not $en) { $h.Status = 'OFF' }
+                    $script:Hosts.Add($h)
+                }
+            }
+            Write-Event 'REMOTE    : viewer mode off - pinging from this PC again'
+        } else {
+            Write-Event ('REMOTE    : viewer mode on - watching {0}' -f $r.Url)
+            Write-Event 'REMOTE    : this PC stops pinging and stops sending alerts; the server does both'
+        }
+        Rebuild-Grid; Update-Alarm; Refresh-Banner; Refresh-Status
+        Start-CheckCycle
+    }
 })
 
 # ---- Web dashboard settings -------------------------------------------------

@@ -1,0 +1,54 @@
+# The gate for the Windows tool.
+#
+# Until now the .ps1 had none: it is a single 5000-line file that builds a
+# WinForms UI on load, so nothing about it could be checked without a desktop.
+# These three checks do not need one.
+#
+# The ASCII check is the important one. The file ships WITHOUT a BOM, so
+# Windows PowerShell 5.1 reads it as ANSI - a literal emoji anywhere in it
+# reaches the browser and the phone as mojibake, and the self-updater then
+# distributes that to every installed copy.
+name: windows-ci
+
+on:
+  push:
+    paths:
+      - 'GCL-PingMonitor.ps1'
+      - 'install.ps1'
+      - 'tests/**'
+      - '.github/workflows/windows-ci.yml'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The script must be pure ASCII
+        shell: powershell
+        run: |
+          foreach ($f in 'GCL-PingMonitor.ps1', 'install.ps1') {
+            $bad = @([IO.File]::ReadAllBytes($f) | Where-Object { $_ -gt 127 })
+            "$f -> $($bad.Count) non-ASCII byte(s)"
+            if ($bad.Count -gt 0) { exit 1 }
+          }
+
+      - name: It must parse
+        shell: powershell
+        run: |
+          foreach ($f in 'GCL-PingMonitor.ps1', 'install.ps1') {
+            $err = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile(
+                      (Resolve-Path $f), [ref]$null, [ref]$err)
+            if ($err -and $err.Count) {
+              $err | ForEach-Object { "  line $($_.Extent.StartLineNumber): $($_.Message)" }
+              exit 1
+            }
+            "$f -> parses"
+          }
+
+      - name: Viewer mode tests
+        shell: powershell
+        run: .\tests\Test-ViewerMode.ps1
