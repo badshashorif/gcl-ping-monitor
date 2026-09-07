@@ -1,12 +1,18 @@
 # Self-hosted ntfy for the GCL Ping Monitor phone alarm.
 #
-# Two containers: ntfy itself, and Caddy in front of it for automatic
-# Let's Encrypt. ntfy can terminate TLS on its own, but Caddy is used here
-# because it is already the pattern on the other GCL boxes - one thing to know
-# rather than two.
+# ntfy only. It sits behind a Caddy that already exists on the host and joins
+# that stack's network from the outside - the same shape as the ping monitor's
+# own compose project, and for the same reason: nothing here can break the
+# services already running there, and `docker compose down` in this directory
+# cannot take them with it.
 #
-# ntfy is NOT published on the host: only Caddy is. Everything reaches ntfy
-# through the proxy, so there is no way to hit it in plaintext from outside.
+# Nothing is published on the host. Caddy is the only thing facing the world,
+# and it reaches this by container name. Run ./add-caddy-site.sh to add the
+# site block - it carries proxy settings that ntfy specifically needs.
+#
+# Why self-hosted at all: on the public ntfy.sh the topic name is the only
+# thing protecting the alerts, every outage message passes through a third
+# party, and so does the dashboard link - token included.
 
 services:
   ntfy:
@@ -17,30 +23,30 @@ services:
     # No "user:" here on purpose. Docker creates a named volume owned by root,
     # so pinning the container to uid 1000 would leave ntfy unable to write
     # cache.db or auth.db - and it fails at that quietly enough to look like a
-    # config problem. Nothing of ntfy's is published on the host anyway; it is
-    # only reachable through Caddy.
+    # config problem.
     environment:
       # Behind a proxy, so ntfy must NOT try to do its own TLS, and it has to
       # trust the forwarded client IP or every visitor looks like the proxy and
-      # the rate limiter treats them as one abusive client.
+      # the rate limiter treats them all as one abusive client.
       - NTFY_BASE_URL=https://${NTFY_DOMAIN}
       - NTFY_LISTEN_HTTP=:80
       - NTFY_BEHIND_PROXY=true
       - NTFY_CACHE_FILE=/var/cache/ntfy/cache.db
       - NTFY_CACHE_DURATION=48h
       - NTFY_AUTH_FILE=/var/lib/ntfy/auth.db
-      # deny-all: a topic name is then no longer the only thing protecting the
-      # alerts. Without this, anyone who guesses the topic can read every
+      # deny-all: the topic name is then no longer the only thing protecting
+      # the alerts. Without this, anyone who guesses the topic can read every
       # outage message and publish fake ones.
       - NTFY_AUTH_DEFAULT_ACCESS=deny-all
       - NTFY_ENABLE_SIGNUP=false
       - NTFY_ENABLE_LOGIN=true
       - NTFY_ATTACHMENT_CACHE_DIR=/var/cache/ntfy/attachments
       - NTFY_LOG_LEVEL=info
+      - TZ=${TZ:-Asia/Dhaka}
     volumes:
       - ntfy_cache:/var/cache/ntfy
       - ntfy_data:/var/lib/ntfy
-    networks: [ntfy_net]
+    networks: [proxy_net]
     healthcheck:
       # /v1/health is ntfy's own endpoint (server.go: apiHealthPath). Checking
       # for HTTP 200 rather than grepping the JSON body, so a change to the
@@ -50,32 +56,22 @@ services:
       timeout: 10s
       retries: 3
       start_period: 20s
-
-  caddy:
-    image: caddy:2.10-alpine
-    container_name: gcl-ntfy-caddy
-    restart: unless-stopped
-    depends_on: [ntfy]
-    ports:
-      # 80 stays open to the world on purpose: ACME HTTP-01 needs it, and Caddy
-      # redirects everything else to 443.
-      - "80:80"
-      - "443:443"
-    environment:
-      - NTFY_DOMAIN=${NTFY_DOMAIN}
-      - ACME_EMAIL=${ACME_EMAIL}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    networks: [ntfy_net]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
-  ntfy_net:
-    name: gcl_ntfy_net
+  proxy_net:
+    external: true
+    # The network the host's existing Caddy is on. VERIFY IT FIRST:
+    #   docker network ls
+    # On monitor.grameencybernet.net it is plain "monitor_net" - NOT
+    # "monitoring-stack_monitor_net", which is what Compose's usual project
+    # prefixing would lead you to expect. deploy.sh detects it.
+    name: ${NTFY_NET_NAME:-monitor_net}
 
 volumes:
   ntfy_cache:
   ntfy_data:
-  caddy_data:
-  caddy_config:

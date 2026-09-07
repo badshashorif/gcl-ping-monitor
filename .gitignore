@@ -6,5 +6,6 @@ events.log
 
 # ntfy server secrets - never commit
 ntfy-server/.env
+ntfy-server/*.bak-*
 ntfy-server/monitor.token
 ntfy-server/monitor.token.raw

@@ -16,14 +16,19 @@ and **Token** fields in the tool change.
 
 ## What it deploys
 
-`ntfy` behind `caddy` (automatic Let's Encrypt). ntfy is **not** published on the
-host — only Caddy is — so there is no plaintext way in from outside.
+`ntfy` alone, behind a Caddy that **already runs on the host** — the same shape
+as the ping monitor server: a separate compose project that joins that stack's
+network from the outside, so nothing here can break what is already running
+there, and `docker compose down` in this directory cannot take it with it.
+
+ntfy publishes no port. Caddy is the only thing facing the world, and it reaches
+ntfy by container name, so there is no plaintext way in from outside.
 
 Two accounts are created, least privilege:
 
 | Account | Access | Used by |
 |---|---|---|
-| `monitor` | **write-only** on the topic | the Windows tool, via a token |
+| `monitor` | **write-only** on the topic | the ping monitor, via a token |
 | `phone` | **read-only** on the topic | the handsets |
 
 Write-only for the sender is the point: if the desk PC is stolen, its token can
@@ -40,38 +45,68 @@ git clone https://github.com/badshashorif/gcl-ping-monitor.git
 cd gcl-ping-monitor/ntfy-server
 cp .env.example .env
 openssl rand -base64 24     # do this twice, for the two passwords
-vi .env                     # domain, email, topic, the two passwords
-./deploy.sh
+vi .env                     # domain, topic, the two passwords
+./deploy.sh                 # brings ntfy up and creates the accounts
+./add-caddy-site.sh         # publishes it through the host's Caddy
 ```
 
-**The DNS A record must exist and point at this server before you run it.**
+Both halves are needed. `deploy.sh` alone leaves ntfy running and unreachable.
+
+**The DNS record must exist and point at this server before you run it.**
 `deploy.sh` checks and refuses to start otherwise — a wrong record means
 Let's Encrypt failing in a loop, and enough failures rate-limits the domain for
 a week.
 
-Ports **80 and 443 must be reachable from the internet**. 80 is not optional:
-that is how ACME issues the certificate.
+Ports **80 and 443 must be reachable from the internet** — that is the host's
+existing Caddy, already listening. 80 is not optional: it is how ACME issues
+the certificate.
 
 ## Wiring it up
 
-**On the PC** — Settings → Notifications... → Phone (ntfy):
+**On the server** — in `server/.env` (secrets) and `server/config/config.yml`:
 
-| Field | Value |
-|---|---|
-| Server | `https://ntfy.yourdomain` |
-| Topic | whatever you put in `NTFY_TOPIC` |
-| Token | the contents of `ntfy-server/monitor.token` |
+```
+# server/.env
+GCLPM_NTFY_TOPIC=<NTFY_TOPIC>
+GCLPM_NTFY_TOKEN=<contents of ntfy-server/monitor.token>
+```
+```yaml
+# server/config/config.yml
+notify:
+  ntfy:
+    server: https://ntfy.yourdomain
+```
+```bash
+cd ../server && docker compose up -d --force-recreate
+```
 
-Then **Send a test to my phone**.
+`--force-recreate` is needed: Compose does not notice a changed `.env` on a
+plain `up -d`, and the container keeps the old environment.
+
+**On the Windows tool** (if it is still sending) — Settings → Notifications… →
+Phone (ntfy): the same Server, Topic and Token.
 
 **On the phone** — install ntfy, then:
 
 1. Settings → **Manage users** → add `https://ntfy.yourdomain`, user `phone`.
-2. Subscribe to the topic.
-3. Open the topic → its settings → set a **custom sound**.
+2. Subscribe to the topic, with **Use another server** ticked.
+3. Set the alarm sound — **in Android, not in the ntfy app**:
+   Settings → Apps → ntfy → Notifications → the **Max priority** channel →
+   Sound.
+4. Battery → **Unrestricted**, or the phone will sleep the app and the alert
+   arrives late.
 
 Step 3 is the one people skip, and it is the one that turns a notification into
-an alarm.
+an alarm. It is set per **priority channel**, not per topic — a DOWN alert is
+sent at priority 5, so it is the Max channel that has to make the noise. There
+is no per-topic sound setting to find, and looking for one is how an afternoon
+disappears.
+
+Leave **"Keep alerting" / insistent** switched **off**. ntfy has no way to
+cancel a notification it has already delivered, so an insistent alarm cannot be
+stopped by the host coming back. Repeating while something is still down is the
+server's job instead (`notify.repeat_min`), because the server is the only thing
+that knows when it recovers.
 
 ## Checking it
 
@@ -84,7 +119,7 @@ curl -s https://ntfy.yourdomain/v1/health # {"healthy":true}
 
 ## Notes worth keeping
 
-- **`flush_interval -1` and `read_timeout 0` in the Caddyfile are not
+- **`flush_interval -1` and `read_timeout 0` in the site block are not
   decoration.** ntfy's app holds a long streaming connection for instant
   delivery; a proxy that buffers or times it out silently downgrades the whole
   thing to polling, and the alarm arrives minutes late. That failure looks like

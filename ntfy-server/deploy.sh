@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Brings up ntfy and creates the two accounts the Ping Monitor needs.
 #
+#   ./deploy.sh            then     ./add-caddy-site.sh
+#
 # Idempotent: safe to run again after a change. It refuses to start rather than
-# start something broken - DNS that does not point here would mean Let's Encrypt
-# failing over and over and eventually rate-limiting the domain for a week.
+# start something broken - DNS that does not point here would mean Let's
+# Encrypt failing over and over and eventually rate-limiting the domain for a
+# week.
+#
+# This deploys ntfy ALONE, behind a Caddy that already runs on the host.
+# add-caddy-site.sh is the second half and carries the proxy settings ntfy
+# needs; running this without it leaves ntfy unreachable from outside.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -16,7 +23,6 @@ say() { echo "==> $*"; }
 set -a; . ./.env; set +a
 
 : "${NTFY_DOMAIN:?NTFY_DOMAIN is not set in .env}"
-: "${ACME_EMAIL:?ACME_EMAIL is not set in .env}"
 : "${NTFY_TOPIC:?NTFY_TOPIC is not set in .env}"
 
 case "$NTFY_DOMAIN" in
@@ -37,19 +43,26 @@ if command -v dig >/dev/null 2>&1; then
   resolved="$(dig +short @1.1.1.1 "$NTFY_DOMAIN" A | tail -1 || true)"
 fi
 if [ -z "$resolved" ]; then
-  die "$NTFY_DOMAIN does not resolve. Create the DNS A record first - Let's Encrypt will fail without it."
+  die "$NTFY_DOMAIN does not resolve. Create the DNS record first - Let's Encrypt will fail without it."
 fi
 say "  $NTFY_DOMAIN resolves to $resolved"
 
-for p in 80 443; do
-  if ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$p\$"; then
-    # our own Caddy re-running is fine, anything else is a conflict
-    if ! docker ps --format '{{.Names}}' | grep -qx gcl-ntfy-caddy; then
-      die "port $p is already in use by something else"
-    fi
-  fi
-done
-say "  ports 80 and 443 are free (or already ours)"
+# Which network is the host's Caddy on? Guessing wrong means ntfy starts, Caddy
+# cannot see it, and nothing anywhere says why.
+if [ -z "${NTFY_NET_NAME:-}" ]; then
+  mapfile -t NETS < <(docker network ls --format '{{.Name}}' | grep -i 'monitor' || true)
+  case "${#NETS[@]}" in
+    0) die "no docker network with 'monitor' in the name - set NTFY_NET_NAME in .env" ;;
+    1) NTFY_NET_NAME="${NETS[0]}" ;;
+    *) printf '  more than one candidate:\n'; printf '    %s\n' "${NETS[@]}"
+       read -rp "  which one? " NTFY_NET_NAME ;;
+  esac
+  grep -q '^NTFY_NET_NAME=' .env \
+    && sed -i "s|^NTFY_NET_NAME=.*|NTFY_NET_NAME=${NTFY_NET_NAME}|" .env \
+    || echo "NTFY_NET_NAME=${NTFY_NET_NAME}" >> .env
+fi
+docker network inspect "$NTFY_NET_NAME" >/dev/null || die "network '$NTFY_NET_NAME' does not exist"
+say "  using network $NTFY_NET_NAME"
 
 # ---- up --------------------------------------------------------------------
 say "pulling images"
@@ -69,9 +82,9 @@ say "  ntfy is healthy"
 
 # ---- accounts --------------------------------------------------------------
 # Two accounts on purpose, least privilege:
-#   monitor - write only. This is the one whose token sits in config.json on the
-#             desk PC. If that PC is lost, the token can publish alarms and can
-#             NOT read the outage history.
+#   monitor - write only. This is the account whose token the ping monitor
+#             holds. If that box is compromised the token can publish alarms
+#             and can NOT read the outage history.
 #   phone   - read only, for the handsets.
 nt() { docker exec gcl-ntfy ntfy "$@"; }
 
@@ -97,9 +110,9 @@ nt access monitor "$NTFY_TOPIC" write-only >/dev/null
 nt access phone   "$NTFY_TOPIC" read-only  >/dev/null
 nt access | sed 's/^/    /'
 
-# ---- token for the Windows tool -------------------------------------------
+# ---- token for the ping monitor -------------------------------------------
 # A token, not the password: it can be revoked on its own without changing an
-# account that the phones may also be using.
+# account the phones may also be using.
 if [ ! -s ./monitor.token ]; then
   say "creating an access token for the monitor account"
   # "ntfy token add <user>" with no --expires is the never-expiring form; there
@@ -115,13 +128,23 @@ if [ ! -s ./monitor.token ]; then
   rm -f ./monitor.token.raw
   chmod 600 ./monitor.token
 fi
-say "  token is in $(pwd)/monitor.token (mode 600) - paste it into the tool's Phone (ntfy) tab"
+say "  token is in $(pwd)/monitor.token (mode 600)"
 
 echo
-say "done"
-echo "    Server : https://$NTFY_DOMAIN"
-echo "    Topic  : $NTFY_TOPIC"
-echo "    Token  : $(pwd)/monitor.token"
-echo
-echo "  On the phone: install ntfy, Settings -> Manage users -> add"
-echo "  https://$NTFY_DOMAIN as user 'phone', then subscribe to '$NTFY_TOPIC'."
+say "ntfy is up, but NOT reachable from outside yet"
+cat <<EOF
+
+  Next        ./add-caddy-site.sh     publishes it through the host's Caddy
+
+  Then point the ping monitor at it, in server/.env:
+      GCLPM_NTFY_TOPIC=$NTFY_TOPIC
+      GCLPM_NTFY_TOKEN=\$(cat $(pwd)/monitor.token)
+  and in server/config/config.yml:
+      notify.ntfy.server: https://$NTFY_DOMAIN
+  then: docker compose up -d --force-recreate
+
+  On each phone: install ntfy, Settings -> Manage users -> Add user
+      https://$NTFY_DOMAIN   user 'phone'
+  then subscribe to '$NTFY_TOPIC' with "Use another server" ticked.
+
+EOF
