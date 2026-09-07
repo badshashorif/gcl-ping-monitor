@@ -79,7 +79,7 @@ docker compose up -d --force-recreate caddy
 
 say "Checking it answers"
 sleep 5
-code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "https://${SITE}/" || echo000)"
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "https://${SITE}/" || echo 000)"
 echo "  https://${SITE}/  ->  $code   (401 is correct: no token in that URL)"
 [ "$code" = "401" ] || [ "$code" = "200" ] || die "unexpected response - check: docker compose logs caddy"
 
