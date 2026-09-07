@@ -111,27 +111,22 @@ docker compose exec -T pingmon python -c \
   || die "the container cannot ping. Check that net.ipv4.ping_group_range is allowed on this host."
 
 TOKEN="$(grep '^GCLPM_WEB_TOKEN=' .env | cut -d= -f2-)"
-IP="$(hostname -I | awk '{print $1}')"
 
-say "Up."
+say "Up - but not reachable yet."
 cat <<EOF
 
-  Dashboard   http://${IP}:8080/?t=${TOKEN}     (only from inside this box's network
-              until you add the Caddy block below - no port is published)
-  Hosts       add them at  /hosts   - the link is at the bottom of the dashboard
+  No port is published, on purpose: nothing here faces the world directly. Right
+  now only other containers on ${NET} can reach it, so there is one more step
+  before you can open it in a browser at all.
+
+  Next        ./add-caddy-site.sh      publishes it through the stack's Caddy
+              then                     https://ping.monitor.grameencybernet.net/?t=${TOKEN}
+
+  Hosts       add them at  /hosts  - the link is at the bottom of the dashboard
+  Token       ${TOKEN}
+              This is the ONLY lock on the dashboard. Treat the link as the
+              password it is, and do not paste it anywhere public.
   Logs        docker compose logs -f
   Restart     docker compose restart
-
-  To put it behind HTTPS, add this to the monitoring stack's Caddyfile:
-
-    ping.monitor.grameencybernet.net {
-        reverse_proxy gcl-pingmon:8080
-    }
-
-  Then recreate Caddy - do NOT just reload it. The Caddyfile is bind-mounted as
-  a single file on this box, so an edited file never reaches the running
-  container and the reload silently does nothing:
-
-    cd /root/data/monitoring-stack && docker compose up -d --force-recreate caddy
 
 EOF
