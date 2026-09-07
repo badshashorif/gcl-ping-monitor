@@ -25,10 +25,10 @@ VERSION = "1.0.0"
 log = logging.getLogger("gclpm")
 
 
-async def ping_loop(mon: Monitor, cfg_ref: dict, notifier_ref: dict) -> None:
+async def ping_loop(mon: Monitor, cfg_ref: dict, parts: dict) -> None:
     while True:
         cfg = cfg_ref["cfg"]
-        notifier: Notifier = notifier_ref["n"]
+        notifier: Notifier = parts["n"]
         started = time.monotonic()
 
         if cfgmod.changed_on_disk(cfg):
@@ -42,12 +42,16 @@ async def ping_loop(mon: Monitor, cfg_ref: dict, notifier_ref: dict) -> None:
             else:
                 cfg_ref["cfg"] = cfg = new
                 notifier.cfg = new
+                # the web server holds its own reference, and the dashboard
+                # reads the monitor name and the read-only flag from it
+                if parts.get("s") is not None:
+                    parts["s"].cfg = new
                 for note in mon.sync(new.hosts, new.loss_window):
                     mon.note(f"CONFIG    : {note}")
                 mon.note("CONFIG    : reloaded config.yml")
 
         if not mon.paused:
-            pinger: Pinger = notifier_ref["p"]
+            pinger: Pinger = parts["p"]
             pinger.timeout = cfg.timeout
             targets = mon.active()
             results = await pinger.ping_all(targets)
@@ -71,10 +75,10 @@ async def ping_loop(mon: Monitor, cfg_ref: dict, notifier_ref: dict) -> None:
         await asyncio.sleep(max(0.5, cfg.interval - elapsed))
 
 
-async def notify_loop(mon: Monitor, cfg_ref: dict, notifier_ref: dict) -> None:
+async def notify_loop(mon: Monitor, cfg_ref: dict, parts: dict) -> None:
     while True:
         cfg = cfg_ref["cfg"]
-        notifier: Notifier = notifier_ref["n"]
+        notifier: Notifier = parts["n"]
         try:
             await notifier.flush()
             await notifier.reminder(mon.unacked_down())
@@ -114,11 +118,12 @@ async def amain(args) -> int:
     cfg_ref = {"cfg": cfg}
     notifier = Notifier(cfg, cfg.monitor_name, mon.note)
     pinger = Pinger(cfg.timeout, privileged=args.privileged)
-    notifier_ref = {"n": notifier, "p": pinger}
+    parts = {"n": notifier, "p": pinger}
 
     token = build_token(cfg)
     server = Server(mon, cfg, token, VERSION,
                     on_ack=lambda: setattr(notifier, "last_sent", None))
+    parts["s"] = server
     app = server.build()
 
     runner = aioweb.AppRunner(app, access_log=None)
@@ -135,8 +140,8 @@ async def amain(args) -> int:
         await notifier.send_test()
 
     tasks = [
-        asyncio.create_task(ping_loop(mon, cfg_ref, notifier_ref), name="ping"),
-        asyncio.create_task(notify_loop(mon, cfg_ref, notifier_ref), name="notify"),
+        asyncio.create_task(ping_loop(mon, cfg_ref, parts), name="ping"),
+        asyncio.create_task(notify_loop(mon, cfg_ref, parts), name="notify"),
     ]
 
     stop = asyncio.Event()

@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>Hosts - GCL Ping Monitor</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<style>
+:root{
+  --bg:#0f1115; --card:#171a21; --line:#252a34; --fg:#e6e9ef; --dim:#8b93a3;
+  --up:#22c55e; --down:#ef4444; --warn:#f59e0b; --off:#4b5563; --accent:#3b82f6;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--fg);
+  font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  -webkit-text-size-adjust:100%;
+}
+.wrap{max-width:900px;margin:0 auto;padding:10px 10px 120px}
+h1{font-size:19px;margin:6px 2px 2px}
+p.lead{color:var(--dim);font-size:13px;margin:0 2px 12px}
+a{color:var(--accent)}
+
+button{
+  font:inherit;font-weight:600;color:var(--fg);background:var(--card);
+  border:1px solid var(--line);border-radius:9px;padding:10px 14px;cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+}
+button:active{transform:translateY(1px)}
+button[disabled]{opacity:.4;cursor:default}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.ghost{background:none}
+
+/* One card per host, on every screen size. A row of nine narrow inputs is
+   unusable on a phone, and this is a page somebody edits from a phone. */
+.host{
+  background:var(--card);border:1px solid var(--line);border-radius:12px;
+  padding:10px 12px;margin-bottom:8px;display:grid;gap:8px;
+  grid-template-columns:1fr 1fr auto;align-items:center;
+}
+.host.off{opacity:.55}
+.host .fields{display:contents}
+input[type=text]{
+  font:inherit;width:100%;color:var(--fg);background:#0f1218;
+  border:1px solid var(--line);border-radius:8px;padding:9px 10px;
+}
+input[type=text]:focus{outline:none;border-color:var(--accent)}
+input.ip{font-family:ui-monospace,Consolas,monospace;font-size:14px}
+input.bad{border-color:var(--down);background:#2a1212}
+.toggles{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.tg{
+  font-size:12px;font-weight:600;letter-spacing:.3px;padding:6px 11px;border-radius:99px;
+  border:1px solid var(--line);background:#0f1218;color:var(--dim);cursor:pointer;
+}
+.tg.on{background:#0d3320;border-color:#166534;color:#6ee7a0}
+.tg.snd.on{background:#3a2a08;border-color:#a16207;color:#fbbf24}
+.grow{flex:1}
+.del{border-color:#4a2020;color:#f88;background:none;padding:8px 12px}
+@media (max-width:640px){
+  .host{grid-template-columns:1fr}
+  .del{width:100%}
+}
+
+/* The save bar follows you down the page: on a phone the Save button is
+   otherwise below thirty host cards, and an unsaved edit is a lost edit. */
+#bar{
+  position:fixed;left:0;right:0;bottom:0;z-index:5;
+  background:#12151c;border-top:1px solid var(--line);
+  padding:10px calc(10px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));
+  display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+}
+#msg{font-size:13px;flex:1;min-width:140px}
+#msg.ok{color:#6ee7a0}
+#msg.err{color:#fca5a5}
+#msg.busy{color:var(--dim)}
+.dirty #save{background:var(--warn);border-color:var(--warn);color:#111}
+.note{color:var(--dim);font-size:12px;margin:14px 2px 0;line-height:1.6}
+.empty{color:var(--dim);text-align:center;padding:26px 10px;border:1px dashed var(--line);border-radius:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Hosts</h1>
+  <p class="lead">
+    Saved straight into config.yml. The monitor picks the change up within a few
+    seconds - it does not restart, and hosts that stay in the list keep their
+    history and their acknowledgements.
+    <a href="/">&larr; back to the dashboard</a>
+  </p>
+
+  <div id="list"></div>
+
+  <p class="note">
+    <b>Watching</b> off means the host is not pinged at all: greyed out, and it can
+    never raise an alarm. Use it for a device that is deliberately switched off.<br>
+    <b>Alarm</b> off means no <i>noise</i>. The host still goes red, still needs an
+    acknowledgement, and still sends its notifications.
+  </p>
+</div>
+
+<div id="bar">
+  <button id="add">+ Add host</button>
+  <span id="msg"></span>
+  <button id="reload" class="ghost">Discard</button>
+  <button id="save" class="primary">Save</button>
+</div>
+
+<script>
+"use strict";
+var tok = "";
+try { tok = localStorage.getItem("tok") || ""; } catch (e) {}
+var m = /[?&]t=([^&]+)/.exec(location.search);
+if (m) {
+  tok = decodeURIComponent(m[1]);
+  try { localStorage.setItem("tok", tok); } catch (e) {}
+  history.replaceState(null, "", location.pathname);
+}
+
+var rows = [];        // the working copy; the file is only touched on Save
+var dirty = false;
+var listEl = document.getElementById("list");
+var msgEl = document.getElementById("msg");
+var saveEl = document.getElementById("save");
+
+function api(path, opts) {
+  opts = opts || {};
+  opts.headers = opts.headers || {};
+  if (tok) { opts.headers["X-Token"] = tok; }
+  opts.cache = "no-store";
+  return fetch(path, opts).then(function (r) {
+    if (!r.ok) { return r.json().catch(function () { return {}; }).then(function (j) {
+      throw new Error(j.error || String(r.status));
+    }); }
+    return r.json();
+  });
+}
+
+function say(text, cls) {
+  msgEl.textContent = text || "";
+  msgEl.className = cls || "";
+}
+
+function markDirty() {
+  dirty = true;
+  document.body.classList.add("dirty");
+  say("unsaved changes", "busy");
+}
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function render() {
+  if (!rows.length) {
+    listEl.innerHTML = '<div class="empty">No hosts yet. Nothing is being monitored.</div>';
+    return;
+  }
+  var html = "";
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    html +=
+      '<div class="host' + (r.enabled ? "" : " off") + '" data-i="' + i + '">' +
+        '<input type="text" class="lbl" data-f="label" value="' + esc(r.label) + '" placeholder="Name" maxlength="60" autocomplete="off" spellcheck="false">' +
+        '<input type="text" class="ip" data-f="target" value="' + esc(r.target) + '" placeholder="IP or hostname" autocomplete="off" spellcheck="false" inputmode="url">' +
+        '<button class="del" data-act="del" title="Remove this host">Remove</button>' +
+        '<div class="toggles">' +
+          '<span class="tg' + (r.enabled ? " on" : "") + '" data-act="enabled">' +
+            (r.enabled ? "Watching" : "Not watched") + '</span>' +
+          '<span class="tg snd' + (r.sound ? " on" : "") + '" data-act="sound">' +
+            (r.sound ? "Alarm on" : "Alarm off") + '</span>' +
+          '<span class="grow"></span>' +
+        '</div>' +
+      '</div>';
+  }
+  listEl.innerHTML = html;
+}
+
+function indexOfEvent(e) {
+  var card = e.target.closest ? e.target.closest(".host") : null;
+  return card ? parseInt(card.getAttribute("data-i"), 10) : -1;
+}
+
+listEl.addEventListener("input", function (e) {
+  var f = e.target.getAttribute && e.target.getAttribute("data-f");
+  if (!f) { return; }
+  var i = indexOfEvent(e);
+  if (i < 0) { return; }
+  rows[i][f] = e.target.value;
+  e.target.classList.remove("bad");
+  markDirty();
+});
+
+listEl.addEventListener("click", function (e) {
+  var act = e.target.getAttribute && e.target.getAttribute("data-act");
+  if (!act) { return; }
+  var i = indexOfEvent(e);
+  if (i < 0) { return; }
+  if (act === "del") {
+    // deleting the wrong router by accident is a silent hole in the monitoring
+    if (!confirm("Remove " + (rows[i].label || rows[i].target) + " from monitoring?")) { return; }
+    rows.splice(i, 1);
+  } else {
+    rows[i][act] = !rows[i][act];
+  }
+  markDirty();
+  render();
+});
+
+document.getElementById("add").onclick = function () {
+  rows.push({ label: "", target: "", enabled: true, sound: true });
+  markDirty();
+  render();
+  var inputs = listEl.querySelectorAll(".lbl");
+  if (inputs.length) { inputs[inputs.length - 1].focus(); }
+};
+
+function load(quiet) {
+  say(quiet ? "" : "loading...", "busy");
+  return api("/api/hosts").then(function (j) {
+    rows = j.hosts || [];
+    dirty = false;
+    document.body.classList.remove("dirty");
+    render();
+    say("");
+  }).catch(function (err) {
+    if (String(err.message) === "401") {
+      say("Link no longer valid - open the dashboard again from ntfy or the shortcut.", "err");
+    } else {
+      say("Could not load: " + err.message, "err");
+    }
+  });
+}
+
+document.getElementById("reload").onclick = function () {
+  if (dirty && !confirm("Throw away your unsaved changes?")) { return; }
+  load();
+};
+
+saveEl.onclick = function () {
+  saveEl.disabled = true;
+  say("saving...", "busy");
+  api("/api/hosts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ hosts: rows })
+  }).then(function (j) {
+    rows = j.hosts || rows;
+    dirty = false;
+    document.body.classList.remove("dirty");
+    render();
+    say("Saved. " + (j.hosts ? j.hosts.length : 0) + " host(s) - the monitor is picking it up now.", "ok");
+  }).catch(function (err) {
+    // the server names the row and says what is wrong with it; mark it too
+    say(err.message, "err");
+    var mm = /row (\d+)/.exec(err.message);
+    if (mm) {
+      var card = listEl.querySelector('.host[data-i="' + (parseInt(mm[1], 10) - 1) + '"]');
+      if (card) {
+        card.querySelector(".ip").classList.add("bad");
+        card.scrollIntoView({ block: "center" });
+      }
+    }
+  }).then(function () {
+    saveEl.disabled = false;
+  });
+};
+
+window.addEventListener("beforeunload", function (e) {
+  if (dirty) { e.preventDefault(); e.returnValue = ""; }
+});
+
+load();
+</script>
+</body>
+</html>

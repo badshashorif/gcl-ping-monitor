@@ -3,3 +3,6 @@
 aiohttp==3.14.3
 icmplib==3.0.4
 PyYAML==6.0.2
+# Round-trips config.yml when the host list is edited from a browser, so saving
+# does not strip the comments that explain what every setting means.
+ruamel.yaml==0.18.10

@@ -3,10 +3,12 @@
 # No secrets in here on purpose: passwords and tokens come from .env.
 # This file is re-read while running - save it and the change applies on the
 # next cycle, without losing ping history or acknowledgements.
+#
+# Everything below is an example. Nothing here is a real address.
 
 # Shown on the dashboard and at the end of every alert, so you can tell which
 # box raised it. Blank = the container's hostname.
-monitor_name: GCL-MONITOR (203.191.33.29)
+monitor_name: MONITOR-01
 
 interval_seconds: 5      # how often every enabled host is pinged
 timeout_ms: 1500         # how long to wait for one reply
@@ -16,6 +18,7 @@ loss_window: 100         # how many recent pings the Loss % is measured over
 web:
   port: 8080
   allow_ack: true        # false makes the dashboard strictly read-only
+  allow_edit: true       # the /hosts editor. false = config.yml is the only way
 
 notify:
   on_down: true
@@ -26,12 +29,12 @@ notify:
 
   email:
     enabled: false
-    smtp_server: cpns3.citechco.net
+    smtp_server: mail.example.com
     port: 465
     security: auto       # auto | starttls | ssl | none   (465 = ssl, 587 = starttls)
     user: alerts@example.com
     sender: alerts@example.com
-    to: noc@grameencybernet.net
+    to: noc@example.com
 
   telegram:
     enabled: false
@@ -45,21 +48,24 @@ notify:
     up_priority: 3       # a recovery at 5 would wake you at 3am to say all is well
     click_url: ""        # tapping the phone notification opens this
 
+# The host list. Editable from a browser at /hosts - saving there rewrites this
+# block and leaves every comment in this file alone.
+#
 # label   what you call it
 # target  IP or hostname to ping
 # enabled false = not pinged at all, shown greyed out, can never alarm
 # sound   false = no NOISE at the desk. It still goes red, still needs an
 #         acknowledgement, and it still sends its notifications.
 hosts:
-  - label: GOOGLE.COM
+  - label: GATEWAY
+    target: 192.0.2.1
+  - label: CORE_SWITCH
+    target: 192.0.2.2
+  - label: UPS_INPUT_POWER
+    target: 192.0.2.10
+  - label: PUBLIC_CHECK
     target: google.com
     sound: false
-  - label: ACCESS_RTR_6
-    target: 122.99.103.227
-  - label: UPS_1_INPUT_POWER
-    target: 172.30.173.80
-  - label: UPS_2_INPUT_POWER
-    target: 172.30.173.90
-  - label: OLD_BILLING_VM
-    target: 172.30.30.9
+  - label: DECOMMISSIONED_VM
+    target: 192.0.2.99
     enabled: false

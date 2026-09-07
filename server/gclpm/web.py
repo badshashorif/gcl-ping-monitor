@@ -16,12 +16,23 @@ from pathlib import Path
 
 from aiohttp import web
 
+from . import editor
 from .state import Monitor, fmt_duration
 
 log = logging.getLogger("gclpm.web")
 
 STATIC = Path(__file__).parent / "static"
 CONTRACT_VERSION = 1
+
+# Where the link to the host editor is spliced into the dashboard.
+#
+# The dashboard page itself is byte-identical to the copy embedded in
+# GCL-PingMonitor.ps1 and a test enforces that, because the phone must see the
+# same UI whichever engine is answering. The editor is a server-only feature -
+# the Windows tool has its own host list in a WinForms dialog - so its link is
+# added here at serve time instead of being written into the shared page.
+EDIT_ANCHOR = '<span id="fmon"></span>'
+EDIT_LINK = '<a href="/hosts" style="color:#3b82f6">Edit hosts</a>'
 
 MANIFEST = (
     '{{"name":"GCL Ping Monitor","short_name":"Ping Mon","start_url":"/?t={token}",'
@@ -52,6 +63,16 @@ class Server:
         self.version = version
         self.on_ack = on_ack
         self.page = (STATIC / "dashboard.html").read_text(encoding="utf-8")
+        self.hosts_page = (STATIC / "hosts.html").read_text(encoding="utf-8")
+        if self.can_edit:
+            self.page = self.page.replace(EDIT_ANCHOR, EDIT_LINK + EDIT_ANCHOR, 1)
+
+    @property
+    def can_edit(self) -> bool:
+        """Editing needs somewhere to write. When the config was built in memory
+        - which is what the tests do - there is no file, so the editor is off
+        rather than pretending to save."""
+        return bool(self.cfg.web.get("allow_edit", True)) and self.cfg.path is not None
 
     # ---- auth ----------------------------------------------------------
     def _authorised(self, request: web.Request) -> bool:
@@ -152,6 +173,56 @@ class Server:
         self.mon.note("MONITOR   : resumed from a browser")
         return web.json_response({"ok": True})
 
+    # ---- the host editor -----------------------------------------------
+    def _edit_guard(self) -> web.Response | None:
+        if not self.can_edit:
+            return web.json_response(
+                {"ok": False, "error": "editing is disabled on this monitor"},
+                status=403)
+        return None
+
+    async def h_hosts_page(self, request: web.Request) -> web.StreamResponse:
+        if not self.can_edit:
+            raise web.HTTPNotFound()
+        resp = web.Response(text=self.hosts_page, content_type="text/html", charset="utf-8")
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        if request.query.get("t"):
+            resp.set_cookie("gclpm", self.token, max_age=31536000,
+                            httponly=True, samesite="Lax", path="/")
+        return resp
+
+    async def h_hosts_get(self, request: web.Request) -> web.StreamResponse:
+        denied = self._edit_guard()
+        if denied:
+            return denied
+        return web.json_response({"ok": True, "hosts": editor.read_hosts(self.cfg.path)})
+
+    async def h_hosts_post(self, request: web.Request) -> web.StreamResponse:
+        denied = self._edit_guard()
+        if denied:
+            return denied
+        try:
+            body = await request.json()
+        except Exception:                              # noqa: BLE001
+            return web.json_response({"ok": False, "error": "malformed request"}, status=400)
+
+        try:
+            hosts = editor.save_hosts(self.cfg.path, body.get("hosts"))
+        except editor.ValidationError as exc:
+            # 400, not 500: the person editing can fix this, and the page shows
+            # the message next to the row it names
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except Exception as exc:                       # noqa: BLE001
+            log.exception("saving the host list failed")
+            return web.json_response({"ok": False, "error": f"could not save: {exc}"},
+                                     status=500)
+
+        on, off = sum(1 for h in hosts if h["enabled"]), sum(1 for h in hosts if not h["enabled"])
+        self.mon.note(f"CONFIG    : host list saved from a browser - "
+                      f"{len(hosts)} host(s), {on} watched, {off} not")
+        return web.json_response({"ok": True, "hosts": hosts})
+
     async def h_manifest(self, request: web.Request) -> web.StreamResponse:
         return web.Response(text=MANIFEST.format(token=self.token),
                             content_type="application/manifest+json", charset="utf-8")
@@ -183,6 +254,9 @@ class Server:
             web.post("/api/ack", self._guard(self.h_ack)),
             web.post("/api/pause", self._guard(self.h_pause)),
             web.post("/api/resume", self._guard(self.h_resume)),
+            web.get("/hosts", self._guard(self.h_hosts_page)),
+            web.get("/api/hosts", self._guard(self.h_hosts_get)),
+            web.post("/api/hosts", self._guard(self.h_hosts_post)),
             web.get("/manifest.webmanifest", self._guard(self.h_manifest)),
             web.get("/icon.svg", self._guard(self.h_icon)),
             web.get("/sw.js", self._guard(self.h_sw)),

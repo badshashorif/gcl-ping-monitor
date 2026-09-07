@@ -36,6 +36,10 @@ DEFAULTS: dict[str, Any] = {
     "web": {
         "port": 8080,
         "allow_ack": True,
+        # The browser host editor. Off makes config.yml the only way to change
+        # what is monitored - which is what you want once the dashboard link has
+        # been handed to people who should only be looking at it.
+        "allow_edit": True,
     },
     "notify": {
         "on_down": True,
@@ -178,6 +182,13 @@ def load(path: str | os.PathLike[str]) -> Config:
         raise ValueError("config.yml must be a mapping at the top level")
 
     raw = _merge(DEFAULTS, parsed)
+
+    # On the public ntfy.sh the topic name IS the password - anyone who knows it
+    # can read every alert and send fake ones. So it may come from .env instead,
+    # which keeps it out of the file people copy, paste and screenshot.
+    topic = os.environ.get("GCLPM_NTFY_TOPIC", "")
+    if topic:
+        raw["notify"]["ntfy"]["topic"] = topic
 
     secrets = {name: os.environ.get(env, "") for name, env in SECRET_ENV.items()}
 

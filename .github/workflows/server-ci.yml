@@ -51,13 +51,36 @@ jobs:
           p = pathlib.Path('/tmp/config.yml')
           p.write_text(re.sub(r'(?ms)^hosts:.*$', 'hosts: []\n', p.read_text()))
           PY
-          timeout 25 python -m gclpm -c /tmp/config.yml &
+          timeout 90 python -m gclpm -c /tmp/config.yml &
           sleep 8
           code=$(curl -s -o /tmp/body -w '%{http_code}' -H 'X-Token: citest' http://127.0.0.1:8080/api/status)
           echo "status -> $code"; cat /tmp/body | head -c 400; echo
           test "$code" = "200"
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/status)" = "401"
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthz)" = "200"
+
+          # The host editor, against the real running app and a real file -
+          # the unit tests cover the writer, this covers the wiring.
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Token: citest' http://127.0.0.1:8080/hosts)" = "200"
+          curl -s -H 'X-Token: citest' http://127.0.0.1:8080/ | grep -q 'href="/hosts"'
+          code=$(curl -s -o /tmp/save -w '%{http_code}' -X POST -H 'X-Token: citest' \
+                   -H 'Content-Type: application/json' \
+                   -d '{"hosts":[{"label":"CI","target":"192.0.2.7"}]}' \
+                   http://127.0.0.1:8080/api/hosts)
+          echo "save -> $code"; cat /tmp/save; echo
+          test "$code" = "200"
+          grep -q '192.0.2.7' /tmp/config.yml
+          grep -q 'No secrets in here on purpose' /tmp/config.yml   # comments survived
+          test -f /tmp/config.yml.bak                               # previous version kept
+          # a bad row must be refused, and must not touch the file
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'X-Token: citest' \
+                   -H 'Content-Type: application/json' \
+                   -d '{"hosts":[{"target":"http://nope"}]}' \
+                   http://127.0.0.1:8080/api/hosts)" = "400"
+          grep -q '192.0.2.7' /tmp/config.yml
+          # and the running monitor must pick the new host up on its own
+          sleep 8
+          curl -s -H 'X-Token: citest' http://127.0.0.1:8080/api/status | grep -q '192.0.2.7'
 
   docker:
     runs-on: ubuntu-latest
@@ -68,7 +91,7 @@ jobs:
       - name: The compose file must be valid
         working-directory: server
         run: |
-          cp .env.example .env
+          mkdir -p config && cp .env.example .env
           docker compose config >/dev/null
       - name: It must ping for real, as a non-root user
         run: |

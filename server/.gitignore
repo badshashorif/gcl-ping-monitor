@@ -3,3 +3,6 @@ config.yml
 __pycache__/
 *.pyc
 .venv/
+config/
+*.bak
+*.tmp

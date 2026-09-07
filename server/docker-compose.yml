@@ -25,7 +25,17 @@ services:
       - GCLPM_CONFIG=/config/config.yml
       - TZ=${TZ:-Asia/Dhaka}
     volumes:
-      - ./config.yml:/config/config.yml:ro
+      # The DIRECTORY, not the file, and read-write.
+      #
+      # Saving the host list from a browser writes config.yml.tmp and renames it
+      # over config.yml, which is what makes the save atomic and survivable. A
+      # single-file bind mount follows the original inode, so after the first
+      # save the container would carry on reading the old, deleted file for ever
+      # and every edit would appear to do nothing at all. Exactly the trap the
+      # Caddyfile mount on this box already has.
+      #
+      # The directory must be writable by uid 10001 - deploy.sh chowns it.
+      - ./config:/config
     # Unprivileged ICMP. This is what lets the container ping as uid 10001 with
     # no root and no CAP_NET_RAW. Without it every host goes red at once and it
     # looks like a total outage rather than a permissions problem - the log says
