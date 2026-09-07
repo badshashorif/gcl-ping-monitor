@@ -1,0 +1,83 @@
+# The verification gate for the Linux server.
+#
+# It exists because the PC this is written on has neither Python nor Docker -
+# the same reason gcl-librenms-stack uses Actions as its gate. Anything that
+# cannot be checked here has not been checked.
+name: server-ci
+
+on:
+  push:
+    paths:
+      - 'server/**'
+      - 'GCL-PingMonitor.ps1'      # the dashboard-drift test reads this
+      - '.github/workflows/server-ci.yml'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12, not newer: icmplib 3.0.4 declares support only up to 3.12 and
+          # this container's whole job is to ping reliably
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements-dev.txt
+
+      - name: Byte-compile everything
+        run: python -m compileall -q gclpm
+
+      - name: Tests
+        run: python -m pytest -q --tb=short
+
+      - name: The example config must actually start the app
+        env:
+          GCLPM_WEB_TOKEN: citest
+        run: |
+          cp config.example.yml /tmp/config.yml
+          # no hosts: this is a smoke test of startup and the web layer, not of
+          # ICMP - GitHub runners block outbound ping anyway
+          python - <<'PY'
+          import re, pathlib
+          p = pathlib.Path('/tmp/config.yml')
+          p.write_text(re.sub(r'(?ms)^hosts:.*$', 'hosts: []\n', p.read_text()))
+          PY
+          timeout 25 python -m gclpm -c /tmp/config.yml &
+          sleep 8
+          code=$(curl -s -o /tmp/body -w '%{http_code}' -H 'X-Token: citest' http://127.0.0.1:8080/api/status)
+          echo "status -> $code"; cat /tmp/body | head -c 400; echo
+          test "$code" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/status)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthz)" = "200"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t gcl-ping-monitor:ci server
+      - name: The compose file must be valid
+        working-directory: server
+        run: |
+          cp .env.example .env
+          docker compose config >/dev/null
+      - name: It must ping for real, as a non-root user
+        run: |
+          # the real test of the sysctl: uid 10001 opening an ICMP socket
+          docker run --rm --sysctl net.ipv4.ping_group_range='0 2147483647' \
+            --entrypoint python gcl-ping-monitor:ci -c "
+          import asyncio, sys
+          from icmplib import async_ping
+          r = asyncio.run(async_ping('127.0.0.1', count=2, timeout=2, privileged=False))
+          print('alive:', r.is_alive, 'rtt:', r.avg_rtt)
+          sys.exit(0 if r.is_alive else 1)
+          "

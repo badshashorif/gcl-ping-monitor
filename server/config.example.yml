@@ -1,0 +1,65 @@
+# GCL Ping Monitor - server configuration
+#
+# No secrets in here on purpose: passwords and tokens come from .env.
+# This file is re-read while running - save it and the change applies on the
+# next cycle, without losing ping history or acknowledgements.
+
+# Shown on the dashboard and at the end of every alert, so you can tell which
+# box raised it. Blank = the container's hostname.
+monitor_name: GCL-MONITOR (203.191.33.29)
+
+interval_seconds: 5      # how often every enabled host is pinged
+timeout_ms: 1500         # how long to wait for one reply
+fail_threshold: 2        # consecutive misses before a host is called DOWN
+loss_window: 100         # how many recent pings the Loss % is measured over
+
+web:
+  port: 8080
+  allow_ack: true        # false makes the dashboard strictly read-only
+
+notify:
+  on_down: true
+  on_recover: true
+  batch_seconds: 20      # events inside this window become ONE message
+  max_per_hour: 20       # hard cap, so a flapping link cannot spam
+  repeat_min: 5          # re-send while STILL down and un-acknowledged. 0 = once only
+
+  email:
+    enabled: false
+    smtp_server: cpns3.citechco.net
+    port: 465
+    security: auto       # auto | starttls | ssl | none   (465 = ssl, 587 = starttls)
+    user: alerts@example.com
+    sender: alerts@example.com
+    to: noc@grameencybernet.net
+
+  telegram:
+    enabled: false
+    chat_id: ""          # group ids start with -100
+
+  ntfy:
+    enabled: false
+    server: https://ntfy.sh
+    topic: ""            # on the public server the topic name IS the password
+    down_priority: 5     # 5 = urgent: rings through Do Not Disturb
+    up_priority: 3       # a recovery at 5 would wake you at 3am to say all is well
+    click_url: ""        # tapping the phone notification opens this
+
+# label   what you call it
+# target  IP or hostname to ping
+# enabled false = not pinged at all, shown greyed out, can never alarm
+# sound   false = no NOISE at the desk. It still goes red, still needs an
+#         acknowledgement, and it still sends its notifications.
+hosts:
+  - label: GOOGLE.COM
+    target: google.com
+    sound: false
+  - label: ACCESS_RTR_6
+    target: 122.99.103.227
+  - label: UPS_1_INPUT_POWER
+    target: 172.30.173.80
+  - label: UPS_2_INPUT_POWER
+    target: 172.30.173.90
+  - label: OLD_BILLING_VM
+    target: 172.30.30.9
+    enabled: false

@@ -1,0 +1,57 @@
+# A SEPARATE compose project, deliberately.
+#
+# It joins the existing monitoring-stack network from the outside instead of
+# being added to that stack's docker-compose.yml, so nothing here can break
+# Cacti, Pritunl, Uptime Kuma or Nagios - and `docker compose down` here cannot
+# take any of them with it.
+#
+# Deploy path on monitor.grameencybernet.net (203.191.33.29):
+#   /root/data/gcl-ping-monitor
+#
+# Routing note that matters for a PING tool specifically: this container sits on
+# monitor_net (172.21.0.0/24) and reaches everything else through the host's own
+# routing table, which on `monitor` is correct for the 172.18.x OLT range. The
+# same container on `netauto` would NOT work - a docker bridge there occupies
+# 172.18.0.0/16 and silently swallows every OLT.
+
+services:
+  pingmon:
+    build: .
+    image: gcl-ping-monitor:1.0.0
+    container_name: gcl-pingmon
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - GCLPM_CONFIG=/config/config.yml
+      - TZ=${TZ:-Asia/Dhaka}
+    volumes:
+      - ./config.yml:/config/config.yml:ro
+    # Unprivileged ICMP. This is what lets the container ping as uid 10001 with
+    # no root and no CAP_NET_RAW. Without it every host goes red at once and it
+    # looks like a total outage rather than a permissions problem - the log says
+    # which it is, exactly once.
+    sysctls:
+      - net.ipv4.ping_group_range=0 2147483647
+    networks: [monitor_net]
+    # No published port: Caddy is the only thing on this box that faces the
+    # world, and it reaches this over the shared network by name.
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=5).status==200 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  monitor_net:
+    external: true
+    # Created by the monitoring-stack compose project. Verify the real name
+    # first - `docker network ls` - Compose usually prefixes it with the project
+    # name, so this is very often monitoring-stack_monitor_net.
+    name: ${MONITOR_NET_NAME:-monitoring-stack_monitor_net}
