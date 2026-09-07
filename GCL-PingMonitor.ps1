@@ -3132,10 +3132,24 @@ $miWeb.Add_Click({
     $btnAcl.Text = 'Allow access from other PCs...'; $btnAcl.AutoSize = $true
     $btnAcl.Location = New-Object System.Drawing.Point([int]($s*24), [int]$y)
     $btnAcl.Add_Click({
-        if (Add-WebUrlAcl) {
-            Show-Info "Permission granted for port $([int]$numP.Value).`r`n`r`nTurn the dashboard off and on again (or restart the tool) to bind to the network." 'Web dashboard'
+        if (-not (Add-WebUrlAcl)) {
+            Show-Info "Nothing was changed - the administrator prompt was refused, or netsh failed.`r`n`r`nThe dashboard still works on this PC (localhost)." 'Web dashboard'
+            return
+        }
+        # Rebind immediately. This used to say "turn it off and on again", which
+        # is three more clicks to do something the tool can obviously do itself.
+        if ($chkOn.Checked) {
+            $script:Config.Web.Port = [int]$numP.Value
+            $script:Config.Web.Bind = 'any'
+            $cboB.SelectedIndex = 0
+            Stop-WebServer
+            Start-WebServer
+            & $refreshUrls
+        }
+        if ($script:Web.Running -and -not $script:Web.LocalOnly) {
+            Show-Info ("Done - the dashboard is now reachable from other devices at:`r`n`r`n{0}" -f (@(Get-WebUrls)[0])) 'Web dashboard'
         } else {
-            Show-Info "Nothing was changed - the administrator prompt was refused or netsh failed.`r`n`r`nThe dashboard will still work on this PC (localhost)." 'Web dashboard'
+            Show-Info "Permission granted. Tick 'Serve the dashboard over HTTP' and Save to start it." 'Web dashboard'
         }
     })
     $btnNew = New-Object System.Windows.Forms.Button
@@ -4275,6 +4289,7 @@ $script:Web = [hashtable]::Synchronized(@{
     Token     = ''
     AllowAck  = $true
     Prefix    = ''
+    LocalOnly = $false
     Stop      = $false
     Hits      = 0
 })
@@ -4317,7 +4332,12 @@ function Get-WebUrls {
     $port = Get-WebPort
     $tok  = Get-WebToken
     $urls = @()
-    if ([string]$script:Config.Web.Bind -eq 'local') {
+    # what it is ACTUALLY bound to, not what was asked for - after a fallback
+    # the two differ, and handing out a network URL that refuses connections is
+    # the most confusing thing this dialog could do
+    $isLocal = if ($script:Web.Running) { [bool]$script:Web.LocalOnly }
+               else { [string]$script:Config.Web.Bind -eq 'local' }
+    if ($isLocal) {
         $urls += ('http://localhost:{0}/?t={1}' -f $port, $tok)
     } else {
         if ($script:MonitorIp) { $urls += ('http://{0}:{1}/?t={2}' -f $script:MonitorIp, $port, $tok) }
@@ -4405,9 +4425,14 @@ function Add-WebUrlAcl {
     # elevates a single netsh call and comes straight back.
     $port = Get-WebPort
     $me   = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
+    # The firewall rule is scoped to private/office ranges, NOT left open.
+    # A monitoring PC can easily have a public address (GCL's desks do), and an
+    # unscoped rule would publish the whole dashboard - hosts, IPs and all - to
+    # the internet on a plain HTTP port with one guessable token in front of it.
+    $from = 'LocalSubnet,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
     $cmd  = 'netsh http add urlacl url=http://+:{0}/ user="{1}" ; ' -f $port, $me
     $cmd += 'netsh advfirewall firewall delete rule name="GCL Ping Monitor web" ; '
-    $cmd += 'netsh advfirewall firewall add rule name="GCL Ping Monitor web" dir=in action=allow protocol=TCP localport={0} profile=any' -f $port
+    $cmd += 'netsh advfirewall firewall add rule name="GCL Ping Monitor web" dir=in action=allow protocol=TCP localport={0} profile=any remoteip={1}' -f $port, $from
     try {
         $p = Start-Process powershell -Verb RunAs -Wait -PassThru -WindowStyle Hidden `
                 -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command', $cmd
@@ -4437,13 +4462,18 @@ function Stop-WebServer {
 }
 
 function Start-WebServer {
-    param([switch]$Quiet)
+    param([switch]$Quiet, [switch]$ForceLocal)
     Stop-WebServer
     $port = Get-WebPort
     $script:Web.Stop     = $false
     $script:Web.Token    = Get-WebToken
     $script:Web.AllowAck = [bool]$script:Config.Web.AllowAck
-    $local = ([string]$script:Config.Web.Bind -eq 'local')
+    # $ForceLocal is the RUNTIME fallback and is deliberately not written to the
+    # config: what the user asked for is "any", and a missing URL reservation is
+    # a temporary condition. Persisting it meant one failed start silently
+    # rewrote the setting to localhost, so granting the permission afterwards
+    # appeared to do nothing.
+    $local = $ForceLocal -or ([string]$script:Config.Web.Bind -eq 'local')
 
     $listener = New-Object System.Net.HttpListener
     $prefix = if ($local) { 'http://localhost:{0}/' -f $port } else { 'http://+:{0}/' -f $port }
@@ -4457,8 +4487,7 @@ function Start-WebServer {
             # ERROR_ACCESS_DENIED - no URL reservation. Fall back to loopback so
             # the tool still works, and say exactly what to click to fix it.
             Write-Event ('WEB   err : port {0} needs a one-off permission (Settings -> Web dashboard -> Allow access from other PCs). Listening on localhost only for now.' -f $port)
-            $script:Config.Web.Bind = 'local'
-            Start-WebServer -Quiet:$Quiet
+            Start-WebServer -Quiet:$Quiet -ForceLocal
             return
         }
         if ($code -eq 32 -or $code -eq 183) {
@@ -4475,9 +4504,10 @@ function Start-WebServer {
         return
     }
 
-    $script:Web.Listener = $listener
-    $script:Web.Prefix   = $prefix
-    $script:Web.Running  = $true
+    $script:Web.Listener  = $listener
+    $script:Web.Prefix    = $prefix
+    $script:Web.LocalOnly = $local
+    $script:Web.Running   = $true
 
     $rs = [runspacefactory]::CreateRunspace()
     $rs.ApartmentState = 'MTA'
