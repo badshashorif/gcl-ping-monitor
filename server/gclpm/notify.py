@@ -291,8 +291,12 @@ class Notifier:
             "Priority": str(pri),
             "Tags": "rotating_light,warning" if critical else "white_check_mark",
         }
-        if c.get("click_url"):
-            headers["Click"] = str(c["click_url"])
+        # Tapping the notification has to land on the dashboard already
+        # authorised. web.public_url + the token does that; click_url is the
+        # override for pointing somewhere else entirely.
+        click = str(c.get("click_url") or "").strip() or self.cfg.dashboard_url
+        if click:
+            headers["Click"] = click
         token = self.cfg.secret("ntfy_token")
         if token:
             headers["Authorization"] = f"Bearer {token}"

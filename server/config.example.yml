@@ -20,6 +20,11 @@ web:
   allow_ack: true        # false makes the dashboard strictly read-only
   allow_edit: true       # the /hosts editor. false = config.yml is the only way
 
+  # Where a phone can reach the dashboard. No token here - it is added at send
+  # time - and no trailing slash. Set this and tapping a phone alert opens the
+  # dashboard already logged in; leave it blank and the tap goes nowhere.
+  public_url: ""
+
 notify:
   on_down: true
   on_recover: true

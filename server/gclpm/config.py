@@ -35,6 +35,11 @@ DEFAULTS: dict[str, Any] = {
     "loss_window": 100,
     "web": {
         "port": 8080,
+        # Where the dashboard is reachable from a phone, with no token and no
+        # trailing slash - e.g. https://ping.example.net. The token is added to
+        # it at send time, so a notification can be tapped straight through to
+        # the dashboard without config.yml ever holding the secret.
+        "public_url": "",
         "allow_ack": True,
         # The browser host editor. Off makes config.yml the only way to change
         # what is monitored - which is what you want once the dashboard link has
@@ -157,6 +162,21 @@ class Config:
             seen.add(spec.key)
             out.append(spec)
         return out
+
+    @property
+    def dashboard_url(self) -> str:
+        """The link to put on a notification, token included.
+
+        Built here rather than written into config.yml, because it has to carry
+        the access token and config.yml must never hold a secret. Without the
+        token a tapped notification lands on a 401, which is the least useful
+        thing a phone can show someone who has just been woken up.
+        """
+        base = str(self.web.get("public_url", "")).strip().rstrip("/")
+        if not base:
+            return ""
+        token = self.secret("web_token")
+        return f"{base}/?t={token}" if token else f"{base}/"
 
     def secret(self, name: str) -> str:
         return self.secrets.get(name, "")

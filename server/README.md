@@ -96,6 +96,11 @@ because it is the file people actually open.
 
 ## Behaviour worth knowing
 
+- **`web.public_url`** - set it, and tapping a phone alert opens the dashboard
+  already authorised. The token is appended at send time rather than written
+  into `config.yml`. Note what that means: the link, token and all, travels
+  through whichever ntfy server you use. On the public ntfy.sh that is a third
+  party, which is one more reason to self-host (see `ntfy-server/`).
 - **`fail_threshold`** consecutive misses before a host is called DOWN. One
   missed ping is a WARN, not an outage.
 - **`batch_seconds`** - a link failure that takes five hosts down is *one*

@@ -17,10 +17,13 @@ from gclpm.notify import Notifier
 from gclpm.state import Monitor
 
 
-def build_cfg(**notify_over):
+def build_cfg(web=None, secrets=None, **notify_over):
     notify = cfgmod._merge(cfgmod.DEFAULTS["notify"], notify_over)
-    raw = cfgmod._merge(cfgmod.DEFAULTS, {"notify": notify})
-    return cfgmod.Config(raw=raw, secrets={})
+    over = {"notify": notify}
+    if web:
+        over["web"] = cfgmod._merge(cfgmod.DEFAULTS["web"], web)
+    raw = cfgmod._merge(cfgmod.DEFAULTS, over)
+    return cfgmod.Config(raw=raw, secrets=secrets or {})
 
 
 def make_notifier(cfg):
@@ -149,6 +152,59 @@ async def test_disabled_events_are_not_queued(ntfy):
     await n.flush()
     await n.close()
     assert ntfy.seen == [], "on_down:false is why nothing was ever sent on the PC"
+
+
+# ---- tapping the notification --------------------------------------------
+async def test_tapping_the_alert_opens_the_dashboard_already_authorised(ntfy):
+    """Without the token the tap lands on a 401 - the least useful thing to
+    show someone who has just been woken up by the alarm."""
+    cfg = build_cfg(web={"public_url": "https://ping.example.net"},
+                    secrets={"web_token": "tok123"},
+                    ntfy={"enabled": True, "server": str(ntfy.make_url("")).rstrip("/"),
+                          "topic": "t"})
+    n, _ = make_notifier(cfg)
+    mon, host = down_host()
+    n.add("DOWN", host)
+    await n.flush()
+    await n.close()
+    assert ntfy.seen[0]["headers"]["Click"] == "https://ping.example.net/?t=tok123"
+
+
+async def test_a_trailing_slash_does_not_double_up(ntfy):
+    cfg = build_cfg(web={"public_url": "https://ping.example.net/"},
+                    secrets={"web_token": "tok123"},
+                    ntfy={"enabled": True, "server": str(ntfy.make_url("")).rstrip("/"),
+                          "topic": "t"})
+    n, _ = make_notifier(cfg)
+    mon, host = down_host()
+    n.add("DOWN", host)
+    await n.flush()
+    await n.close()
+    assert ntfy.seen[0]["headers"]["Click"] == "https://ping.example.net/?t=tok123"
+
+
+async def test_click_url_still_wins(ntfy):
+    cfg = build_cfg(web={"public_url": "https://ping.example.net"},
+                    secrets={"web_token": "tok123"},
+                    ntfy={"enabled": True, "server": str(ntfy.make_url("")).rstrip("/"),
+                          "topic": "t", "click_url": "https://elsewhere.example/"})
+    n, _ = make_notifier(cfg)
+    mon, host = down_host()
+    n.add("DOWN", host)
+    await n.flush()
+    await n.close()
+    assert ntfy.seen[0]["headers"]["Click"] == "https://elsewhere.example/"
+
+
+async def test_no_click_header_when_there_is_nowhere_to_go(ntfy):
+    cfg = build_cfg(ntfy={"enabled": True, "server": str(ntfy.make_url("")).rstrip("/"),
+                          "topic": "t"})
+    n, _ = make_notifier(cfg)
+    mon, host = down_host()
+    n.add("DOWN", host)
+    await n.flush()
+    await n.close()
+    assert "Click" not in ntfy.seen[0]["headers"]
 
 
 # ---- the repeat-while-down reminder --------------------------------------
