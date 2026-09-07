@@ -78,9 +78,16 @@ cd "$STACK"
 docker compose up -d --force-recreate caddy
 
 say "Checking it answers"
-sleep 5
-code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "https://${SITE}/" || echo 000)"
+# Retry rather than sleep-and-hope: the FIRST request for a new hostname is
+# what triggers the Let's Encrypt order, so it can take tens of seconds, and a
+# single early probe reports failure on a deployment that is actually fine.
+code=000
+for _ in $(seq 1 12); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://${SITE}/")" || code=000
+  case "$code" in 200|401) break ;; esac
+  sleep 5
+done
 echo "  https://${SITE}/  ->  $code   (401 is correct: no token in that URL)"
-[ "$code" = "401" ] || [ "$code" = "200" ] || die "unexpected response - check: docker compose logs caddy"
+case "$code" in 200|401) ;; *) die "unexpected response - check: docker compose logs caddy" ;; esac
 
 say "Done. The dashboard is at https://${SITE}/?t=<the token in gcl-ping-monitor/server/.env>"

@@ -57,7 +57,6 @@ ${NTFY_DOMAIN} {
     # being cut off. Without both, delivery quietly degrades to polling.
     reverse_proxy gcl-ntfy:80 {
         flush_interval -1
-        header_up X-Forwarded-For {remote_host}
         transport http {
             read_timeout 0
         }
@@ -86,9 +85,16 @@ cd "$STACK"
 docker compose up -d --force-recreate "$CADDY_CONTAINER"
 
 say "Checking it answers"
-sleep 5
-code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 "https://${NTFY_DOMAIN}/v1/health" || echo 000)"
+# Retry rather than sleep-and-hope: the FIRST request for a new hostname is
+# what triggers the Let's Encrypt order, so it can take tens of seconds, and a
+# single early probe reports failure on a deployment that is actually fine.
+code=000
+for _ in $(seq 1 12); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://${NTFY_DOMAIN}/v1/health")" || code=000
+  [ "$code" = "200" ] && break
+  sleep 5
+done
 echo "  https://${NTFY_DOMAIN}/v1/health  ->  $code"
-[ "$code" = "200" ] || die "not answering yet - a first certificate can take a few seconds; check: docker logs $CADDY_CONTAINER"
+[ "$code" = "200" ] || die "still not answering - check: docker logs $CADDY_CONTAINER"
 
 say "Done. Server URL for the phones: https://${NTFY_DOMAIN}"
