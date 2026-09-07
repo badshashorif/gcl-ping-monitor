@@ -410,15 +410,48 @@ closed.
 **Send a test to my phone** posts immediately, using whatever is typed in the
 boxes rather than what was last saved.
 
-On the phone:
+### Setting the phone up — all three steps matter
 
-1. Install **ntfy** from the Play Store, F-Droid or the App Store.
-2. Subscribe to the same server + topic.
-3. Open the topic → its settings → set a **custom sound**. This is the step that
-   turns a notification into an alarm — do not skip it.
+This is the part that decides whether you get woken up or not. Skipping any one
+of them leaves you with an alert that is late, silent, or eventually stops
+arriving at all.
 
-Two priorities, not one, on purpose: a recovery at 5 would wake you up at 3am to
-tell you everything is fine.
+**1. Subscribe.** Install **ntfy** (Play Store, F-Droid or App Store) and
+subscribe to the same server + topic.
+
+**2. Turn on Instant delivery** for that subscription. Without it the Play Store
+build delivers through Firebase, and the ntfy docs are blunt about the result:
+messages "may arrive with a significant delay (sometimes many minutes, or even
+hours later)". That is fatal for an alarm. Instant delivery keeps a connection
+open and works *in doze mode*, at the cost of a permanent quiet notification
+saying the service is running. The **F-Droid** build has it on by default and
+never touches Firebase.
+
+**3. Set the sound on the *channel*, not the topic.** This is the one everybody
+gets wrong. Android sets notification sound per **notification channel**, and
+ntfy creates one channel per priority — so the setting lives in Android, not in
+the ntfy app:
+
+> Android **Settings → Apps → ntfy → Notifications → Max / Urgent**
+> → set a loud sound, and turn on **Override Do Not Disturb**.
+
+Because DOWN alerts are sent at priority 5 and recoveries at 3, only the outage
+lands on that loud channel. A recovery at priority 5 would wake you at 3am to
+tell you everything is fine — which is why the two priorities are separate
+settings.
+
+**Also exclude ntfy from battery optimisation** (Settings → Apps → ntfy →
+Battery → Unrestricted). Android will otherwise kill the background service
+after a while, and the failure is silent: everything looks subscribed, nothing
+arrives.
+
+### Why not just leave the web dashboard open?
+
+Because a browser stops running the page the moment you switch away from it, so
+the tab makes no sound in your pocket. Web Push could in principle wake a closed
+page, but it needs HTTPS, a push service and a service worker, and it still
+cannot override Do Not Disturb or play a custom alarm sound. ntfy can. The
+dashboard is for *looking* at the monitor; ntfy is for being *told*.
 
 > The alert body is UTF-8 and carries the status emoji. The *title* is forced to
 > plain ASCII because ntfy reads headers as latin-1 and would otherwise show

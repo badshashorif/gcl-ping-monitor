@@ -157,6 +157,10 @@ Set-Default $n 'OnDown'       $true
 Set-Default $n 'OnRecover'    $true
 Set-Default $n 'BatchSeconds' 20
 Set-Default $n 'MaxPerHour'   20
+# A single message can be slept through, and then the outage is unattended until
+# morning. While a host is down AND un-acknowledged, re-send every N minutes.
+# Acknowledging - from the desk, a browser or a phone - stops it. 0 = off.
+Set-Default $n 'RepeatMin'    0
 Set-Default $n 'Email'    ([pscustomobject]@{})
 Set-Default $n 'Telegram' ([pscustomobject]@{})
 Set-Default $n 'Sms'      ([pscustomobject]@{})
@@ -840,7 +844,12 @@ function Format-NotifyBody {
         $b = '{0} "{1}" {2}{3}Severity: {4}{3}Timestamp: {5}' -f `
             $icon, $e.Label, $state, $nl, $sev, $e.Time.ToString('yyyy-MM-dd HH:mm:ss')
         if ($e.Target) { $b += ('{0}IP / Host: {1}' -f $nl, $e.Target) }
-        if (-not $isDown -and $e.DownFor) { $b += ('{0}Downtime: {1}' -f $nl, $e.DownFor) }
+        # A DOWN event normally has no DownFor - it has only just happened. The
+        # "still down" reminder does, and there it is the most useful line in
+        # the message, so both kinds print it when it is set.
+        if ($e.DownFor) {
+            $b += ('{0}{1}: {2}' -f $nl, $(if ($isDown) { 'Down for' } else { 'Downtime' }), $e.DownFor)
+        }
         $blocks += $b
     }
     # which desk PC raised this - once at the end, not on every block, so a
@@ -1246,7 +1255,11 @@ function Send-NtfyTest {
     }
     $body = ('GCL Ping Monitor test from {0}' -f (Get-MonitorLabel)) + [Environment]::NewLine +
             ('Sent {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) + [Environment]::NewLine +
-            'If this arrived silently, set a custom sound for the topic in the ntfy app.'
+            'If this arrived silently: Android sets the sound on the notification CHANNEL,' +
+            [Environment]::NewLine +
+            'not the topic - Settings > Apps > ntfy > Notifications > Max/Urgent.' +
+            [Environment]::NewLine +
+            'If it arrived late, turn on Instant delivery for the subscription.'
     try {
         $ps = [PowerShell]::Create()
         [void]$ps.AddScript($script:NotifySender)
@@ -1313,9 +1326,70 @@ function Send-QueuedNotifications {
     if ($short.Length -gt 300) { $short = $short.Substring(0, 297) + '...' }
 
     Write-Event ('NOTIFY    : sending ({0} down, {1} up)' -f $downs.Count, $ups.Count)
+    # the reminder clock restarts from any real message, so a fresh outage is
+    # never followed a few seconds later by a "still down" for the same thing
+    $script:LastNotifySent = Get-Date
     # the raw events go along too - the command channel can run once per host
     $evts = @($items | ForEach-Object { @{ Kind = $_.Kind; Label = $_.Label; Target = $_.Target } })
     Send-Notification -Subject $subject -BodyLong $long -BodyShort $short -Events $evts
+}
+
+# While something is still down and nobody has acknowledged it, say so again.
+# This is what separates an alarm from a notification: one message at 3am that
+# nobody hears leaves the outage unattended until morning.
+$script:LastNotifySent = $null
+
+function Send-DownReminder {
+    $every = [int]$script:Config.Notify.RepeatMin
+    if ($every -le 0) { return }
+    if (-not (Test-NotifyEnabled)) { return }
+    if (-not $script:Config.Notify.OnDown) { return }
+
+    # Acknowledging is the off switch, deliberately - it is reachable from the
+    # desk, the browser and the phone, and it already means "I have seen this".
+    $down = @($script:Hosts | Where-Object { $_.Enabled -and $_.Status -eq 'DOWN' -and -not $_.Acked })
+    if ($down.Count -eq 0) { $script:LastNotifySent = $null; return }
+
+    if ($null -eq $script:LastNotifySent) { $script:LastNotifySent = Get-Date; return }
+    if (((Get-Date) - $script:LastNotifySent).TotalMinutes -lt $every) { return }
+    $script:LastNotifySent = Get-Date
+
+    # goes through the same cap as everything else, so a flapping link cannot
+    # turn this into an unbounded sender
+    $cut  = (Get-Date).AddHours(-1)
+    $keep = @($script:NotifySent | Where-Object { $_ -gt $cut })
+    $script:NotifySent.Clear()
+    foreach ($t in $keep) { [void]$script:NotifySent.Add($t) }
+    if ($script:NotifySent.Count -ge [int]$script:Config.Notify.MaxPerHour) {
+        Write-Event ('NOTIFY err: hourly limit ({0}) reached - reminder suppressed' -f $script:Config.Notify.MaxPerHour)
+        return
+    }
+    [void]$script:NotifySent.Add((Get-Date))
+
+    $items = @($down | ForEach-Object {
+        [pscustomobject]@{
+            Kind = 'DOWN'; Label = $_.Label; Target = $_.Target
+            Time = Get-Date
+            DownFor = $(if ($_.DownSince) { Format-Duration ((Get-Date) - $_.DownSince) } else { '' })
+        }
+    })
+    $subject = if ($items.Count -eq 1) {
+        '[CRITICAL] "{0}" STILL DOWN - {1}' -f $items[0].Label, $script:MonitorName
+    } else {
+        '[CRITICAL] {0} host(s) STILL DOWN - {1}' -f $items.Count, $script:MonitorName
+    }
+    $parts = @($items | ForEach-Object {
+        '"{0}" still down{1}' -f $_.Label, $(if ($_.DownFor) { ' ' + $_.DownFor } else { '' })
+    })
+    $short = ('[{0}] {1} - {2}' -f $env:COMPUTERNAME, ($parts -join '; '), (Get-Date -Format 'HH:mm:ss'))
+    if ($short.Length -gt 300) { $short = $short.Substring(0, 297) + '...' }
+
+    $long = (Format-NotifyBody $items) + [Environment]::NewLine + [Environment]::NewLine +
+            ('Still not acknowledged. This repeats every {0} minute(s) until someone acknowledges it.' -f $every)
+
+    Write-Event ('NOTIFY    : reminder - {0} still down, un-acknowledged' -f $items.Count)
+    Send-Notification -Subject $subject -BodyLong $long -BodyShort $short `
+        -Events @($items | ForEach-Object { @{ Kind = 'DOWN'; Label = $_.Label; Target = $_.Target } })
 }
 
 function Stop-Alarm {
@@ -2737,9 +2811,17 @@ $miNotify.Add_Click({
     NRow $pGen 'Batch (sec)' $gBatch 8
     $gMax = New-Object System.Windows.Forms.NumericUpDown; $gMax.Minimum=1; $gMax.Maximum=500; $gMax.Value=[Math]::Min([Math]::Max([int]$n.MaxPerHour,1),500)
     NRow $pGen 'Max msgs/hour' $gMax 8
+    $gRep = New-Object System.Windows.Forms.NumericUpDown; $gRep.Minimum=0; $gRep.Maximum=240
+    $gRep.Value = [Math]::Min([Math]::Max([int]$n.RepeatMin, 0), 240)
+    NRow $pGen 'Repeat every (min)' $gRep 8
     $gInfo = New-Object System.Windows.Forms.Label
     $gInfo.Text = "Events inside the batch window are combined into ONE message," + [Environment]::NewLine +
                   "so a link failure taking many hosts down does not fire many SMS." + [Environment]::NewLine + [Environment]::NewLine +
+                  "Repeat every: while a host is STILL down and nobody has" + [Environment]::NewLine +
+                  "acknowledged it, send again this often. 0 = send once only." + [Environment]::NewLine +
+                  "Acknowledging - on the PC, in a browser or on a phone - stops it." + [Environment]::NewLine +
+                  "Use it so a message missed at 3am does not leave an outage" + [Environment]::NewLine +
+                  "unattended until morning. Recoveries are never repeated." + [Environment]::NewLine + [Environment]::NewLine +
                   "Passwords, bot tokens and API keys are stored encrypted (DPAPI)" + [Environment]::NewLine +
                   "and can only be read back by this Windows user on this machine."
     $gInfo.AutoSize = $true
@@ -2827,10 +2909,16 @@ $miNotify.Add_Click({
     })
 
     $nInfo = New-Object System.Windows.Forms.Label
-    $nInfo.Text = "This is the channel that makes your PHONE ring, not just buzz." + [Environment]::NewLine +
-                  "1. Install ""ntfy"" from the Play Store (or F-Droid / App Store)." + [Environment]::NewLine +
-                  "2. Subscribe to the SAME server + topic you type above." + [Environment]::NewLine +
-                  "3. In the app: the topic -> Settings -> set a loud custom sound." + [Environment]::NewLine +
+    $nInfo.Text = "The channel that rings a LOCKED phone. Three steps on the phone," + [Environment]::NewLine +
+                  "and skipping any one of them makes it arrive late or silent:" + [Environment]::NewLine +
+                  "1. Install ""ntfy"", subscribe to the SAME server + topic above." + [Environment]::NewLine +
+                  "2. In the subscription: turn ON 'Instant delivery'. Without it" + [Environment]::NewLine +
+                  "   ntfy uses Firebase and alerts can be MINUTES OR HOURS late." + [Environment]::NewLine +
+                  "3. Android Settings > Apps > ntfy > Notifications > the MAX /" + [Environment]::NewLine +
+                  "   URGENT channel: set a loud sound and 'Override Do Not Disturb'." + [Environment]::NewLine +
+                  "   (Android sets sound per PRIORITY CHANNEL, not per topic.)" + [Environment]::NewLine +
+                  "Also exclude ntfy from battery optimisation, or Android will" + [Environment]::NewLine +
+                  "eventually kill it." + [Environment]::NewLine +
                   "Treat the topic name as a password - anyone who knows it can read" + [Environment]::NewLine +
                   "your alerts on a public server. Use your own server for real use."
     $nInfo.AutoSize = $true
@@ -2947,6 +3035,7 @@ $miNotify.Add_Click({
         $n.OnRecover    = [bool]$gUp.Checked
         $n.BatchSeconds = [int]$gBatch.Value
         $n.MaxPerHour   = [int]$gMax.Value
+        $n.RepeatMin    = [int]$gRep.Value
 
         $n.Email.Enabled    = [bool]$mEn.Checked
         $n.Email.SmtpServer = $mSrv.Text.Trim()
@@ -4705,6 +4794,7 @@ $script:notifyTimer = New-Object System.Windows.Forms.Timer
 $script:notifyTimer.Interval = [Math]::Max([int]$script:Config.Notify.BatchSeconds, 5) * 1000
 $script:notifyTimer.Add_Tick({
     try { Send-QueuedNotifications } catch { Write-Event "ERR notify: $($_.Exception.Message)" }
+    try { Send-DownReminder }        catch { Write-Event "ERR notify: $($_.Exception.Message)" }
 })
 
 # background self-update check while the app is running
