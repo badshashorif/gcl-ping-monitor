@@ -36,7 +36,11 @@ die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 docker ps --format '{{.Names}}' | grep -qx caddy || die "the caddy container is not running"
 docker ps --format '{{.Names}}' | grep -qx gcl-pingmon || die "gcl-pingmon is not running - run ./deploy.sh first"
 
-if grep -q "$SITE" "$CADDYFILE"; then
+# A whole-line match, not a substring: "ping.monitor.grameencybernet.net" is
+# also the tail of "smokeping.monitor.grameencybernet.net", which is already in
+# this file - a plain grep reports the site as present and the script does
+# nothing at all.
+if grep -qxF "${SITE} {" "$CADDYFILE"; then
   say "$SITE is already in the Caddyfile - nothing to do"
   exit 0
 fi
