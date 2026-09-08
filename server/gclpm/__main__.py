@@ -26,6 +26,8 @@ log = logging.getLogger("gclpm")
 
 
 async def ping_loop(mon: Monitor, cfg_ref: dict, parts: dict) -> None:
+    # Latched so a long outage does not repeat the same line every 5 seconds.
+    path_warned = False
     while True:
         cfg = cfg_ref["cfg"]
         notifier: Notifier = parts["n"]
@@ -54,8 +56,38 @@ async def ping_loop(mon: Monitor, cfg_ref: dict, parts: dict) -> None:
             pinger: Pinger = parts["p"]
             pinger.timeout = cfg.timeout
             targets = mon.active()
+            probe_started = time.monotonic()
             results = await pinger.ping_all(targets)
+            probe_took = time.monotonic() - probe_started
             mon.last_check = time.time()
+
+            # Two lines that decide an argument this tool otherwise cannot
+            # settle: when a dozen hosts go red in the same second, is the
+            # network broken or is the monitor?
+            #
+            # A cycle takes about as long as the slowest single ping, because
+            # they all run concurrently. If it takes appreciably longer than
+            # the timeout then the event loop was blocked, every ping in
+            # flight "timed out" for a reason that has nothing to do with the
+            # network, and the dashboard is about to show a site-wide outage
+            # that never happened.
+            if probe_took > cfg.timeout + 0.5:
+                mon.note(f"SLOW      : ping cycle took {probe_took:.1f}s for "
+                         f"{len(targets)} host(s), timeout is {cfg.timeout:.1f}s "
+                         "- misses this cycle may be the monitor, not the hosts")
+
+            # And if most of the list misses in the SAME cycle, these are not
+            # that many separate faults. Every target here leaves through one
+            # interface and one first hop; that hop is the thing to look at.
+            misses = sum(1 for h in targets if results.get(h.key) is None)
+            if len(targets) > 2 and misses * 2 > len(targets):
+                if not path_warned:
+                    path_warned = True
+                    mon.note(f"PATH      : {misses} of {len(targets)} hosts missed the "
+                             "same cycle - suspect the shared path from this monitor")
+            elif path_warned and misses == 0:
+                path_warned = False
+                mon.note("PATH      : full list answering again")
 
             for host in targets:
                 event = mon.record(host, results.get(host.key), cfg.fail_threshold)

@@ -9,6 +9,7 @@ out loud here.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -16,6 +17,8 @@ from dataclasses import dataclass, field
 from .config import HostSpec
 
 INIT, UP, WARN, DOWN, OFF = "INIT", "UP", "WARN", "DOWN", "OFF"
+
+log = logging.getLogger("gclpm.event")
 
 
 @dataclass
@@ -187,3 +190,9 @@ class Monitor:
 
     def note(self, line: str) -> None:
         self.log.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {line}")
+        # Also to stdout, where docker's json-file driver keeps 30 MB of it.
+        # The deque above holds 60 lines and dies with the process, so the
+        # first time anyone asked "when did this start flapping?" the answer
+        # had already scrolled away. Investigating an intermittent fault needs
+        # days of history, not the last few minutes of it.
+        log.info("%s", line)
