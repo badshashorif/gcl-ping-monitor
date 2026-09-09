@@ -111,23 +111,35 @@ because it is the file people actually open.
   cancel a notification it has already delivered, so an insistent alert set on
   the phone can never be stopped by the host coming back.
 - **`<channel>.delay_seconds` and `alarm.delay_seconds`** - how long a host
-  must *stay* down before that channel, or the alarm, is triggered. This is how
-  you separate a nudge from an escalation:
+  must *stay* down before that channel, or the alarm, is triggered. Detection
+  never waits: the host goes DOWN in the table immediately either way. What
+  these tune is the **interruption**.
+
+  The shipped default assumes somebody is at the desk and the rest of the
+  estate is asleep:
 
   ```yaml
   alarm:
-    delay_seconds: 60      # noise at the desk only for a real outage
+    delay_seconds: 0       # desk: banner and noise, instantly
   notify:
-    ntfy:     { delay_seconds: 0 }    # the on-call phone knows in seconds
-    telegram: { delay_seconds: 0 }
-    email:    { delay_seconds: 60 }   # the inbox holds only real outages
+    telegram: { delay_seconds: 0 }    # the running record - every blip
+    ntfy:     { delay_seconds: 60 }   # only ring a pocket for a real outage
+    email:    { delay_seconds: 60 }   # an inbox that holds only real outages
   ```
 
-  The host still goes DOWN in the table immediately either way - the delay
-  holds back the *interruption*, not the detection. A host that recovers
-  inside its window is never mailed about at all, and neither is its recovery:
-  no "RECOVERED" for a "DOWN" nobody received. A channel is likewise only
-  reminded (`repeat_min`) about outages it was actually told about.
+  A link that blips for twenty seconds then alarms the desk, appears in
+  Telegram, and reaches nobody's phone or inbox.
+
+  **The one people get wrong:** `alarm.delay_seconds` is the noise at the
+  *desk*. The sound coming out of a **phone** is ntfy arriving at priority 5.
+  Delaying the alarm does nothing to the phone - delay `ntfy` instead.
+
+  A host that recovers inside its window is never mailed about at all, and
+  neither is its recovery: no "RECOVERED" for a "DOWN" nobody received. A
+  channel is likewise only reminded (`repeat_min`) about outages it was
+  actually told about. A host **deleted** from the config mid-window is
+  dropped too, rather than mailed about a minute after it stopped being
+  monitored.
 
   One flush still costs one slot of `max_per_hour` even when the channels are
   carrying different sets of events, so splitting the fan-out does not

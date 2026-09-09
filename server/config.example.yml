@@ -25,11 +25,24 @@ web:
   # dashboard already logged in; leave it blank and the tap goes nowhere.
   public_url: ""
 
-# The alarm is the red banner and the noise at the desk. This is how long a
-# host has to STAY down before it goes off. The table still shows the host down
-# immediately, and the phone channels below can still be told immediately - the
-# delay only holds back the interruption, so a link that blips for a few
-# seconds does not empty the room.
+# WHO IS TOLD, AND WHEN
+#
+# Detection never waits: a host goes DOWN in the table the moment it is called
+# DOWN, whatever the numbers below say. What these tune is the interruption.
+#
+# The shape that works in practice - someone IS at the desk, and the rest of
+# the estate is asleep:
+#
+#   desk (banner + noise)  instant   they are already looking at it
+#   Telegram               instant   the record of everything, cheap to ignore
+#   phone (ntfy)           60s       only ring a pocket for a real outage
+#   email                  60s       an inbox that holds only real outages
+#
+# The values below are set that way. A link that blips for twenty seconds then
+# alarms the desk, appears in Telegram, and reaches nobody's phone or inbox -
+# which is the whole point.
+
+# The alarm: the red banner and the noise at the desk.
 alarm:
   delay_seconds: 0       # 0 = alarm the moment a host is called DOWN
 
@@ -43,11 +56,10 @@ notify:
   # Every channel has its own `delay_seconds`: how long a host must have been
   # down before THAT channel is told. 0 = immediately.
   #
-  # This is what separates a nudge from an escalation. Leave ntfy and Telegram
-  # at 0 so the on-call phone knows within seconds, and put a delay on email so
-  # the inbox only ever holds real outages. A host that comes back inside its
-  # window is never mailed about at all - and neither is its recovery, so you
-  # never get a "RECOVERED" for a "DOWN" that was never sent.
+  # A host that comes back inside its window is never mailed about at all - and
+  # neither is its recovery, so you never get a "RECOVERED" for a "DOWN" that
+  # was never sent. The same goes for the `repeat_min` reminders below: a
+  # channel is only reminded about outages it was actually told about.
   email:
     enabled: false
     smtp_server: mail.example.com
@@ -56,12 +68,12 @@ notify:
     user: alerts@example.com
     sender: alerts@example.com
     to: noc@example.com
-    delay_seconds: 0
+    delay_seconds: 60    # an inbox that holds only real outages
 
   telegram:
     enabled: false
     chat_id: ""          # group ids start with -100
-    delay_seconds: 0
+    delay_seconds: 0     # the running record: every blip, instantly
 
   ntfy:
     enabled: false
@@ -70,7 +82,10 @@ notify:
     down_priority: 5     # 5 = urgent: rings through Do Not Disturb
     up_priority: 3       # a recovery at 5 would wake you at 3am to say all is well
     click_url: ""        # tapping the phone notification opens this
-    delay_seconds: 0
+    # This is the one people get wrong. `alarm.delay_seconds` is the noise at
+    # the DESK; the sound coming out of a phone is this channel arriving at
+    # priority 5. Delaying the alarm does nothing to the phone - delay ntfy.
+    delay_seconds: 60    # only ring a pocket for an outage that is still down
 
 # The host list. Editable from a browser at /hosts - saving there rewrites this
 # block and leaves every comment in this file alone.
