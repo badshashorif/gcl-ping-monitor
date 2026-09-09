@@ -46,12 +46,27 @@ DEFAULTS: dict[str, Any] = {
         # been handed to people who should only be looking at it.
         "allow_edit": True,
     },
+    # How long a host must stay down before the alarm goes off - the red banner
+    # and the noise. 0 = the moment it is called DOWN. Raising it lets a link
+    # that blips for a few seconds pass without waking the desk, while the
+    # phone channels (below) can still be told straight away.
+    "alarm": {
+        "delay_seconds": 0,
+    },
     "notify": {
         "on_down": True,
         "on_recover": True,
         "batch_seconds": 20,
         "max_per_hour": 20,
         "repeat_min": 0,
+        # Each channel has its own `delay_seconds`: how long a host must have
+        # been down before THAT channel is told. 0 = immediately.
+        #
+        # The point is to separate a nudge from an escalation. ntfy and Telegram
+        # at 0 mean the on-call phone knows within seconds; email at 60 means an
+        # inbox that only ever holds real outages, because a host that comes
+        # back inside the minute is never mailed about at all - and neither is
+        # its recovery, so no orphan "RECOVERED" for a mail nobody received.
         "email": {
             "enabled": False,
             "smtp_server": "",
@@ -60,10 +75,12 @@ DEFAULTS: dict[str, Any] = {
             "user": "",
             "sender": "",
             "to": "",
+            "delay_seconds": 0,
         },
         "telegram": {
             "enabled": False,
             "chat_id": "",
+            "delay_seconds": 0,
         },
         "ntfy": {
             "enabled": False,
@@ -72,6 +89,7 @@ DEFAULTS: dict[str, Any] = {
             "down_priority": 5,
             "up_priority": 3,
             "click_url": "",
+            "delay_seconds": 0,
         },
     },
     "hosts": [],
@@ -120,6 +138,14 @@ class Config:
     @property
     def fail_threshold(self) -> int:
         return max(1, int(self.raw["fail_threshold"]))
+
+    @property
+    def alarm_delay(self) -> float:
+        """Seconds a host must stay down before the banner and the noise."""
+        try:
+            return max(0.0, float(self.raw.get("alarm", {}).get("delay_seconds", 0)))
+        except (TypeError, ValueError):
+            return 0.0
 
     @property
     def loss_window(self) -> int:

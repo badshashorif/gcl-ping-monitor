@@ -110,6 +110,28 @@ because it is the file people actually open.
   0 sends once and stops. This is where repetition belongs: ntfy has no way to
   cancel a notification it has already delivered, so an insistent alert set on
   the phone can never be stopped by the host coming back.
+- **`<channel>.delay_seconds` and `alarm.delay_seconds`** - how long a host
+  must *stay* down before that channel, or the alarm, is triggered. This is how
+  you separate a nudge from an escalation:
+
+  ```yaml
+  alarm:
+    delay_seconds: 60      # noise at the desk only for a real outage
+  notify:
+    ntfy:     { delay_seconds: 0 }    # the on-call phone knows in seconds
+    telegram: { delay_seconds: 0 }
+    email:    { delay_seconds: 60 }   # the inbox holds only real outages
+  ```
+
+  The host still goes DOWN in the table immediately either way - the delay
+  holds back the *interruption*, not the detection. A host that recovers
+  inside its window is never mailed about at all, and neither is its recovery:
+  no "RECOVERED" for a "DOWN" nobody received. A channel is likewise only
+  reminded (`repeat_min`) about outages it was actually told about.
+
+  One flush still costs one slot of `max_per_hour` even when the channels are
+  carrying different sets of events, so splitting the fan-out does not
+  quietly multiply the send rate.
 - A recovery clears a stale acknowledgement, so the *next* outage alarms
   properly instead of starting pre-silenced.
 - A broken `config.yml` does not take the monitor down. It logs the error and

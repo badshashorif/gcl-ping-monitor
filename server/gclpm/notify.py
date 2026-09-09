@@ -18,18 +18,21 @@ import re
 import smtplib
 import ssl
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email.message import EmailMessage
 
 import aiohttp
 
 from .config import Config
-from .state import Host, fmt_duration
+from .state import DOWN, Host, fmt_duration
 
 log = logging.getLogger("gclpm.notify")
 
 RED = "\U0001F534"     # large red circle
 GREEN = "\U0001F7E2"   # large green circle
+
+
+CHANNELS = ("email", "telegram", "ntfy")
 
 
 @dataclass
@@ -39,6 +42,11 @@ class Event:
     target: str
     at: float
     down_for: str = ""
+    key: str = ""                 # host key, for the per-channel bookkeeping
+    host: Host | None = None      # the live object: is it STILL down?
+    # Channels that have finished with this event - sent it, or decided not
+    # to. An event stays queued only while some channel has yet to decide.
+    done: set[str] = field(default_factory=set)
 
 
 def _body(events: list[Event], monitor: str) -> str:
@@ -94,6 +102,10 @@ class Notifier:
         self.sent_times: list[float] = []
         self.last_sent: float | None = None
         self._session: aiohttp.ClientSession | None = None
+        # Which hosts each channel has actually been told are down. A channel
+        # with a delay must never send a recovery for an outage it was never
+        # told about, and must never remind about one either.
+        self._announced: dict[str, set[str]] = {c: set() for c in CHANNELS}
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
@@ -110,7 +122,18 @@ class Notifier:
     @property
     def any_channel(self) -> bool:
         n = self.cfg.notify
-        return any(n[c]["enabled"] for c in ("email", "telegram", "ntfy"))
+        return any(n[c]["enabled"] for c in CHANNELS)
+
+    def enabled_channels(self) -> list[str]:
+        n = self.cfg.notify
+        return [c for c in CHANNELS if n[c]["enabled"]]
+
+    def delay_of(self, channel: str) -> float:
+        """Seconds a host must have been down before this channel is told."""
+        try:
+            return max(0.0, float(self.cfg.notify[channel].get("delay_seconds", 0) or 0))
+        except (TypeError, ValueError):
+            return 0.0
 
     def add(self, kind: str, host: Host) -> None:
         n = self.cfg.notify
@@ -123,7 +146,8 @@ class Notifier:
         down_for = ""
         if kind == "UP" and host.down_since:
             down_for = fmt_duration(time.time() - host.down_since)
-        self.queue.append(Event(kind, host.label, host.target, time.time(), down_for))
+        self.queue.append(Event(kind, host.label, host.target, time.time(),
+                                down_for, key=host.key, host=host))
 
     def _within_cap(self) -> bool:
         cut = time.time() - 3600
@@ -135,23 +159,84 @@ class Notifier:
         self.sent_times.append(time.time())
         return True
 
+    # ---- per-channel delay ---------------------------------------------
+    def _pick(self, channel: str, now: float) -> list[Event]:
+        """What this channel should be sent right now.
+
+        An event lives in the queue until every channel has finished with it,
+        so `e.done` is what stops a fast channel being sent the same event
+        again on the next flush while a slow one is still waiting. Events this
+        channel decides to skip for good are marked done here; the ones it is
+        about to send are marked by the caller, once the send has happened.
+        """
+        delay = self.delay_of(channel)
+        out: list[Event] = []
+        for e in self.queue:
+            if channel in e.done:
+                continue
+            if delay <= 0:
+                out.append(e)
+            elif e.kind == "DOWN":
+                if e.host is not None and e.host.status != DOWN:
+                    e.done.add(channel)           # recovered inside the window
+                elif now - e.at >= delay:
+                    out.append(e)                 # down long enough, tell them
+                # otherwise: still waiting, leave it undecided
+            elif e.key in self._announced[channel]:
+                out.append(e)                     # a recovery we owe this channel
+            else:
+                e.done.add(channel)               # never told it was down
+        return out
+
     # ---- the two things the main loop calls ----------------------------
     async def flush(self) -> None:
         if not self.queue:
             return
-        events, self.queue = self.queue, []
-        if not self.any_channel or not self._within_cap():
+        channels = self.enabled_channels()
+        if not channels:
+            self.queue.clear()
             return
-        downs = sum(1 for e in events if e.kind == "DOWN")
-        ups = len(events) - downs
-        self.note(f"NOTIFY    : sending ({downs} down, {ups} up)")
+
+        now = time.time()
+        per: dict[str, list[Event]] = {}
+        for ch in channels:
+            picked = self._pick(ch, now)
+            if picked:
+                per[ch] = picked
+        if not per:
+            self._drop_finished(channels)
+            return
+        # One flush is one message as far as the hourly cap is concerned, even
+        # when the channels are carrying different sets of events - otherwise
+        # splitting the fan-out would silently triple the send rate.
+        if not self._within_cap():
+            return
+
+        for ch, events in per.items():
+            downs = sum(1 for e in events if e.kind == "DOWN")
+            ups = len(events) - downs
+            self.note(f"NOTIFY    : sending to {ch} ({downs} down, {ups} up)")
+            await self._send(_subject(events, self.monitor),
+                             _body(events, self.monitor),
+                             _short(events, self.monitor),
+                             critical=downs > 0,
+                             channels=[ch])
+            for e in events:
+                e.done.add(ch)
+                if e.kind == "DOWN":
+                    self._announced[ch].add(e.key)
+                else:
+                    self._announced[ch].discard(e.key)
+
+        self._drop_finished(channels)
         # any real message restarts the reminder clock, so a fresh outage is
         # never followed seconds later by a "still down" about the same thing
         self.last_sent = time.time()
-        await self._send(_subject(events, self.monitor),
-                         _body(events, self.monitor),
-                         _short(events, self.monitor),
-                         critical=downs > 0)
+
+    def _drop_finished(self, channels: list[str]) -> None:
+        """Forget events every enabled channel has finished with."""
+        self.queue = [e for e in self.queue
+                      if any(ch not in e.done for ch in channels)]
 
     async def reminder(self, still_down: list[Host]) -> None:
         every = int(self.cfg.notify["repeat_min"])
@@ -169,24 +254,41 @@ class Notifier:
         if not self._within_cap():
             return
 
-        events = [
-            Event("DOWN", h.label, h.target, time.time(),
-                  fmt_duration(time.time() - h.down_since) if h.down_since else "")
-            for h in still_down
-        ]
-        if len(events) == 1:
-            subject = f'[CRITICAL] "{events[0].label}" STILL DOWN - {self.monitor}'
-        else:
-            subject = f"[CRITICAL] {len(events)} host(s) STILL DOWN - {self.monitor}"
-        body = _body(events, self.monitor) + (
-            f"\n\nStill not acknowledged. This repeats every {every} minute(s) "
-            "until someone acknowledges it."
-        )
-        parts = [f'"{e.label}" still down{(" " + e.down_for) if e.down_for else ""}'
-                 for e in events]
-        short = f'[{self.monitor}] {"; ".join(parts)} - {time.strftime("%H:%M:%S")}'
-        self.note(f"NOTIFY    : reminder - {len(events)} still down, un-acknowledged")
-        await self._send(subject, body, short[:300], critical=True)
+        sent_any = False
+        for ch in self.enabled_channels():
+            # A delayed channel is only reminded about outages it was actually
+            # told about. Without this, email at 60s would still get a "STILL
+            # DOWN" for a host whose original alert it never received.
+            hosts = [h for h in still_down
+                     if self.delay_of(ch) <= 0 or h.key in self._announced[ch]]
+            if not hosts:
+                continue
+            events = [
+                Event("DOWN", h.label, h.target, time.time(),
+                      fmt_duration(time.time() - h.down_since) if h.down_since else "",
+                      key=h.key, host=h)
+                for h in hosts
+            ]
+            if len(events) == 1:
+                subject = f'[CRITICAL] "{events[0].label}" STILL DOWN - {self.monitor}'
+            else:
+                subject = f"[CRITICAL] {len(events)} host(s) STILL DOWN - {self.monitor}"
+            body = _body(events, self.monitor) + (
+                f"\n\nStill not acknowledged. This repeats every {every} minute(s) "
+                "until someone acknowledges it."
+            )
+            parts = [f'"{e.label}" still down{(" " + e.down_for) if e.down_for else ""}'
+                     for e in events]
+            short = f'[{self.monitor}] {"; ".join(parts)} - {time.strftime("%H:%M:%S")}'
+            self.note(f"NOTIFY    : reminder to {ch} - {len(events)} still down, "
+                      "un-acknowledged")
+            await self._send(subject, body, short[:300], critical=True, channels=[ch])
+            sent_any = True
+
+        if not sent_any:
+            # Nothing went out, so do not consume the slot the cap just took.
+            if self.sent_times:
+                self.sent_times.pop()
 
     async def send_test(self) -> None:
         e = [Event("DOWN", "TEST-HOST", "0.0.0.0", time.time())]
@@ -197,14 +299,19 @@ class Notifier:
                          critical=True)
 
     # ---- channels ------------------------------------------------------
-    async def _send(self, subject: str, body: str, short: str, critical: bool) -> None:
+    async def _send(self, subject: str, body: str, short: str, critical: bool,
+                    channels: list[str] | None = None) -> None:
         n = self.cfg.notify
+        # None means every enabled channel, which is what a test message wants.
+        # flush() and reminder() name one channel at a time, because with
+        # per-channel delays they no longer all carry the same events.
+        want = set(CHANNELS if channels is None else channels)
         tasks = []
-        if n["email"]["enabled"]:
+        if "email" in want and n["email"]["enabled"]:
             tasks.append(asyncio.to_thread(self._send_email, subject, body))
-        if n["telegram"]["enabled"]:
+        if "telegram" in want and n["telegram"]["enabled"]:
             tasks.append(self._send_telegram(body))
-        if n["ntfy"]["enabled"]:
+        if "ntfy" in want and n["ntfy"]["enabled"]:
             tasks.append(self._send_ntfy(subject, body, critical))
         # one bad channel must not stop the others
         for res in await asyncio.gather(*tasks, return_exceptions=True):

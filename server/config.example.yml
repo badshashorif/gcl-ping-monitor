@@ -25,6 +25,14 @@ web:
   # dashboard already logged in; leave it blank and the tap goes nowhere.
   public_url: ""
 
+# The alarm is the red banner and the noise at the desk. This is how long a
+# host has to STAY down before it goes off. The table still shows the host down
+# immediately, and the phone channels below can still be told immediately - the
+# delay only holds back the interruption, so a link that blips for a few
+# seconds does not empty the room.
+alarm:
+  delay_seconds: 0       # 0 = alarm the moment a host is called DOWN
+
 notify:
   on_down: true
   on_recover: true
@@ -32,6 +40,14 @@ notify:
   max_per_hour: 20       # hard cap, so a flapping link cannot spam
   repeat_min: 5          # re-send while STILL down and un-acknowledged. 0 = once only
 
+  # Every channel has its own `delay_seconds`: how long a host must have been
+  # down before THAT channel is told. 0 = immediately.
+  #
+  # This is what separates a nudge from an escalation. Leave ntfy and Telegram
+  # at 0 so the on-call phone knows within seconds, and put a delay on email so
+  # the inbox only ever holds real outages. A host that comes back inside its
+  # window is never mailed about at all - and neither is its recovery, so you
+  # never get a "RECOVERED" for a "DOWN" that was never sent.
   email:
     enabled: false
     smtp_server: mail.example.com
@@ -40,10 +56,12 @@ notify:
     user: alerts@example.com
     sender: alerts@example.com
     to: noc@example.com
+    delay_seconds: 0
 
   telegram:
     enabled: false
     chat_id: ""          # group ids start with -100
+    delay_seconds: 0
 
   ntfy:
     enabled: false
@@ -52,6 +70,7 @@ notify:
     down_priority: 5     # 5 = urgent: rings through Do Not Disturb
     up_priority: 3       # a recovery at 5 would wake you at 3am to say all is well
     click_url: ""        # tapping the phone notification opens this
+    delay_seconds: 0
 
 # The host list. Editable from a browser at /hosts - saving there rewrites this
 # block and leaves every comment in this file alone.

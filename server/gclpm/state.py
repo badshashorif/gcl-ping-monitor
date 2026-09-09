@@ -78,12 +78,19 @@ class Monitor:
         self.paused = False
         self.last_check: float | None = None
         self.log: deque[str] = deque(maxlen=60)
+        # Seconds a host must stay down before the banner turns red and the
+        # desk hears about it. The DOWN state itself is unaffected - the table
+        # shows it immediately either way, and the phone channels can be told
+        # straight away. This only holds back the alarm.
+        self.alarm_delay: float = 0.0
 
     # ---- host list -----------------------------------------------------
-    def sync(self, specs: list[HostSpec], loss_window: int) -> list[str]:
+    def sync(self, specs: list[HostSpec], loss_window: int,
+             alarm_delay: float = 0.0) -> list[str]:
         """Apply a (re)loaded config without losing live state for hosts that
         are still present. Returns human-readable notes about what changed."""
         notes: list[str] = []
+        self.alarm_delay = max(0.0, float(alarm_delay))
         wanted = {s.key: s for s in specs}
 
         for key in list(self.hosts):
@@ -134,14 +141,27 @@ class Monitor:
     def unacked_down(self) -> list[Host]:
         return [h for h in self.active() if h.status == DOWN and not h.acked]
 
+    def alarming(self) -> list[Host]:
+        """Un-acknowledged downs that have lasted long enough to alarm.
+
+        Below `alarm_delay` a host is still DOWN, still red in the table, and
+        the phone channels may already have been told - it just does not yet
+        make noise. A blip that clears inside the window never alarms at all.
+        """
+        if self.alarm_delay <= 0:
+            return self.unacked_down()
+        cut = time.time() - self.alarm_delay
+        return [h for h in self.unacked_down()
+                if h.down_since is not None and h.down_since <= cut]
+
     @property
     def alarm_active(self) -> bool:
-        return bool(self.unacked_down())
+        return bool(self.alarming())
 
     @property
     def alarm_loud(self) -> bool:
         # the per-host switch decides noise and nothing else
-        return any(h.sound for h in self.unacked_down())
+        return any(h.sound for h in self.alarming())
 
     def acknowledge_all(self) -> int:
         n = 0

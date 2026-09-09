@@ -48,7 +48,7 @@ async def ping_loop(mon: Monitor, cfg_ref: dict, parts: dict) -> None:
                 # reads the monitor name and the read-only flag from it
                 if parts.get("s") is not None:
                     parts["s"].cfg = new
-                for note in mon.sync(new.hosts, new.loss_window):
+                for note in mon.sync(new.hosts, new.loss_window, new.alarm_delay):
                     mon.note(f"CONFIG    : {note}")
                 mon.note("CONFIG    : reloaded config.yml")
 
@@ -144,7 +144,7 @@ async def amain(args) -> int:
         return 2
 
     mon = Monitor()
-    for note in mon.sync(cfg.hosts, cfg.loss_window):
+    for note in mon.sync(cfg.hosts, cfg.loss_window, cfg.alarm_delay):
         log.info("config: %s", note)
 
     cfg_ref = {"cfg": cfg}
