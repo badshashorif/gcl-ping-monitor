@@ -95,7 +95,15 @@ class Monitor:
 
         for key in list(self.hosts):
             if key not in wanted:
-                notes.append(f"removed {self.hosts[key].label} [{self.hosts[key].target}]")
+                gone = self.hosts[key]
+                notes.append(f"removed {gone.label} [{gone.target}]")
+                # Mark it OFF before letting go. A delayed notification still
+                # holds a reference to this object, and nothing will ever
+                # update it again - so leaving it reading DOWN means email
+                # arrives a minute later about a host that is no longer
+                # monitored. Seen live on 9 Sep 2026: removed 14:32:09,
+                # mailed 14:32:57.
+                gone.status, gone.down_since, gone.acked = OFF, None, False
                 del self.hosts[key]
 
         for spec in specs:

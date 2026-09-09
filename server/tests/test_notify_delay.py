@@ -115,6 +115,29 @@ async def test_mail_gets_the_recovery_for_an_outage_it_was_told_about():
 
 
 @pytest.mark.asyncio
+async def test_a_host_deleted_inside_the_window_is_not_mailed_about():
+    """Caught live on 9 Sep 2026: removed at 14:32:09, mailed at 14:32:57.
+
+    A pending delayed alert keeps a reference to the Host, and once the host
+    leaves the config nothing updates that object again - so it read DOWN for
+    ever and the delay expired into a mail about a host nobody is watching.
+    """
+    mon, host, n, sent = make({"email": 60})
+    host.status, host.down_since = DOWN, time.time()
+    n.add("DOWN", host)
+    await n.flush()
+    assert channels_of(sent) == {"telegram", "ntfy"}
+
+    sent.clear()
+    mon.sync([], 100, 0)                     # the host is taken out of the config
+    age(n, 61)
+    await n.flush()
+
+    assert sent == [], "no mail about a host that is no longer monitored"
+    assert n.queue == []
+
+
+@pytest.mark.asyncio
 async def test_zero_delay_everywhere_behaves_exactly_as_before():
     mon, host, n, sent = make({})
     host.status, host.down_since = DOWN, time.time()
