@@ -192,6 +192,7 @@ async def amain(args) -> int:
     with contextlib.suppress(Exception):
         await asyncio.wait_for(notifier.flush(), timeout=20)
     await notifier.close()
+    pinger.close()
     await runner.cleanup()
     return 0
 
