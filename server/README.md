@@ -169,6 +169,28 @@ Three rules keep it from ever hiding anything:
   stays open. A hand-folded layer reopens on reload rather than surviving to
   hide a device from the next person.
 
+### A layer can choose its channels
+
+```yaml
+group_notify:
+  RETAIL_ACCESS_RTR: [telegram]   # the record, but no phone and no inbox
+  POP_RTR: []                     # dashboard only
+```
+
+Kit at the far end of somebody else's fibre will flap. That is worth a line in
+Telegram and not worth a phone ringing at 2am.
+
+This narrows the **interruption**, never the monitoring: a host in a muted
+layer is still pinged, still goes red, still has to be acknowledged, and still
+makes whatever noise its own `sound` flag says. Recoveries and `repeat_min`
+reminders follow the same policy, so no channel gets a "RECOVERED" or a "STILL
+DOWN" about an outage it was never told about, and a fully muted event costs
+no slot of `max_per_hour`.
+
+`[]` and "not listed" are opposites and both are meant: unlisted gets every
+enabled channel, `[]` gets none. The policy only ever narrows - it cannot
+switch a disabled channel on.
+
 A group a host names but `groups:` omits still gets a heading, at the bottom:
 a typo must be visible, not swallow the device. Hosts with no group land under
 `Ungrouped`, a reserved name no host can join.

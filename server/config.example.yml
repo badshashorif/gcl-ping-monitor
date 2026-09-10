@@ -129,6 +129,20 @@ groups:
   - ACCESS_RTR
   - POP_RTR
 
+# Which channels a layer may interrupt people through. A layer that is not
+# listed uses every enabled channel, as before.
+#
+# This narrows the INTERRUPTION, never the monitoring: a host here is still
+# pinged, still goes red, still has to be acknowledged, and still makes the
+# noise its own `sound` says it should. Kit at the far end of somebody else's
+# fibre will flap - worth a line in Telegram, not worth a phone ringing.
+#
+#   RETAIL_ACCESS_RTR: [telegram]   # the record, but no phone and no inbox
+#   POP_RTR: []                     # dashboard only - no channel at all
+#
+# `[]` and "not listed" are opposites, and both are meant.
+group_notify: {}
+
 # The host list. Editable from a browser at /hosts - saving there rewrites this
 # block and leaves every comment in this file alone.
 #
