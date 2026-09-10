@@ -156,8 +156,8 @@ def test_saving_an_empty_list_is_allowed_but_visible(cfg_file):
 def test_read_hosts_round_trips(cfg_file):
     rows = editor.read_hosts(cfg_file)
     assert rows == [
-        {"label": "RTR", "target": "10.0.0.1", "enabled": True, "sound": True},
-        {"label": "OLD", "target": "10.0.0.9", "enabled": False, "sound": True},
+        {"label": "RTR", "target": "10.0.0.1", "enabled": True, "sound": True, "group": ""},
+        {"label": "OLD", "target": "10.0.0.9", "enabled": False, "sound": True, "group": ""},
     ]
 
 
@@ -165,7 +165,7 @@ def test_read_hosts_understands_the_bare_string_shorthand(tmp_path):
     p = tmp_path / "config.yml"
     p.write_text("hosts:\n  - 8.8.8.8\n", encoding="utf-8")
     assert editor.read_hosts(p) == [
-        {"label": "8.8.8.8", "target": "8.8.8.8", "enabled": True, "sound": True}]
+        {"label": "8.8.8.8", "target": "8.8.8.8", "enabled": True, "sound": True, "group": ""}]
 
 
 # ---- over HTTP -----------------------------------------------------------
