@@ -10,14 +10,17 @@ fails if the two ever drift.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 from aiohttp import web
 
 from . import config as cfgmod
 from . import editor
+from .auth import ROLES, AuthError, Sessions, User, Users
 from .state import Monitor, fmt_duration
 
 log = logging.getLogger("gclpm.web")
@@ -57,14 +60,20 @@ DENIED = (
 
 
 class Server:
-    def __init__(self, monitor: Monitor, cfg, token: str, version: str, on_ack=None):
+    def __init__(self, monitor: Monitor, cfg, token: str, version: str,
+                 on_ack=None, users: Users | None = None):
         self.mon = monitor
         self.cfg = cfg
         self.token = token
         self.version = version
         self.on_ack = on_ack
+        self.users = users if users is not None else Users(None)
+        self.sessions = Sessions(cfg.web.get("session_hours", 12)
+                                 if hasattr(cfg, "web") else 12)
         self.page = (STATIC / "dashboard.html").read_text(encoding="utf-8")
         self.hosts_page = (STATIC / "hosts.html").read_text(encoding="utf-8")
+        self.login_page = (STATIC / "login.html").read_text(encoding="utf-8")
+        self.users_page = (STATIC / "users.html").read_text(encoding="utf-8")
         if self.can_edit:
             self.page = self.page.replace(EDIT_ANCHOR, EDIT_LINK + EDIT_ANCHOR, 1)
 
@@ -75,26 +84,60 @@ class Server:
         rather than pretending to save."""
         return bool(self.cfg.web.get("allow_edit", True)) and self.cfg.path is not None
 
+    @property
+    def link_role(self) -> str:
+        """What the shared notification link is worth.
+
+        Only consulted once real users exist. Until then the link is the only
+        lock there is, and demoting it would lock the operator out of their
+        own dashboard on the strength of an upgrade they did not ask for.
+        """
+        if not self.users.enabled:
+            return "admin"
+        role = str(self.cfg.web.get("link_role", "read")).strip().lower()
+        return role if role in ("read", "write", "admin") else "read"
+
     # ---- auth ----------------------------------------------------------
-    def _authorised(self, request: web.Request) -> bool:
-        if not self.token:
-            return True
+    def user_for(self, request: web.Request) -> User | None:
+        """Who is asking, or None. A session beats the shared link."""
+        self.users.reload()
+        who = self.sessions.user_of(request.cookies.get("gclpm_s", ""), self.users)
+        if who is not None:
+            return who
         got = (request.query.get("t")
                or request.headers.get("X-Token")
                or request.cookies.get("gclpm")
                or "")
-        return got == self.token
+        if self.token:
+            return User("link", self.link_role) if hmac.compare_digest(got, self.token) else None
+        # No token and no users: an unlocked monitor, which is what the tests
+        # and a first run on a private LAN look like.
+        return None if self.users.enabled else User("", "admin")
 
-    def _guard(self, handler):
+    def _guard(self, handler, need: str = "read"):
         async def wrapped(request: web.Request) -> web.StreamResponse:
-            if not self._authorised(request):
+            who = self.user_for(request)
+            if who is None:
+                wants_html = "text/html" in request.headers.get("Accept", "")
+                if wants_html and self.users.enabled:
+                    # come back to the page they actually wanted
+                    raise web.HTTPFound(
+                        "/login?next=" + quote(request.path, safe="/"))
                 return web.Response(status=401, text=DENIED,
                                     content_type="text/html", charset="utf-8")
+            if not who.can(need):
+                # 403, not 401: signing in again will not help, and saying so
+                # is kinder than a login form that rejects a correct password.
+                return web.json_response(
+                    {"ok": False,
+                     "error": f"your account is {who.role}; this needs {need}"},
+                    status=403)
+            request["who"] = who
             return await handler(request)
         return wrapped
 
     # ---- the contract --------------------------------------------------
-    def snapshot(self) -> dict:
+    def snapshot(self, who: User | None = None) -> dict:
         now = time.time()
         hosts = []
         for h in self.mon.all():
@@ -120,7 +163,16 @@ class Server:
             "time": time.strftime("%H:%M:%S"),
             "checked": time.strftime("%H:%M:%S", time.localtime(self.mon.last_check)) if self.mon.last_check else "",
             "paused": self.mon.paused,
-            "canAck": bool(self.cfg.web["allow_ack"]),
+            # What THIS caller may do, so the page can hide a button rather
+            # than offer one that will 403. The server checks again anyway -
+            # a hidden button is a courtesy, never a control.
+            "canAck": bool(self.cfg.web["allow_ack"]) and (who is None or who.can("write")),
+            "canEdit": self.can_edit and (who is None or who.can("write")),
+            "you": {
+                "name": who.name if who else "",
+                "role": who.role if who else "admin",
+                "auth": self.users.enabled,
+            },
             "alarm": {
                 "active": self.mon.alarm_active,
                 "loud": self.mon.alarm_loud,
@@ -179,16 +231,111 @@ class Server:
         return resp
 
     async def h_status(self, request: web.Request) -> web.StreamResponse:
-        resp = web.json_response(self.snapshot())
+        resp = web.json_response(self.snapshot(request.get("who")))
         resp.headers["Cache-Control"] = "no-store"
         return resp
+
+    # ---- signing in ----------------------------------------------------
+    def _set_session(self, resp: web.StreamResponse, token: str) -> None:
+        resp.set_cookie("gclpm_s", token, max_age=int(self.sessions.ttl),
+                        httponly=True, samesite="Lax", path="/",
+                        secure=bool(self.cfg.web.get("https_only", False)))
+
+    async def h_login_page(self, request: web.Request) -> web.StreamResponse:
+        resp = web.Response(text=self.login_page, content_type="text/html",
+                            charset="utf-8")
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
+
+    async def h_login(self, request: web.Request) -> web.StreamResponse:
+        if not self.users.enabled:
+            return web.json_response(
+                {"ok": False, "error": "no users are configured on this monitor"},
+                status=400)
+        try:
+            body = await request.json()
+        except Exception:                                    # noqa: BLE001
+            return web.json_response({"ok": False, "error": "malformed request"},
+                                     status=400)
+        try:
+            who = self.users.check(body.get("username"), body.get("password"))
+        except AuthError as exc:
+            # One message for a bad name and a bad password, and the same
+            # delay, so the form cannot be used to enumerate accounts.
+            return web.json_response({"ok": False, "error": str(exc)}, status=401)
+
+        resp = web.json_response({"ok": True, "you": who.public()})
+        self._set_session(resp, self.sessions.new(who))
+        self.mon.note(f"LOGIN     : {who.name} signed in ({who.role})")
+        return resp
+
+    async def h_logout(self, request: web.Request) -> web.StreamResponse:
+        self.sessions.drop(request.cookies.get("gclpm_s", ""))
+        resp = web.json_response({"ok": True})
+        resp.del_cookie("gclpm_s", path="/")
+        # The shared link would otherwise sign them straight back in, which
+        # is not what anybody means by "log out".
+        resp.del_cookie("gclpm", path="/")
+        return resp
+
+    async def h_me(self, request: web.Request) -> web.StreamResponse:
+        who = request["who"]
+        return web.json_response({"ok": True, "you": who.public(),
+                                  "auth": self.users.enabled,
+                                  "canEdit": self.can_edit})
+
+    # ---- the user list (admin only) ------------------------------------
+    async def h_users_page(self, request: web.Request) -> web.StreamResponse:
+        resp = web.Response(text=self.users_page, content_type="text/html",
+                            charset="utf-8")
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
+
+    async def h_users_get(self, request: web.Request) -> web.StreamResponse:
+        return web.json_response({"ok": True, "users": self.users.list(),
+                                  "roles": list(ROLES)})
+
+    async def h_users_post(self, request: web.Request) -> web.StreamResponse:
+        try:
+            body = await request.json()
+        except Exception:                                    # noqa: BLE001
+            return web.json_response({"ok": False, "error": "malformed request"},
+                                     status=400)
+        actor = request["who"]
+        action = str(body.get("action", "save"))
+        try:
+            if action == "remove":
+                name = str(body.get("name", "")).strip().lower()
+                if name == actor.name:
+                    raise AuthError("you cannot remove the account you are using")
+                self.users.remove(name, actor=actor.name)
+                self.sessions.drop_user(name)
+            else:
+                user = self.users.upsert(body.get("name"), body.get("role"),
+                                         body.get("password"), actor=actor.name)
+                # A demotion or a new password must not leave an old session
+                # running at the old level.
+                if user.name != actor.name:
+                    self.sessions.drop_user(user.name)
+        except AuthError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except Exception as exc:                             # noqa: BLE001
+            log.exception("saving the user list failed")
+            return web.json_response({"ok": False, "error": f"could not save: {exc}"},
+                                     status=500)
+        self.mon.note(f"USERS     : {action} by {actor.name}")
+        return web.json_response({"ok": True, "users": self.users.list()})
 
     async def h_ack(self, request: web.Request) -> web.StreamResponse:
         if not self.cfg.web["allow_ack"]:
             return web.json_response({"ok": False, "error": "read-only"}, status=403)
         n = self.mon.acknowledge_all()
         if n:
-            self.mon.note(f"ACK       : {n} host(s) acknowledged from a browser")
+            who = request.get("who")
+            by = f" by {who.name}" if who and who.name else ""
+            self.mon.note(f"ACK       : {n} host(s) acknowledged from a browser{by}")
             if self.on_ack:
                 self.on_ack()
         return web.json_response({"ok": True, "acknowledged": n})
@@ -282,17 +429,31 @@ class Server:
     def build(self) -> web.Application:
         app = web.Application()
         app.add_routes([
+            # read: looking at it
             web.get("/", self._guard(self.h_index)),
             web.get("/api/status", self._guard(self.h_status)),
-            web.post("/api/ack", self._guard(self.h_ack)),
-            web.post("/api/pause", self._guard(self.h_pause)),
-            web.post("/api/resume", self._guard(self.h_resume)),
-            web.get("/hosts", self._guard(self.h_hosts_page)),
-            web.get("/api/hosts", self._guard(self.h_hosts_get)),
-            web.post("/api/hosts", self._guard(self.h_hosts_post)),
+            web.get("/api/me", self._guard(self.h_me)),
             web.get("/manifest.webmanifest", self._guard(self.h_manifest)),
             web.get("/icon.svg", self._guard(self.h_icon)),
             web.get("/sw.js", self._guard(self.h_sw)),
+
+            # write: changing what is monitored, or silencing it
+            web.post("/api/ack", self._guard(self.h_ack, "write")),
+            web.post("/api/pause", self._guard(self.h_pause, "write")),
+            web.post("/api/resume", self._guard(self.h_resume, "write")),
+            web.get("/hosts", self._guard(self.h_hosts_page, "write")),
+            web.get("/api/hosts", self._guard(self.h_hosts_get, "write")),
+            web.post("/api/hosts", self._guard(self.h_hosts_post, "write")),
+
+            # admin: who else gets in
+            web.get("/users", self._guard(self.h_users_page, "admin")),
+            web.get("/api/users", self._guard(self.h_users_get, "admin")),
+            web.post("/api/users", self._guard(self.h_users_post, "admin")),
+
+            # open on purpose: the way in, and the way a watchdog checks
+            web.get("/login", self.h_login_page),
+            web.post("/api/login", self.h_login),
+            web.post("/api/logout", self.h_logout),
             web.get("/healthz", self.h_health),
         ])
         return app

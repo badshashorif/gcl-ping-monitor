@@ -84,6 +84,16 @@ select.grp.none{color:var(--dim)}
 #msg.busy{color:var(--dim)}
 .dirty #save{background:var(--warn);border-color:var(--warn);color:#111}
 .note{color:var(--dim);font-size:12px;margin:14px 2px 0;line-height:1.6}
+.note.top{margin:0 2px 10px}
+h2.sec{font-size:13px;letter-spacing:.6px;text-transform:uppercase;color:var(--dim);
+       margin:22px 2px 8px}
+.layer{
+  background:var(--card);border:1px solid var(--line);border-radius:12px;
+  padding:8px 10px;margin-bottom:6px;display:flex;gap:8px;align-items:center;
+}
+.layer input{flex:1;font-family:ui-monospace,Consolas,monospace;font-size:13px}
+.layer .ord{padding:7px 11px;line-height:1;font-size:13px}
+.layer .count{color:var(--dim);font-size:12px;white-space:nowrap}
 .empty{color:var(--dim);text-align:center;padding:26px 10px;border:1px dashed var(--line);border-radius:12px}
 </style>
 </head>
@@ -97,6 +107,15 @@ select.grp.none{color:var(--dim)}
     <a href="/">&larr; back to the dashboard</a>
   </p>
 
+  <h2 class="sec">Layers</h2>
+  <p class="note top">
+    The order here is the order the dashboard draws them: upstream at the top,
+    the edge at the bottom.
+  </p>
+  <div id="layers"></div>
+  <button id="addg" class="ghost">+ Add layer</button>
+
+  <h2 class="sec">Hosts</h2>
   <div id="list"></div>
 
   <p class="note">
@@ -105,9 +124,9 @@ select.grp.none{color:var(--dim)}
     <b>Alarm</b> off means no <i>noise</i>. The host still goes red, still needs an
     acknowledgement, and still sends its notifications.<br>
     <b>Group</b> is the layer of the network the device sits on, and only decides
-    where its row is drawn - never what is pinged or who is told. The
-    <i>order</i> of the layers is the hierarchy the dashboard follows; it comes
-    from <code>groups:</code> in config.yml, so re-ordering them is an edit there.
+    where its row is drawn - never what is pinged, when it alarms, or who is
+    told. Renaming a layer carries its hosts with it; removing one hands them
+    back to Ungrouped, still monitored.
   </p>
 </div>
 
@@ -166,9 +185,8 @@ function esc(s) {
     .replace(/"/g, "&quot;");
 }
 
-/* The group a host belongs to. The list is the hierarchy the dashboard draws,
-   so its ORDER matters and is edited in config.yml - this picker only says
-   which layer a device is on, and can add a layer that is missing. */
+/* Which layer this one device is on. The order of the layers - the hierarchy
+   itself - is edited in the Layers panel above. */
 function groupPicker(current) {
   var html = '<select class="grp' + (current ? "" : " none") + '" data-f="group">' +
              '<option value=""' + (current ? "" : " selected") + '>no group</option>';
@@ -180,6 +198,109 @@ function groupPicker(current) {
   }
   return html + '<option value="__new__">+ new group...</option></select>';
 }
+
+/* ---- the layers -------------------------------------------------------
+   Order is the hierarchy, so it is editable here rather than being something
+   you have to open config.yml over SSH to change.
+
+   Renaming carries the hosts with it and removing hands them back to "no
+   group". Neither may quietly orphan a device: a host that lost its layer
+   still gets pinged, still alarms, and shows up under Ungrouped where
+   somebody will notice it. */
+var layersEl = document.getElementById("layers");
+
+function usedBy(name) {
+  var n = 0;
+  for (var i = 0; i < rows.length; i++) { if (rows[i].group === name) { n++; } }
+  return n;
+}
+
+function renderLayers() {
+  if (!groups.length) {
+    layersEl.innerHTML = '<div class="empty">No layers yet. Every host will ' +
+                         "sit under Ungrouped.</div>";
+    return;
+  }
+  var html = "";
+  for (var i = 0; i < groups.length; i++) {
+    var n = usedBy(groups[i]);
+    html +=
+      '<div class="layer" data-g="' + i + '">' +
+        '<button class="ord" data-gact="up" title="Move up"' +
+          (i === 0 ? " disabled" : "") + ">&#9650;</button>" +
+        '<button class="ord" data-gact="down" title="Move down"' +
+          (i === groups.length - 1 ? " disabled" : "") + ">&#9660;</button>" +
+        '<input type="text" data-gact="name" value="' + esc(groups[i]) +
+          '" maxlength="40" autocomplete="off" spellcheck="false">' +
+        '<span class="count">' + n + (n === 1 ? " host" : " hosts") + "</span>" +
+        '<button class="del" data-gact="del">Remove</button>' +
+      "</div>";
+  }
+  layersEl.innerHTML = html;
+}
+
+function layerIndex(e) {
+  var card = e.target.closest ? e.target.closest(".layer") : null;
+  return card ? parseInt(card.getAttribute("data-g"), 10) : -1;
+}
+
+layersEl.addEventListener("click", function (e) {
+  var act = e.target.getAttribute && e.target.getAttribute("data-gact");
+  if (!act || act === "name") { return; }
+  var i = layerIndex(e);
+  if (i < 0) { return; }
+
+  if (act === "up" || act === "down") {
+    var j = act === "up" ? i - 1 : i + 1;
+    if (j < 0 || j >= groups.length) { return; }
+    var t = groups[i]; groups[i] = groups[j]; groups[j] = t;
+  } else if (act === "del") {
+    var n = usedBy(groups[i]);
+    if (n && !confirm(groups[i] + " has " + n + " host" + (n === 1 ? "" : "s") +
+                      ". They stay monitored and move to Ungrouped. Remove the layer?")) {
+      return;
+    }
+    for (var k = 0; k < rows.length; k++) {
+      if (rows[k].group === groups[i]) { rows[k].group = ""; }
+    }
+    groups.splice(i, 1);
+  }
+  markDirty();
+  renderAll();
+});
+
+/* Renaming on every keystroke would leave the hosts pointing at half-typed
+   names, so the rows are carried across on blur instead. */
+layersEl.addEventListener("change", function (e) {
+  if (e.target.getAttribute("data-gact") !== "name") { return; }
+  var i = layerIndex(e);
+  if (i < 0) { return; }
+  var was = groups[i];
+  var now = e.target.value.trim();
+  if (!now || now === was) { e.target.value = was; return; }
+  if (groups.indexOf(now) >= 0) {
+    say(now + " already exists", "err");
+    e.target.value = was;
+    return;
+  }
+  groups[i] = now;
+  for (var k = 0; k < rows.length; k++) {
+    if (rows[k].group === was) { rows[k].group = now; }
+  }
+  markDirty();
+  renderAll();
+});
+
+document.getElementById("addg").onclick = function () {
+  var name = (prompt("New layer name:") || "").trim();
+  if (!name) { return; }
+  if (groups.indexOf(name) >= 0) { say(name + " already exists", "err"); return; }
+  groups.push(name);
+  markDirty();
+  renderAll();
+};
+
+function renderAll() { renderLayers(); render(); }
 
 function render() {
   if (!rows.length) {
@@ -237,7 +358,7 @@ listEl.addEventListener("change", function (e) {
   }
   rows[i].group = value;
   markDirty();
-  render();
+  renderAll();
 });
 
 listEl.addEventListener("click", function (e) {
@@ -253,7 +374,7 @@ listEl.addEventListener("click", function (e) {
     rows[i][act] = !rows[i][act];
   }
   markDirty();
-  render();
+  renderAll();
 });
 
 document.getElementById("add").onclick = function () {
@@ -262,7 +383,7 @@ document.getElementById("add").onclick = function () {
   var last = rows.length ? rows[rows.length - 1].group : "";
   rows.push({ label: "", target: "", enabled: true, sound: true, group: last || "" });
   markDirty();
-  render();
+  renderAll();
   var inputs = listEl.querySelectorAll(".lbl");
   if (inputs.length) { inputs[inputs.length - 1].focus(); }
 };
@@ -274,7 +395,7 @@ function load(quiet) {
     groups = j.groups || [];
     dirty = false;
     document.body.classList.remove("dirty");
-    render();
+    renderAll();
     say("");
   }).catch(function (err) {
     if (String(err.message) === "401") {
@@ -302,7 +423,7 @@ saveEl.onclick = function () {
     groups = j.groups || groups;
     dirty = false;
     document.body.classList.remove("dirty");
-    render();
+    renderAll();
     say("Saved. " + (j.hosts ? j.hosts.length : 0) + " host(s) - the monitor is picking it up now.", "ok");
   }).catch(function (err) {
     // the server names the row and says what is wrong with it; mark it too

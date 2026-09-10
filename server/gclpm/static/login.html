@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>Sign in - GCL Ping Monitor</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<style>
+:root{
+  --bg:#0f1115; --card:#171a21; --line:#252a34; --fg:#e6e9ef; --dim:#8b93a3;
+  --down:#ef4444; --accent:#3b82f6;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;height:100%}
+body{
+  background:var(--bg); color:var(--fg);
+  font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;
+  display:flex; align-items:center; justify-content:center;
+  padding:24px env(safe-area-inset-right) 24px env(safe-area-inset-left);
+  -webkit-text-size-adjust:100%;
+}
+form{
+  background:var(--card); border:1px solid var(--line); border-radius:14px;
+  padding:22px 20px; width:100%; max-width:340px;
+}
+h1{font-size:17px;margin:0 0 2px;letter-spacing:.3px}
+p.sub{color:var(--dim);font-size:13px;margin:0 0 18px}
+label{display:block;font-size:12px;color:var(--dim);margin:12px 0 5px;letter-spacing:.3px}
+input{
+  font:inherit;width:100%;color:var(--fg);background:#0f1218;
+  border:1px solid var(--line);border-radius:9px;padding:11px 12px;
+}
+input:focus{outline:none;border-color:var(--accent)}
+button{
+  font:inherit;font-weight:600;width:100%;margin-top:18px;
+  color:#fff;background:var(--accent);border:1px solid var(--accent);
+  border-radius:9px;padding:12px 14px;cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+}
+button:active{transform:translateY(1px)}
+button[disabled]{opacity:.5;cursor:default}
+#msg{font-size:13px;margin-top:14px;min-height:18px;color:#fca5a5}
+#msg.busy{color:var(--dim)}
+.foot{color:var(--dim);font-size:11px;margin-top:16px;line-height:1.6}
+</style>
+</head>
+<body>
+<form id="f" autocomplete="on">
+  <h1>GCL Ping Monitor</h1>
+  <p class="sub">Sign in to continue</p>
+
+  <label for="u">Username</label>
+  <input id="u" name="username" autocomplete="username" autocapitalize="none"
+         autocorrect="off" spellcheck="false" required>
+
+  <label for="p">Password</label>
+  <input id="p" name="password" type="password" autocomplete="current-password" required>
+
+  <button id="go" type="submit">Sign in</button>
+  <div id="msg"></div>
+  <p class="foot">
+    Alerts still link straight to the dashboard. What that link is worth is set
+    by <code>web.link_role</code>, and it is read-only unless someone changed it.
+  </p>
+</form>
+
+<script>
+"use strict";
+var msg = document.getElementById("msg");
+var go = document.getElementById("go");
+
+/* A login page reached because a session expired should return you to where
+   you were, not dump you on the dashboard root. Same-origin paths only - an
+   open redirect on a login form is how a phishing link gets its polish. */
+function nextPath() {
+  var m = /[?&]next=([^&]*)/.exec(location.search);
+  var raw = m ? decodeURIComponent(m[1]) : "/";
+  return (raw.charAt(0) === "/" && raw.charAt(1) !== "/") ? raw : "/";
+}
+
+document.getElementById("f").onsubmit = function (e) {
+  e.preventDefault();
+  go.disabled = true;
+  msg.className = "busy";
+  msg.textContent = "signing in...";
+
+  fetch("/api/login", {
+    method: "POST",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: document.getElementById("u").value,
+      password: document.getElementById("p").value
+    })
+  }).then(function (r) {
+    return r.json().catch(function () { return {}; }).then(function (j) {
+      if (!r.ok || !j.ok) { throw new Error(j.error || ("HTTP " + r.status)); }
+      return j;
+    });
+  }).then(function () {
+    /* replace, not assign: the back button must not land on a stale form */
+    location.replace(nextPath());
+  }).catch(function (err) {
+    msg.className = "";
+    msg.textContent = err.message;
+    document.getElementById("p").value = "";
+    document.getElementById("p").focus();
+    go.disabled = false;
+  });
+};
+
+document.getElementById("u").focus();
+</script>
+</body>
+</html>

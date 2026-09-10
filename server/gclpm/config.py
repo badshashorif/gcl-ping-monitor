@@ -45,6 +45,22 @@ DEFAULTS: dict[str, Any] = {
         # what is monitored - which is what you want once the dashboard link has
         # been handed to people who should only be looking at it.
         "allow_edit": True,
+
+        # ---- accounts (config/users.yml) --------------------------------
+        # With no users.yml there are no accounts and the link token is the
+        # only lock, exactly as before. Once a user exists, a password is
+        # required - and these three start to matter.
+        #
+        # What the shared notification link is worth once accounts exist. It
+        # has to keep working: tapping an ntfy alert at 3am must land on the
+        # dashboard, not a login form. `read` lets whoever is holding the
+        # phone see what woke them without being able to change the estate.
+        "link_role": "read",
+        "session_hours": 12,
+        # Set true behind TLS (which Caddy gives you) so the session cookie
+        # is never sent in clear. Left false by default because a monitor
+        # first reached over plain http on a LAN would otherwise never log in.
+        "https_only": False,
     },
     # How long a host must stay down before the alarm goes off - the red banner
     # and the noise. 0 = the moment it is called DOWN. Raising it lets a link
@@ -225,6 +241,12 @@ class Config:
             seen.add(spec.key)
             out.append(spec)
         return out
+
+    @property
+    def users_path(self) -> Path | None:
+        """users.yml sits beside config.yml, in the mounted config directory -
+        gitignored, never in the image, and 600 on disk."""
+        return self.path.parent / "users.yml" if self.path else None
 
     @property
     def dashboard_url(self) -> str:

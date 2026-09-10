@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import getpass
 import logging
 import os
 import signal
@@ -15,6 +16,7 @@ import time
 from aiohttp import web as aioweb
 
 from . import config as cfgmod
+from .auth import ROLES, AuthError, Users
 from .notify import Notifier
 from .pinger import Pinger
 from .state import Monitor
@@ -153,8 +155,13 @@ async def amain(args) -> int:
     parts = {"n": notifier, "p": pinger}
 
     token = build_token(cfg)
+    users = Users(cfg.users_path)
+    if users.enabled:
+        log.info("accounts are on: %d user(s), the shared link is worth '%s'",
+                 len(users.users), cfg.web.get("link_role", "read"))
     server = Server(mon, cfg, token, VERSION,
-                    on_ack=lambda: setattr(notifier, "last_sent", None))
+                    on_ack=lambda: setattr(notifier, "last_sent", None),
+                    users=users)
     parts["s"] = server
     app = server.build()
 
@@ -197,6 +204,43 @@ async def amain(args) -> int:
     return 0
 
 
+def add_user(args) -> int:
+    """Create the first admin, or reset a password, from a shell.
+
+    The way in when there is no way in: before any account exists there is
+    nobody who can open the Users page, and after a forgotten password there
+    is nobody who can reset it.
+    """
+    try:
+        cfg = cfgmod.load(args.config)
+    except Exception as exc:                           # noqa: BLE001
+        print(f"cannot read {args.config}: {exc}", file=sys.stderr)
+        return 2
+    if cfg.users_path is None:
+        print("this monitor has no config directory to store users in", file=sys.stderr)
+        return 2
+
+    password = getpass.getpass(f"password for {args.add_user}: ")
+    if password != getpass.getpass("again: "):
+        print("they do not match", file=sys.stderr)
+        return 2
+
+    users = Users(cfg.users_path)
+    try:
+        user = users.upsert(args.add_user, args.role, password, actor="cli")
+    except AuthError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    existing = len(users.users)
+    print(f"{user.name} is now {user.role}. {existing} user(s) in "
+          f"{cfg.users_path}.")
+    if existing == 1:
+        print("Accounts are now ON: the dashboard asks for a password, and the "
+              "shared notification link is worth "
+              f"'{cfg.web.get('link_role', 'read')}'.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="gclpm", description="GCL Ping Monitor server")
     ap.add_argument("-c", "--config", default=os.environ.get("GCLPM_CONFIG", "/config/config.yml"))
@@ -206,7 +250,15 @@ def main() -> int:
                          "ping_group_range sysctl.")
     ap.add_argument("--test-notify", action="store_true",
                     help="send one test message to every enabled channel at startup")
+    ap.add_argument("--add-user", metavar="NAME",
+                    help="create or update an account, then exit. The password "
+                         "is read from the terminal, never from the command "
+                         "line - argv is visible to anyone who can run ps.")
+    ap.add_argument("--role", default="admin", choices=list(ROLES),
+                    help="the role for --add-user (default: admin)")
     args = ap.parse_args()
+    if args.add_user:
+        return add_user(args)
     try:
         return asyncio.run(amain(args))
     except KeyboardInterrupt:

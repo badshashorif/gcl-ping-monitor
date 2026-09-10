@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>Users - GCL Ping Monitor</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<style>
+:root{
+  --bg:#0f1115; --card:#171a21; --line:#252a34; --fg:#e6e9ef; --dim:#8b93a3;
+  --up:#22c55e; --down:#ef4444; --warn:#f59e0b; --accent:#3b82f6;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--fg);
+  font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  -webkit-text-size-adjust:100%;
+}
+.wrap{max-width:820px;margin:0 auto;padding:10px 10px 40px}
+h1{font-size:19px;margin:6px 2px 2px}
+h2{font-size:14px;margin:26px 2px 8px;color:var(--dim);letter-spacing:.5px;text-transform:uppercase}
+p.lead{color:var(--dim);font-size:13px;margin:0 2px 14px}
+a{color:var(--accent)}
+code{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+
+button{
+  font:inherit;font-weight:600;color:var(--fg);background:var(--card);
+  border:1px solid var(--line);border-radius:9px;padding:9px 13px;cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+}
+button:active{transform:translateY(1px)}
+button[disabled]{opacity:.4;cursor:default}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.del{border-color:#4a2020;color:#f88;background:none}
+
+.card{
+  background:var(--card);border:1px solid var(--line);border-radius:12px;
+  padding:11px 13px;margin-bottom:8px;display:flex;gap:10px;
+  align-items:center;flex-wrap:wrap;
+}
+.who{font-weight:700;min-width:120px}
+.me{font-size:11px;font-weight:700;color:#7ef0a6;background:#10331d;
+    border-radius:99px;padding:2px 8px;margin-left:6px}
+.grow{flex:1}
+input,select{
+  font:inherit;color:var(--fg);background:#0f1218;
+  border:1px solid var(--line);border-radius:9px;padding:9px 11px;
+}
+input:focus,select:focus{outline:none;border-color:var(--accent)}
+input{min-width:0}
+.new{display:grid;gap:8px;grid-template-columns:1fr 1fr 130px auto;align-items:center}
+@media (max-width:620px){
+  .new{grid-template-columns:1fr}
+  .card .grow{flex-basis:100%}
+}
+#msg{font-size:13px;margin:12px 2px;min-height:18px}
+#msg.ok{color:#6ee7a0}
+#msg.err{color:#fca5a5}
+#msg.busy{color:var(--dim)}
+.roles{color:var(--dim);font-size:12px;line-height:1.8;margin:10px 2px 0}
+.roles b{color:var(--fg)}
+.warn{background:#3a2a08;border:1px solid #a16207;color:#fbbf24;border-radius:10px;
+      padding:9px 12px;font-size:12.5px;margin:14px 2px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Users</h1>
+  <p class="lead">
+    Who can open this monitor, and what they may do.
+    <a href="/">&larr; back to the dashboard</a>
+  </p>
+
+  <div id="list"></div>
+
+  <h2>Add someone</h2>
+  <div class="new">
+    <input id="nname" placeholder="username" autocomplete="off" autocapitalize="none"
+           autocorrect="off" spellcheck="false">
+    <input id="npass" type="password" placeholder="password" autocomplete="new-password">
+    <select id="nrole"></select>
+    <button id="add" class="primary">Add</button>
+  </div>
+
+  <div id="msg"></div>
+
+  <p class="roles">
+    <b>read</b> - look at the dashboard, and nothing else.<br>
+    <b>write</b> - acknowledge an alarm, and change what is monitored: hosts and groups.<br>
+    <b>admin</b> - all of that, and this page.
+  </p>
+
+  <div class="warn" id="linknote"></div>
+</div>
+
+<script>
+"use strict";
+var listEl = document.getElementById("list");
+var msgEl = document.getElementById("msg");
+var users = [], roles = ["read", "write", "admin"], me = "";
+
+function api(path, opts) {
+  opts = opts || {};
+  opts.cache = "no-store";
+  return fetch(path, opts).then(function (r) {
+    return r.json().catch(function () { return {}; }).then(function (j) {
+      if (!r.ok || j.ok === false) { throw new Error(j.error || ("HTTP " + r.status)); }
+      return j;
+    });
+  });
+}
+
+function post(body) {
+  return api("/api/users", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+}
+
+function say(text, cls) {
+  msgEl.textContent = text || "";
+  msgEl.className = cls || "";
+}
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function roleOptions(current) {
+  var out = "";
+  for (var i = 0; i < roles.length; i++) {
+    out += '<option value="' + esc(roles[i]) + '"' +
+           (roles[i] === current ? " selected" : "") + ">" + esc(roles[i]) + "</option>";
+  }
+  return out;
+}
+
+function render() {
+  var html = "";
+  for (var i = 0; i < users.length; i++) {
+    var u = users[i];
+    html +=
+      '<div class="card" data-n="' + esc(u.name) + '">' +
+        '<span class="who">' + esc(u.name) +
+          (u.name === me ? '<span class="me">you</span>' : "") + "</span>" +
+        '<select data-act="role">' + roleOptions(u.role) + "</select>" +
+        '<input type="password" data-act="pass" placeholder="set a new password" ' +
+          'autocomplete="new-password">' +
+        '<span class="grow"></span>' +
+        '<button data-act="save">Save</button>' +
+        (u.name === me ? "" : '<button class="del" data-act="remove">Remove</button>') +
+      "</div>";
+  }
+  listEl.innerHTML = html || '<div class="card">No users yet.</div>';
+}
+
+listEl.addEventListener("click", function (e) {
+  var act = e.target.getAttribute && e.target.getAttribute("data-act");
+  if (act !== "save" && act !== "remove") { return; }
+  var card = e.target.closest(".card");
+  var name = card.getAttribute("data-n");
+
+  if (act === "remove") {
+    /* removing the wrong account locks a colleague out at 3am */
+    if (!confirm("Remove " + name + "? They will be signed out immediately.")) { return; }
+    say("removing...", "busy");
+    post({ action: "remove", name: name })
+      .then(done("Removed " + name + "."))
+      .catch(fail);
+    return;
+  }
+
+  var body = { name: name, role: card.querySelector('[data-act="role"]').value };
+  var pass = card.querySelector('[data-act="pass"]').value;
+  if (pass) { body.password = pass; }
+  say("saving...", "busy");
+  post(body).then(done("Saved " + name + ".")).catch(fail);
+});
+
+document.getElementById("add").onclick = function () {
+  var name = document.getElementById("nname").value.trim();
+  var pass = document.getElementById("npass").value;
+  if (!name || !pass) { say("a new user needs a name and a password", "err"); return; }
+  say("adding...", "busy");
+  post({ name: name, role: document.getElementById("nrole").value, password: pass })
+    .then(function (j) {
+      document.getElementById("nname").value = "";
+      document.getElementById("npass").value = "";
+      return done("Added " + name + ".")(j);
+    })
+    .catch(fail);
+};
+
+function done(text) {
+  return function (j) {
+    users = j.users || users;
+    render();
+    say(text, "ok");
+  };
+}
+
+function fail(err) { say(err.message, "err"); }
+
+Promise.all([api("/api/me"), api("/api/users")]).then(function (r) {
+  me = (r[0].you || {}).name || "";
+  users = r[1].users || [];
+  roles = r[1].roles || roles;
+  document.getElementById("nrole").innerHTML = roleOptions("read");
+  render();
+  document.getElementById("linknote").textContent =
+    "The notification link is a separate way in and is not a user. Set what " +
+    "it is worth with web.link_role in config.yml - it is read-only unless " +
+    "somebody changed it.";
+}).catch(function (err) {
+  say("Could not load: " + err.message, "err");
+});
+</script>
+</body>
+</html>

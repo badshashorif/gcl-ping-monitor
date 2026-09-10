@@ -200,6 +200,7 @@ footer{color:var(--dim);font-size:12px;margin:12px 2px 24px;display:flex;flex-wr
   <div id="log"></div>
   <footer>
     <span id="fmon"></span><span id="fver"></span><span id="fchk"></span>
+    <span class="spacer"></span><span id="fwho"></span>
   </footer>
 </div>
 
@@ -583,6 +584,36 @@ inQ.onkeydown = function (e) {
 };
 paintSort();
 
+/* ---- who is looking ----------------------------------------------------
+   Everything here is a courtesy: hiding a control the server would refuse
+   anyway. The server checks the role again on every request, so a hidden
+   button is never the thing keeping anybody out.
+
+   `you` is absent when the Windows engine is answering - it has no accounts -
+   so the footer simply stays empty rather than claiming anything. */
+function paintWho() {
+  var el = document.getElementById("fwho");
+  var edit = document.querySelector('footer a[href="/hosts"]');
+  if (edit) { edit.hidden = S.canEdit === false; }
+
+  var you = S.you;
+  if (!you || !you.auth) { el.textContent = ""; return; }
+  var out = esc(you.name || "link") + " (" + esc(you.role) + ")";
+  if (you.role === "admin") { out += ' &middot; <a href="/users">Users</a>'; }
+  if (you.name) { out += ' &middot; <a href="#" id="out">Sign out</a>'; }
+  el.innerHTML = out;
+
+  var b = document.getElementById("out");
+  if (b) {
+    b.onclick = function (e) {
+      e.preventDefault();
+      api("/api/logout", { method: "POST" })
+        .catch(function () {})
+        .then(function () { location.replace("/login"); });
+    };
+  }
+}
+
 function rowHtml(h) {
   var cls = (h.status === "DOWN" ? "down" : "") + (h.acked ? " acked" : "");
   return '<tr class="' + cls + '">' +
@@ -705,6 +736,7 @@ function render(tick) {
   document.getElementById("fmon").textContent = S.monitor;
   document.getElementById("fver").textContent = "v:" + S.version;
   document.getElementById("fchk").textContent = S.checked ? "last check " + S.checked : "";
+  paintWho();
   document.title = (downs.length ? "(" + downs.length + " DOWN) " : "") + "GCL Ping Monitor";
 }
 
@@ -733,6 +765,14 @@ function poll() {
          "no connection" - and on a monitoring screen that is the difference
          between "fix your link" and "go and look at the rack". */
       if (String(e && e.message) === "401") {
+        /* If this monitor has accounts, a 401 is an expired session and the
+           login form is the answer. Without accounts it is a bad token, and
+           sending someone to a form that cannot help them is worse than
+           telling them what actually happened. */
+        if (S && S.you && S.you.auth) {
+          location.replace("/login?next=" + encodeURIComponent(location.pathname));
+          return;
+        }
         b.innerHTML = "LINK NO LONGER VALID<small>the access token was changed - open the current link from Settings &rarr; Web dashboard</small>";
         document.title = "(link expired) GCL Ping Monitor";
       } else {
