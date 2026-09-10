@@ -369,10 +369,10 @@ function sevOf(h) {
   return (h.status === "DOWN" && h.acked) ? s + 0.5 : s;
 }
 
+function bust(h) { return h.status === "DOWN" || h.status === "WARN"; }
+
 function troubled(list) {
-  for (var i = 0; i < list.length; i++) {
-    if (list[i].status === "DOWN" || list[i].status === "WARN") return true;
-  }
+  for (var i = 0; i < list.length; i++) { if (bust(list[i])) return true; }
   return false;
 }
 
@@ -715,10 +715,12 @@ function render(tick) {
         (shut ? "&#9654;" : "&#9660;") + '</span><span class="gname">' +
         esc(L.name) + '</span><span class="spacer"></span>' + pills +
         "</div></td></tr>";
-      if (!shut) {
-        var mem = arrange(L.rows, nowS);
-        for (var b = 0; b < mem.length; b++) { out += rowHtml(mem[b]); }
-      }
+      /* Folding may hide healthy rows. It may never hide a broken one - the
+         whole point of the page is that an outage is on screen, and "it was
+         behind a fold you closed an hour ago" is not monitoring. So a folded
+         layer still lists whatever is wrong with it. */
+      var mem = arrange(shut ? L.rows.filter(bust) : L.rows, nowS);
+      for (var b = 0; b < mem.length; b++) { out += rowHtml(mem[b]); }
     }
   } else {
     body.className = "";
