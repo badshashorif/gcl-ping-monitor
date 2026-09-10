@@ -4557,9 +4557,36 @@ button.needsound{background:var(--warn);border-color:var(--warn);color:#111;
 .spacer{flex:1}
 .pill{font-size:12px;color:var(--dim);white-space:nowrap}
 
+input[type=search],select{
+  font:inherit;color:var(--fg);background:var(--card);
+  border:1px solid var(--line);border-radius:9px;padding:9px 12px;
+}
+input[type=search]{flex:1 1 180px;min-width:150px;max-width:300px}
+input[type=search]::placeholder{color:var(--dim)}
+input[type=search]:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
+select{font-weight:600;padding:9px 8px}
+/* On a phone the column headers are hidden, so sorting needs its own control.
+   On a desktop the headers themselves are the control and these would be
+   two ways to do one thing. */
+.sortctl{display:none}
+
+/* A filter that hides a DOWN host is the one way this page can lie, so it
+   says so - and loudly when what it is hiding is an outage. */
+#fwarn{border-radius:10px;padding:8px 12px;margin-bottom:10px;font-size:13px;
+       font-weight:600;display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+       background:#3a2a08;border:1px solid #a16207;color:#fbbf24}
+#fwarn.bad{background:var(--down);border-color:#b91c1c;color:#fff}
+#fwarn button{padding:4px 10px;font-size:12px}
+/* an id beats [hidden]'s display:none, so the strip would never go away */
+#fwarn[hidden]{display:none}
+
 table{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden}
 th,td{padding:9px 10px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
 th{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);font-weight:600}
+th.sortable{cursor:pointer;user-select:none;-webkit-user-select:none}
+th.sortable:hover{color:var(--fg)}
+th.sorted{color:var(--fg)}
+th .car{font-size:9px;margin-left:3px;vertical-align:1px}
 tr:last-child td{border-bottom:none}
 td.name{white-space:normal;font-weight:600;word-break:break-word}
 td.ip{color:var(--dim);font-family:ui-monospace,Consolas,monospace;font-size:13px}
@@ -4578,6 +4605,8 @@ tr.down.acked td{background:#2a2412}
    into 380px is unreadable, and unreadable is the same as broken here. */
 @media (max-width:640px){
   thead{display:none}
+  .sortctl{display:inline-block}
+  input[type=search]{max-width:none}
   table,tbody,tr,td{display:block;width:100%}
   table{background:none}
   tr{background:var(--card);border:1px solid var(--line);border-radius:12px;margin-bottom:8px;padding:10px 12px}
@@ -4602,18 +4631,39 @@ footer{color:var(--dim);font-size:12px;margin:12px 2px 24px;display:flex;flex-wr
 <div class="wrap">
   <div id="banner">connecting&hellip;</div>
 
+  <div id="fwarn" hidden></div>
+
   <div class="bar">
     <button id="ack" class="danger" hidden>ACKNOWLEDGE</button>
     <button id="snd">&#128263; Sound off</button>
     <button id="wake" title="Stop the phone screen turning off">&#9728; Keep awake</button>
+    <input id="q" type="search" placeholder="Search name, IP or status"
+           autocomplete="off" autocorrect="off" spellcheck="false"
+           aria-label="Filter the host list">
+    <select id="sortsel" class="sortctl" aria-label="Sort by">
+      <option value="">Config order</option>
+      <option value="name">Name</option>
+      <option value="target">IP / Host</option>
+      <option value="status">Status</option>
+      <option value="rtt">ms</option>
+      <option value="loss">Loss</option>
+      <option value="since">Since</option>
+      <option value="downFor">Down for</option>
+    </select>
+    <button id="sortdir" class="sortctl" title="Reverse the sort">&#9650;</button>
     <span class="spacer"></span>
     <span class="pill" id="counts"></span>
   </div>
 
   <table id="tbl">
     <thead><tr>
-      <th>Name</th><th>IP / Host</th><th>Status</th><th style="text-align:right">ms</th>
-      <th style="text-align:right">Loss</th><th>Since</th><th>Down for</th>
+      <th class="sortable" data-s="name" data-t="Name">Name</th>
+      <th class="sortable" data-s="target" data-t="IP / Host">IP / Host</th>
+      <th class="sortable" data-s="status" data-t="Status">Status</th>
+      <th class="sortable" data-s="rtt" data-t="ms" style="text-align:right">ms</th>
+      <th class="sortable" data-s="loss" data-t="Loss" style="text-align:right">Loss</th>
+      <th class="sortable" data-s="since" data-t="Since">Since</th>
+      <th class="sortable" data-s="downFor" data-t="Down for">Down for</th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
@@ -4758,14 +4808,162 @@ function esc(s) {
   });
 }
 
-function render() {
+/* ---- search and sort ---------------------------------------------------
+   Both are view-only. The banner, the counts and the alarm are always
+   computed from the WHOLE list, never from what happens to be on screen: a
+   filter that could turn the banner green would be the one way this page is
+   able to lie, and lying is the failure it exists to prevent. When a filter
+   IS hiding something down, the strip above the table says so.
+
+   The sort is remembered across a reload. The search deliberately is not -
+   walking up to a wall display and not noticing that half the estate has
+   been filtered out is exactly the same trap.                               */
+var q = "", sortKey = "", sortDir = 1;
+try {
+  sortKey = localStorage.getItem("sk") || "";
+  sortDir = localStorage.getItem("sd") === "-1" ? -1 : 1;
+} catch (e) {}
+
+/* Worst first, so ascending on Status is the order a NOC actually wants. */
+var SEV = { DOWN: 0, WARN: 1, INIT: 2, UP: 3, OFF: 4 };
+
+/* 172.30.100.9 must sort before 172.30.100.10, which it does not as text. */
+function ipKey(s) {
+  var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s || "");
+  if (!m) return null;
+  var n = 0;
+  for (var i = 1; i <= 4; i++) {
+    if (+m[i] > 255) return null;
+    n = n * 256 + (+m[i]);
+  }
+  return n;
+}
+
+/* the four shapes fmt_duration emits: "1d 2h", "3h 4m", "5m 6s", "7s" */
+function durSecs(s) {
+  var t = 0, mul = { d: 86400, h: 3600, m: 60, s: 1 }, re = /(\d+)\s*([dhms])/g, m;
+  while ((m = re.exec(s || ""))) { t += (+m[1]) * mul[m[2]]; }
+  return t;
+}
+
+/* "HH:MM:SS" -> seconds. A stamp ahead of the monitor's own clock can only be
+   yesterday, so it sorts before midnight instead of jumping to the far end. */
+function clockSecs(s, nowS) {
+  var m = /^(\d\d):(\d\d):(\d\d)$/.exec(s || "");
+  if (!m) return 0;
+  var t = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]);
+  return (nowS && t > nowS + 60) ? t - 86400 : t;
+}
+
+function sortVal(h, nowS) {
+  switch (sortKey) {
+    case "name":    return String(h.label || h.target || "").toLowerCase();
+    /* one comparable string for both kinds of target: IPs zero-padded and
+       grouped ahead of names, so the two never interleave */
+    case "target":  var n = ipKey(h.target);
+                    return n === null ? "1 " + String(h.target || "").toLowerCase()
+                                      : "0 " + ("0000000000" + n).slice(-10);
+    case "status":  return SEV[h.status] === undefined ? 9 : SEV[h.status];
+    case "rtt":     return h.rtt == null ? 0 : h.rtt;
+    case "loss":    return h.loss || 0;
+    case "since":   return clockSecs(h.since, nowS);
+    case "downFor": return durSecs(h.downFor);
+  }
+  return 0;
+}
+
+/* "-" is not a small number. A host with no reading sits at the bottom
+   whichever way the column is pointing, rather than winning the sort. */
+function isBlank(h) {
+  if (sortKey === "rtt") return h.rtt == null;
+  if (sortKey === "since") return !h.since;
+  if (sortKey === "downFor") return !h.downFor;
+  return false;
+}
+
+function arrange(list, nowS) {
+  if (!sortKey) return list;
+  var k = list.map(function (h, i) {
+    return { h: h, i: i, v: sortVal(h, nowS), b: isBlank(h) };
+  });
+  k.sort(function (x, y) {
+    if (x.b !== y.b) return x.b ? 1 : -1;
+    var c = (x.v < y.v ? -1 : x.v > y.v ? 1 : 0) * sortDir;
+    return c || (x.i - y.i);          /* ties keep the order config lists them */
+  });
+  return k.map(function (e) { return e.h; });
+}
+
+function matches(h) {
+  if (!q) return true;
+  return (String(h.label || "") + " " + String(h.target || "") + " " +
+          String(h.status || "")).toLowerCase().indexOf(q) >= 0;
+}
+
+var inQ = document.getElementById("q");
+var selSort = document.getElementById("sortsel");
+var bDir = document.getElementById("sortdir");
+
+function setSort(key, dir) {
+  sortKey = dir ? key : "";
+  sortDir = dir || 1;
+  try {
+    localStorage.setItem("sk", sortKey);
+    localStorage.setItem("sd", String(sortDir));
+  } catch (e) {}
+  paintSort();
+  if (S) render();
+}
+
+function paintSort() {
+  selSort.value = sortKey;
+  bDir.innerHTML = sortDir > 0 ? "&#9650;" : "&#9660;";
+  bDir.disabled = !sortKey;
+  var ths = document.querySelectorAll("th.sortable");
+  for (var i = 0; i < ths.length; i++) {
+    var on = ths[i].getAttribute("data-s") === sortKey;
+    ths[i].className = on ? "sortable sorted" : "sortable";
+    ths[i].innerHTML = esc(ths[i].getAttribute("data-t")) +
+      (on ? '<span class="car">' + (sortDir > 0 ? "&#9650;" : "&#9660;") + "</span>" : "");
+  }
+}
+
+(function () {
+  var ths = document.querySelectorAll("th.sortable");
+  for (var i = 0; i < ths.length; i++) {
+    /* asc, then desc, then back to the order config lists them in */
+    ths[i].onclick = function () {
+      var k = this.getAttribute("data-s");
+      if (k !== sortKey) setSort(k, 1);
+      else if (sortDir > 0) setSort(k, -1);
+      else setSort("", 0);
+    };
+  }
+})();
+
+selSort.onchange = function () { setSort(this.value, this.value ? sortDir : 0); };
+bDir.onclick = function () { if (sortKey) setSort(sortKey, -sortDir); };
+
+function clearQ() { inQ.value = ""; q = ""; if (S) render(); }
+inQ.oninput = function () {
+  q = this.value.trim().toLowerCase();
+  if (S) render();
+};
+inQ.onkeydown = function (e) {
+  if (e.key === "Escape" || e.keyCode === 27) { clearQ(); }
+};
+paintSort();
+
+/* `tick` is only true when a poll brought new data, so holding a key down in
+   the search box cannot speed up the banner's flash. */
+function render(tick) {
   var b = document.getElementById("banner");
   var downs = S.hosts.filter(function (h) { return h.status === "DOWN"; });
   var unacked = downs.filter(function (h) { return !h.acked; });
 
   b.className = downs.length ? "down" : "ok";
   if (downs.length) {
-    flash = !flash;
+    if (tick) flash = !flash;
     if (flash && unacked.length) b.className = "down flash";
     var names = downs.slice(0, 4).map(function (h) { return h.label || h.target; }).join(", ");
     if (downs.length > 4) names += " +" + (downs.length - 4) + " more";
@@ -4784,12 +4982,34 @@ function render() {
      a tap depends on the alarm, which changes underneath it */
   paintSnd();
 
+  /* the view: filtered and sorted, and used for NOTHING but the table */
+  var nm = /^(\d\d):(\d\d):(\d\d)$/.exec(S.time || "");
+  var nowS = nm ? (+nm[1]) * 3600 + (+nm[2]) * 60 + (+nm[3]) : 0;
+  var shown = arrange(S.hosts.filter(matches), nowS);
+
+  var hidden = S.hosts.length - shown.length;
+  var hiddenDown = 0;
+  for (var d = 0; d < downs.length; d++) { if (!matches(downs[d])) hiddenDown++; }
+
+  var fw = document.getElementById("fwarn");
+  fw.hidden = !hidden;
+  if (hidden) {
+    fw.className = hiddenDown ? "bad" : "";
+    fw.innerHTML = (hiddenDown
+        ? esc(hiddenDown + (hiddenDown === 1 ? " DOWN host is" : " DOWN hosts are") +
+              " hidden by the search")
+        : esc(hidden + (hidden === 1 ? " host" : " hosts") + " hidden by the search")) +
+      ' <span class="spacer"></span><button type="button" id="fclr">Show all</button>';
+    document.getElementById("fclr").onclick = clearQ;
+  }
+
   document.getElementById("counts").textContent =
+    (q ? "showing " + shown.length + " of " + S.hosts.length + "   " : "") +
     "UP " + S.counts.up + "   DOWN " + S.counts.down + "   off " + S.counts.off;
 
   var out = "";
-  for (var i = 0; i < S.hosts.length; i++) {
-    var h = S.hosts[i];
+  for (var i = 0; i < shown.length; i++) {
+    var h = shown[i];
     var cls = (h.status === "DOWN" ? "down" : "") + (h.acked ? " acked" : "");
     out += '<tr class="' + cls + '">' +
       '<td class="name">' + esc(h.label || h.target) +
@@ -4801,6 +5021,9 @@ function render() {
       '<td class="num" data-k="loss">' + h.loss + "%</td>" +
       '<td data-k="since">' + esc(h.since) + "</td>" +
       '<td data-k="down for">' + esc(h.downFor) + "</td></tr>";
+  }
+  if (!shown.length) {
+    out = '<tr><td class="mute" colspan="7">nothing matches ' + esc(q) + "</td></tr>";
   }
   document.getElementById("rows").innerHTML = out;
 
@@ -4827,7 +5050,7 @@ function poll() {
       fails = 0;
       if (!j.ready) return;
       S = j;
-      render();
+      render(true);
     })
     .catch(function (e) {
       fails++;
@@ -4854,8 +5077,7 @@ if ("serviceWorker" in navigator) {
 }
 </script>
 </body>
-</html>
-'@
+</html>'@
 # ---------------------------------------------------------------------------
 #  Web dashboard  (browser on the LAN, and a phone)
 # ---------------------------------------------------------------------------
