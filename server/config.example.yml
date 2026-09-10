@@ -25,6 +25,26 @@ web:
   # dashboard already logged in; leave it blank and the tap goes nowhere.
   public_url: ""
 
+  # ---- accounts -------------------------------------------------------
+  # There are none until you make one:
+  #
+  #     docker compose exec gclpm python -m gclpm --add-user shorif --role admin
+  #
+  # Until then the link token is the only lock and grants everything, exactly
+  # as it always has. The moment the first account exists the dashboard asks
+  # for a password, and the three settings below start to matter.
+  #
+  # What the shared notification link is then worth. It has to keep working -
+  # tapping an alert at 3am must land on the dashboard, not a login form - so
+  # it stays valid at this role. `read` lets whoever is holding the phone see
+  # what woke them without being able to change the estate.
+  link_role: read
+  session_hours: 12
+  # true behind TLS (which Caddy gives you), so the session cookie is never
+  # sent in clear. Left false so a monitor first reached over plain http on a
+  # LAN can still be logged into at all.
+  https_only: false
+
 # WHO IS TOLD, AND WHEN
 #
 # Detection never waits: a host goes DOWN in the table the moment it is called

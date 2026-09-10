@@ -94,6 +94,53 @@ Only in `.env`, never in `config.yml`:
 `config.yml` is therefore safe to read over someone's shoulder, which matters
 because it is the file people actually open.
 
+## Accounts
+
+There are none until you make one:
+
+```bash
+docker compose exec gclpm python -m gclpm --add-user shorif --role admin
+```
+
+**Nothing changes until you do.** With no `config/users.yml` the link token is
+the only lock and grants everything, exactly as before. The first account
+switches the dashboard over to asking for a password. That order matters: an
+upgrade that silently locked the operator out of their own monitoring
+dashboard would be a worse failure than the one it prevents.
+
+| role | can |
+|---|---|
+| `read` | look at the dashboard |
+| `write` | + acknowledge, + add/remove/modify hosts and layers |
+| `admin` | + the user list, at `/users` |
+
+**The notification link keeps working.** Tapping an ntfy alert at 3am has to
+land on the dashboard, not a login form, so the shared token stays valid at
+`web.link_role` - `read` by default. Enough to see what woke you; not enough
+to change the estate from a phone somebody else could be holding. Set it to
+`write` to keep today's behaviour of acknowledging straight from the alert.
+
+Passwords are salted scrypt hashes in `config/users.yml`, written `0600` in
+the already-gitignored config directory, never in the image, and never
+returned by the API. `--add-user` reads the password from the terminal rather
+than the command line, because `ps` is public. It is also the way back in
+after a forgotten password.
+
+Some deliberate behaviour:
+
+- A wrong username and a wrong password give the same message and take the
+  same time - a login form must not answer "does this account exist?".
+- Failed logins back off in-process rather than at the firewall. Enumerating
+  usernames against this box once tripped fail2ban and locked the real
+  operator out, which is the worse outcome.
+- Roles are re-read on every request, so a demotion applies immediately;
+  removing a user drops their sessions.
+- The last admin cannot demote or delete themselves.
+- Sessions live in memory, so a redeploy asks people to sign in again. That
+  is the trade for not keeping the keys to the estate in another file.
+- Set `web.https_only: true` behind Caddy so the session cookie never travels
+  in clear.
+
 ## Layers
 
 `groups:` in `config.yml` is the network's hierarchy - upstream first, edge
