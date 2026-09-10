@@ -115,6 +115,19 @@ DEFAULTS: dict[str, Any] = {
     # its own heading at the bottom - because dropping it would be a device
     # that silently stopped being watched.
     "groups": [],
+    # Which notification channels a layer is allowed to use. A layer that is
+    # not listed here uses every enabled channel, as before.
+    #
+    #   group_notify:
+    #     RETAIL_ACCESS_RTR: [telegram]     # the record, but no phone, no inbox
+    #     POP_RTR: []                       # dashboard only
+    #
+    # This is about the INTERRUPTION, never the monitoring. Whatever is here,
+    # the host is still pinged, still goes red, still needs acknowledging and
+    # still makes the noise its `sound` flag says it should. Seventeen retail
+    # access routers at the far end of somebody else's fibre will flap; that
+    # is worth a line in Telegram and not worth a phone ringing.
+    "group_notify": {},
     "hosts": [],
 }
 
@@ -241,6 +254,24 @@ class Config:
             seen.add(spec.key)
             out.append(spec)
         return out
+
+    def channels_for(self, group: str) -> set[str] | None:
+        """Channels this layer may use, or None for "no restriction".
+
+        None and the empty set mean opposite things and both are legitimate:
+        a layer nobody has configured gets everything, a layer configured
+        with `[]` gets nothing but the dashboard. So a missing key can never
+        be confused with a deliberate silence.
+        """
+        raw = self.raw.get("group_notify") or {}
+        if not isinstance(raw, dict) or group not in raw:
+            return None
+        allowed = raw[group]
+        if allowed is None:
+            return set()
+        if isinstance(allowed, str):
+            allowed = [allowed]
+        return {str(c).strip().lower() for c in allowed if str(c).strip()}
 
     @property
     def users_path(self) -> Path | None:

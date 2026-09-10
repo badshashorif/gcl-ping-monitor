@@ -43,6 +43,10 @@ class Event:
     at: float
     down_for: str = ""
     key: str = ""                 # host key, for the per-channel bookkeeping
+    # The layer the host was on when this was raised. Copied rather than read
+    # back off `host`, for the same reason label and target are: by the time
+    # this is sent the host may have been re-grouped, or removed entirely.
+    group: str = ""
     host: Host | None = None      # the live object: is it STILL down?
     # Channels that have finished with this event - sent it, or decided not
     # to. An event stays queued only while some channel has yet to decide.
@@ -135,6 +139,17 @@ class Notifier:
         except (TypeError, ValueError):
             return 0.0
 
+    def allows(self, channel: str, group: str) -> bool:
+        """May this layer use this channel?
+
+        Only ever narrows what an already-enabled channel carries. It cannot
+        turn a channel on, and it has no say over detection, the dashboard,
+        the red banner or the desk alarm - a muted layer still goes red and
+        still has to be acknowledged.
+        """
+        allowed = self.cfg.channels_for(group)
+        return True if allowed is None else channel in allowed
+
     def add(self, kind: str, host: Host) -> None:
         n = self.cfg.notify
         if not self.any_channel:
@@ -147,7 +162,8 @@ class Notifier:
         if kind == "UP" and host.down_since:
             down_for = fmt_duration(time.time() - host.down_since)
         self.queue.append(Event(kind, host.label, host.target, time.time(),
-                                down_for, key=host.key, host=host))
+                                down_for, key=host.key, group=host.group,
+                                host=host))
 
     def _within_cap(self) -> bool:
         cut = time.time() - 3600
@@ -174,7 +190,9 @@ class Notifier:
         for e in self.queue:
             if channel in e.done:
                 continue
-            if delay <= 0:
+            if not self.allows(channel, e.group):
+                e.done.add(channel)               # this layer does not use it
+            elif delay <= 0:
                 out.append(e)
             elif e.kind == "DOWN":
                 if e.host is not None and e.host.status != DOWN:
@@ -260,13 +278,14 @@ class Notifier:
             # told about. Without this, email at 60s would still get a "STILL
             # DOWN" for a host whose original alert it never received.
             hosts = [h for h in still_down
-                     if self.delay_of(ch) <= 0 or h.key in self._announced[ch]]
+                     if self.allows(ch, h.group)
+                     and (self.delay_of(ch) <= 0 or h.key in self._announced[ch])]
             if not hosts:
                 continue
             events = [
                 Event("DOWN", h.label, h.target, time.time(),
                       fmt_duration(time.time() - h.down_since) if h.down_since else "",
-                      key=h.key, host=h)
+                      key=h.key, group=h.group, host=h)
                 for h in hosts
             ]
             if len(events) == 1:
