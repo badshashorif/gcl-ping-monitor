@@ -4601,6 +4601,27 @@ tr.down td{background:#2a1212}
 tr.down.acked td{background:#2a2412}
 .mute{color:var(--dim);font-size:12px}
 
+/* ---- group headings ----
+   The whole strip is the tap target, and the colour down its left edge is
+   the group's worst host - so the layer that is in trouble is findable
+   without reading a single row. */
+tr.ghead td{padding:0;background:#12151c}
+.gh{display:flex;align-items:center;gap:9px;padding:11px 12px;cursor:pointer;
+    border-left:3px solid var(--off);-webkit-tap-highlight-color:transparent}
+tr.ghead.ok .gh{border-left-color:#1c5c33}
+tr.ghead.warn .gh{border-left-color:var(--warn)}
+tr.ghead.bad .gh{border-left-color:var(--down);background:#1f1416}
+.gcar{color:var(--dim);font-size:10px;width:9px;flex:none}
+.gname{font-weight:700;font-size:12px;letter-spacing:.7px;text-transform:uppercase}
+.gp{font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;
+    background:#20242c;color:var(--dim);white-space:nowrap}
+.gp.down{background:var(--down);color:#fff}
+.gp.warn{background:#3a2a08;color:#fbbf24}
+.gp.up{background:#0d3320;color:#4ade80}
+/* members sit under their heading, so the hierarchy is visible and not just
+   implied by the order */
+tbody.grouped td.name{padding-left:24px}
+
 /* On a phone the table becomes one card per host - a 9-column grid squeezed
    into 380px is unreadable, and unreadable is the same as broken here. */
 @media (max-width:640px){
@@ -4621,6 +4642,10 @@ tr.down.acked td{background:#2a2412}
   tr.down td,tr.down.acked td{background:none}
   tr.down{border-color:var(--down);background:#2a1212}
   tr.down.acked{background:#2a2412;border-color:#a16207}
+  /* the heading is a strip between cards, not another card */
+  tr.ghead{background:none;border:none;border-radius:0;padding:0;margin:10px 0 6px}
+  tr.ghead td{display:block;background:#12151c;border-radius:10px}
+  tbody.grouped td.name{padding-left:0}
 }
 #log{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-top:10px;
      font:12px/1.5 ui-monospace,Consolas,monospace;color:var(--dim);max-height:230px;overflow:auto;white-space:pre-wrap}
@@ -4640,8 +4665,11 @@ footer{color:var(--dim);font-size:12px;margin:12px 2px 24px;display:flex;flex-wr
     <input id="q" type="search" placeholder="Search name, IP or status"
            autocomplete="off" autocorrect="off" spellcheck="false"
            aria-label="Filter the host list">
+    <button id="grp" title="Group the list by network layer">Grouped</button>
+    <button id="focus" title="Collapse the layers that are healthy">Focus</button>
     <select id="sortsel" class="sortctl" aria-label="Sort by">
-      <option value="">Config order</option>
+      <option value="">Priority (down first)</option>
+      <option value="config">Config order</option>
       <option value="name">Name</option>
       <option value="target">IP / Host</option>
       <option value="status">Status</option>
@@ -4818,14 +4846,33 @@ function esc(s) {
    The sort is remembered across a reload. The search deliberately is not -
    walking up to a wall display and not noticing that half the estate has
    been filtered out is exactly the same trap.                               */
-var q = "", sortKey = "", sortDir = 1;
+var q = "", sortKey = "", sortDir = 1, grouped = true, focusMode = true;
 try {
   sortKey = localStorage.getItem("sk") || "";
   sortDir = localStorage.getItem("sd") === "-1" ? -1 : 1;
+  grouped = localStorage.getItem("gv") !== "0";
+  focusMode = localStorage.getItem("fm") !== "0";
 } catch (e) {}
 
 /* Worst first, so ascending on Status is the order a NOC actually wants. */
 var SEV = { DOWN: 0, WARN: 1, INIT: 2, UP: 3, OFF: 4 };
+var UNGROUPED = "Ungrouped";
+
+/* The default ordering, and the reason the list is worth looking at: whatever
+   is broken is at the top of its layer. An acknowledged outage drops below an
+   unacknowledged one - somebody is already on that one. */
+function sevOf(h) {
+  var s = SEV[h.status];
+  if (s === undefined) s = 9;
+  return (h.status === "DOWN" && h.acked) ? s + 0.5 : s;
+}
+
+function troubled(list) {
+  for (var i = 0; i < list.length; i++) {
+    if (list[i].status === "DOWN" || list[i].status === "WARN") return true;
+  }
+  return false;
+}
 
 /* 172.30.100.9 must sort before 172.30.100.10, which it does not as text. */
 function ipKey(s) {
@@ -4882,16 +4929,68 @@ function isBlank(h) {
 }
 
 function arrange(list, nowS) {
-  if (!sortKey) return list;
+  if (sortKey === "config") return list;      /* the raw file order, on demand */
+  var pri = !sortKey;                         /* the default: worst first */
+  var dir = pri ? 1 : sortDir;
   var k = list.map(function (h, i) {
-    return { h: h, i: i, v: sortVal(h, nowS), b: isBlank(h) };
+    return { h: h, i: i,
+             v: pri ? sevOf(h) : sortVal(h, nowS),
+             b: pri ? false : isBlank(h) };
   });
   k.sort(function (x, y) {
     if (x.b !== y.b) return x.b ? 1 : -1;
-    var c = (x.v < y.v ? -1 : x.v > y.v ? 1 : 0) * sortDir;
+    var c = (x.v < y.v ? -1 : x.v > y.v ? 1 : 0) * dir;
     return c || (x.i - y.i);          /* ties keep the order config lists them */
   });
   return k.map(function (e) { return e.h; });
+}
+
+/* ---- the layers --------------------------------------------------------
+   Order comes from config, not from the data: `groups:` in config.yml IS the
+   hierarchy, upstream first. A layer with something wrong is lifted above the
+   healthy ones, so an incident walks up the page towards you instead of
+   waiting to be scrolled to.
+
+   Counts on a heading are always the WHOLE layer, never the filtered subset -
+   same rule as the banner. A heading that quietly recounted itself to match a
+   search would be the page lying in a smaller font.                          */
+var collapsed = {};      /* name -> bool. Session only, on purpose: a reload
+                            must not restore a fold that hides a device. */
+
+function layers(all, keep) {
+  var order = [], bucket = {}, out = [];
+  var declared = S.groups || [];
+  for (var i = 0; i < declared.length; i++) {
+    order.push(declared[i].name);
+    bucket[declared[i].name] = [];
+  }
+  for (var j = 0; j < all.length; j++) {
+    var name = all[j].group || UNGROUPED;
+    if (!bucket[name]) { bucket[name] = []; order.push(name); }
+    bucket[name].push(all[j]);
+  }
+  for (var k = 0; k < order.length; k++) {
+    var members = bucket[order[k]];
+    if (!members.length) continue;            /* an empty layer is just noise */
+    var rows = members.filter(keep);
+    if (!rows.length) continue;               /* nothing of it survived the search */
+    out.push({ name: order[k], all: members, rows: rows, bad: troubled(members) });
+  }
+  var hurt = [], well = [];
+  for (var m = 0; m < out.length; m++) { (out[m].bad ? hurt : well).push(out[m]); }
+  return hurt.concat(well);
+}
+
+function tally(members) {
+  var t = { up: 0, down: 0, warn: 0, off: 0 };
+  for (var i = 0; i < members.length; i++) {
+    var s = members[i].status;
+    if (s === "OFF") t.off++;
+    else if (s === "DOWN") t.down++;
+    else if (s === "WARN") t.warn++;
+    else if (s === "UP") t.up++;
+  }
+  return t;
 }
 
 function matches(h) {
@@ -4944,6 +5043,35 @@ function paintSort() {
 selSort.onchange = function () { setSort(this.value, this.value ? sortDir : 0); };
 bDir.onclick = function () { if (sortKey) setSort(sortKey, -sortDir); };
 
+var bGrp = document.getElementById("grp"), bFocus = document.getElementById("focus");
+function paintView() {
+  bGrp.className = grouped ? "on" : "";
+  bGrp.textContent = grouped ? "Grouped" : "Flat";
+  bFocus.className = focusMode ? "on" : "";
+  bFocus.disabled = !grouped;
+}
+function toggle(which) {
+  return function () {
+    if (which === "gv") { grouped = !grouped; } else { focusMode = !focusMode; }
+    try {
+      localStorage.setItem(which, (which === "gv" ? grouped : focusMode) ? "1" : "0");
+    } catch (e) {}
+    paintView();
+    if (S) render();
+  };
+}
+bGrp.onclick = toggle("gv");
+bFocus.onclick = toggle("fm");
+paintView();
+
+/* Folding a layer is one tap anywhere along its strip. */
+document.getElementById("rows").addEventListener("click", function (e) {
+  var tr = e.target.closest ? e.target.closest("tr.ghead") : null;
+  if (!tr) return;
+  collapsed[tr.getAttribute("data-g")] = tr.getAttribute("data-c") !== "1";
+  if (S) render();
+});
+
 function clearQ() { inQ.value = ""; q = ""; if (S) render(); }
 inQ.oninput = function () {
   q = this.value.trim().toLowerCase();
@@ -4953,6 +5081,20 @@ inQ.onkeydown = function (e) {
   if (e.key === "Escape" || e.keyCode === 27) { clearQ(); }
 };
 paintSort();
+
+function rowHtml(h) {
+  var cls = (h.status === "DOWN" ? "down" : "") + (h.acked ? " acked" : "");
+  return '<tr class="' + cls + '">' +
+    '<td class="name">' + esc(h.label || h.target) +
+      (h.sound ? "" : ' <span class="mute" title="sound off for this host">&#128263;</span>') + "</td>" +
+    '<td class="ip" data-k="">' + esc(h.target) + "</td>" +
+    '<td data-k=""><span class="badge s-' + esc(h.status) + '">' + esc(h.status) +
+      (h.acked ? " ack" : "") + "</span></td>" +
+    '<td class="num" data-k="ms">' + (h.rtt == null ? "-" : h.rtt) + "</td>" +
+    '<td class="num" data-k="loss">' + h.loss + "%</td>" +
+    '<td data-k="since">' + esc(h.since) + "</td>" +
+    '<td data-k="down for">' + esc(h.downFor) + "</td></tr>";
+}
 
 /* `tick` is only true when a poll brought new data, so holding a key down in
    the search box cannot speed up the banner's flash. */
@@ -5007,25 +5149,54 @@ function render(tick) {
     (q ? "showing " + shown.length + " of " + S.hosts.length + "   " : "") +
     "UP " + S.counts.up + "   DOWN " + S.counts.down + "   off " + S.counts.off;
 
+  var body = document.getElementById("rows");
   var out = "";
-  for (var i = 0; i < shown.length; i++) {
-    var h = shown[i];
-    var cls = (h.status === "DOWN" ? "down" : "") + (h.acked ? " acked" : "");
-    out += '<tr class="' + cls + '">' +
-      '<td class="name">' + esc(h.label || h.target) +
-        (h.sound ? "" : ' <span class="mute" title="sound off for this host">&#128263;</span>') + "</td>" +
-      '<td class="ip" data-k="">' + esc(h.target) + "</td>" +
-      '<td data-k=""><span class="badge s-' + esc(h.status) + '">' + esc(h.status) +
-        (h.acked ? " ack" : "") + "</span></td>" +
-      '<td class="num" data-k="ms">' + (h.rtt == null ? "-" : h.rtt) + "</td>" +
-      '<td class="num" data-k="loss">' + h.loss + "%</td>" +
-      '<td data-k="since">' + esc(h.since) + "</td>" +
-      '<td data-k="down for">' + esc(h.downFor) + "</td></tr>";
+
+  /* No group on any host means the engine answering does not send them - the
+     Windows tool does not - so the page quietly stays flat rather than piling
+     the whole estate under one "Ungrouped" heading. */
+  var anyGroup = false;
+  for (var g = 0; g < S.hosts.length; g++) {
+    if (S.hosts[g].group) { anyGroup = true; break; }
   }
+
+  if (grouped && anyGroup) {
+    body.className = "grouped";
+    var incident = troubled(S.hosts);
+    var ls = layers(S.hosts, matches);
+    for (var a = 0; a < ls.length; a++) {
+      var L = ls[a], t = tally(L.all);
+      /* An explicit fold wins. Otherwise Focus collapses the layers with
+         nothing wrong, but only once something IS wrong somewhere: on a quiet
+         day the whole estate stays open, which is the view a wall wants. */
+      var shut = Object.prototype.hasOwnProperty.call(collapsed, L.name)
+        ? collapsed[L.name]
+        : (focusMode && incident && !L.bad);
+      var pills = "";
+      if (t.down) { pills += '<span class="gp down">' + t.down + " down</span>"; }
+      if (t.warn) { pills += '<span class="gp warn">' + t.warn + " warn</span>"; }
+      if (t.up) { pills += '<span class="gp up">' + t.up + " up</span>"; }
+      if (t.off) { pills += '<span class="gp">' + t.off + " off</span>"; }
+      out += '<tr class="ghead ' + (t.down ? "bad" : t.warn ? "warn" : "ok") +
+        '" data-g="' + esc(L.name) + '" data-c="' + (shut ? "1" : "0") + '">' +
+        '<td colspan="7"><div class="gh"><span class="gcar">' +
+        (shut ? "&#9654;" : "&#9660;") + '</span><span class="gname">' +
+        esc(L.name) + '</span><span class="spacer"></span>' + pills +
+        "</div></td></tr>";
+      if (!shut) {
+        var mem = arrange(L.rows, nowS);
+        for (var b = 0; b < mem.length; b++) { out += rowHtml(mem[b]); }
+      }
+    }
+  } else {
+    body.className = "";
+    for (var i = 0; i < shown.length; i++) { out += rowHtml(shown[i]); }
+  }
+
   if (!shown.length) {
     out = '<tr><td class="mute" colspan="7">nothing matches ' + esc(q) + "</td></tr>";
   }
-  document.getElementById("rows").innerHTML = out;
+  body.innerHTML = out;
 
   var lg = document.getElementById("log");
   lg.textContent = (S.log || []).join("\n");

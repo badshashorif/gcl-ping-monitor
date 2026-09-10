@@ -92,8 +92,19 @@ DEFAULTS: dict[str, Any] = {
             "delay_seconds": 0,
         },
     },
+    # The layers of the network, upstream first and edge last. This list is
+    # the HIERARCHY: the dashboard shows groups in exactly this order, so
+    # "what is above what" is a config decision rather than something the page
+    # guesses. A host naming a group that is not here still appears - under
+    # its own heading at the bottom - because dropping it would be a device
+    # that silently stopped being watched.
+    "groups": [],
     "hosts": [],
 }
+
+# Where an ungrouped host is shown. Not a group anyone can configure: it is
+# the bucket for "you have not said yet", and it always sorts last.
+UNGROUPED = "Ungrouped"
 
 # Every secret comes from the environment, never from config.yml.
 SECRET_ENV = {
@@ -110,6 +121,7 @@ class HostSpec:
     target: str
     enabled: bool = True
     sound: bool = True
+    group: str = ""
 
     @property
     def key(self) -> str:
@@ -164,6 +176,29 @@ class Config:
         return self.raw["notify"]
 
     @property
+    def groups(self) -> list[str]:
+        """The configured layers, in order, then any group a host names that
+        the list forgot, then Ungrouped if anything needs it.
+
+        Built from both ends on purpose. Trusting only `groups:` would hide a
+        host whose group was mistyped; trusting only the hosts would make the
+        hierarchy depend on the order somebody happened to add routers in.
+        """
+        out: list[str] = []
+        for name in self.raw.get("groups") or []:
+            name = str(name).strip()
+            if name and name != UNGROUPED and name not in out:
+                out.append(name)
+        extra: list[str] = []
+        ungrouped = False
+        for spec in self.hosts:
+            if not spec.group:
+                ungrouped = True
+            elif spec.group not in out and spec.group not in extra:
+                extra.append(spec.group)
+        return out + sorted(extra) + ([UNGROUPED] if ungrouped else [])
+
+    @property
     def hosts(self) -> list[HostSpec]:
         out: list[HostSpec] = []
         seen: set[str] = set()
@@ -173,11 +208,13 @@ class Config:
             target = str(item.get("target", "")).strip()
             if not target:
                 continue
+            group = str(item.get("group") or "").strip()
             spec = HostSpec(
                 label=str(item.get("label") or target).strip(),
                 target=target,
                 enabled=bool(item.get("enabled", True)),
                 sound=bool(item.get("sound", True)),
+                group="" if group == UNGROUPED else group,
             )
             # A duplicate target would give two rows that can never disagree,
             # two alarms for one outage, and two notifications. Drop the second

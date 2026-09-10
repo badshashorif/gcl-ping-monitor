@@ -41,6 +41,12 @@ log = logging.getLogger("gclpm.editor")
 MAX_HOSTS = 500
 MAX_LABEL = 60
 MAX_TARGET = 253
+MAX_GROUP = 40
+MAX_GROUPS = 40
+
+# The bucket for hosts with no group. Never written to the file - it is what
+# "you have not said yet" is called on screen, not a group you can join.
+UNGROUPED = "Ungrouped"
 
 # Hostnames and IPv4. Anything else - a space, a slash, "http://", a :port - is
 # a paste of the wrong thing, and every one of them fails as a DNS lookup that
@@ -70,6 +76,39 @@ def _clean_label(value: Any, fallback: str) -> str:
     if not text:
         text = fallback
     return text[:MAX_LABEL]
+
+
+def _clean_group(value: Any) -> str:
+    """A group name, or "" for none.
+
+    Trimmed and control-stripped like a label. "Ungrouped" is folded to "" so
+    the reserved on-screen bucket can never become a real group sitting next
+    to the genuinely ungrouped hosts.
+    """
+    text = re.sub(r"[\x00-\x1f\x7f]", "", str(value or "")).strip()[:MAX_GROUP]
+    return "" if text.casefold() == UNGROUPED.casefold() else text
+
+
+def normalise_groups(names: Any, used: list[str] | None = None) -> list[str]:
+    """The ordered group list to write, de-duplicated case-insensitively.
+
+    Any group a host names but the list omits is appended rather than
+    rejected: the alternative is a save that quietly re-homes a device.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in (names if isinstance(names, list) else []):
+        name = _clean_group(raw)
+        if name and name.casefold() not in seen:
+            seen.add(name.casefold())
+            out.append(name)
+    for name in (used or []):
+        if name and name.casefold() not in seen:
+            seen.add(name.casefold())
+            out.append(name)
+    if len(out) > MAX_GROUPS:
+        raise ValidationError(f"too many groups ({len(out)}); the limit is {MAX_GROUPS}")
+    return out
 
 
 def normalise(rows: Any) -> list[dict[str, Any]]:
@@ -117,6 +156,7 @@ def normalise(rows: Any) -> list[dict[str, Any]]:
             "target": target,
             "enabled": bool(row.get("enabled", True)),
             "sound": bool(row.get("sound", True)),
+            "group": _clean_group(row.get("group")),
         })
 
     return out
@@ -127,13 +167,15 @@ def _to_yaml(rows: list[dict[str, Any]]) -> CommentedSeq:
 
     Both default to true, so spelling them out on every row would treble the
     length of the file and bury the two lines that actually say something
-    unusual about a host.
+    unusual about a host. `group` is written whenever there is one.
     """
     seq = CommentedSeq()
     for row in rows:
         item = CommentedMap()
         item["label"] = row["label"]
         item["target"] = row["target"]
+        if row.get("group"):
+            item["group"] = row["group"]
         if not row["enabled"]:
             item["enabled"] = False
         if not row["sound"]:
@@ -150,13 +192,26 @@ def _yaml() -> YAML:
     return y
 
 
-def save_hosts(path: str | os.PathLike[str], rows: Any) -> list[dict[str, Any]]:
-    """Validate `rows` and write them into config.yml as the new host list.
+def save_hosts(path: str | os.PathLike[str], rows: Any,
+               groups: Any = None) -> tuple[list[dict[str, Any]], list[str]]:
+    """Validate and write the host list, and the group order alongside it.
 
-    Returns the normalised list. Everything else in the file - settings,
-    comments, blank lines - is left exactly as it was.
+    Returns the normalised hosts and groups. Everything else in the file -
+    settings, comments, blank lines - is left exactly as it was.
     """
     hosts = normalise(rows)
+    order = normalise_groups(
+        groups if groups is not None else [],
+        used=[h["group"] for h in hosts if h["group"]],
+    )
+
+    # One canonical spelling per group. Without this "CORE_RTR" typed on one
+    # row and "core_rtr" on another become two headings holding one layer.
+    canon = {name.casefold(): name for name in order}
+    for h in hosts:
+        if h["group"]:
+            h["group"] = canon.get(h["group"].casefold(), h["group"])
+
     p = Path(path)
     yaml = _yaml()
 
@@ -167,6 +222,8 @@ def save_hosts(path: str | os.PathLike[str], rows: Any) -> list[dict[str, Any]]:
     if not isinstance(data, dict):
         raise ValidationError("config.yml is not a mapping at the top level")
 
+    if order or "groups" in data:
+        data["groups"] = CommentedSeq(order)
     data["hosts"] = _to_yaml(hosts)
 
     tmp = p.parent / (p.name + ".tmp")
@@ -182,8 +239,9 @@ def save_hosts(path: str | os.PathLike[str], rows: Any) -> list[dict[str, Any]]:
         tmp.unlink(missing_ok=True)
         raise
 
-    log.info("config.yml rewritten from the browser: %d host(s)", len(hosts))
-    return hosts
+    log.info("config.yml rewritten from the browser: %d host(s), %d group(s)",
+             len(hosts), len(order))
+    return hosts, order
 
 
 def read_hosts(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
@@ -211,5 +269,21 @@ def read_hosts(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
             "target": target,
             "enabled": bool(item.get("enabled", True)),
             "sound": bool(item.get("sound", True)),
+            "group": _clean_group(item.get("group")),
         })
     return out
+
+
+def read_groups(path: str | os.PathLike[str]) -> list[str]:
+    """The group order as the file has it, plus any group only a host names.
+
+    Same both-ends rule as the running config: a mistyped group must show up
+    in the editor as a group, not vanish and take its hosts with it.
+    """
+    p = Path(path)
+    with p.open("r", encoding="utf-8") as fh:
+        data = _yaml().load(fh) or {}
+    return normalise_groups(
+        list(data.get("groups") or []),
+        used=[h["group"] for h in read_hosts(path) if h["group"]],
+    )

@@ -87,19 +87,45 @@ notify:
     # priority 5. Delaying the alarm does nothing to the phone - delay ntfy.
     delay_seconds: 60    # only ring a pocket for an outage that is still down
 
+# THE LAYERS OF THE NETWORK
+#
+# This list is the hierarchy: upstream at the top, the edge at the bottom, and
+# the dashboard draws the groups in exactly this order. So re-ordering these
+# lines re-orders the dashboard - which is why the order lives here and not in
+# whatever sequence somebody happened to add routers in.
+#
+# A layer with something wrong is lifted above the healthy ones, and with
+# "Focus" on the healthy layers fold away while that lasts. Nothing is hidden:
+# every heading carries its own count, and the banner is always the whole
+# estate.
+#
+# Hosts with no group land under "Ungrouped" at the bottom. That name is
+# reserved - a host cannot join it, it is just where "not said yet" is drawn.
+groups:
+  - UPSTREAM_PEER
+  - CORE_RTR
+  - CORE_SWITCH
+  - NAT_RTR
+  - ACCESS_RTR
+  - POP_RTR
+
 # The host list. Editable from a browser at /hosts - saving there rewrites this
 # block and leaves every comment in this file alone.
 #
 # label   what you call it
 # target  IP or hostname to ping
+# group   which layer above it sits on. Presentation only: it never changes
+#         what is pinged, when it alarms, or who is told.
 # enabled false = not pinged at all, shown greyed out, can never alarm
 # sound   false = no NOISE at the desk. It still goes red, still needs an
 #         acknowledgement, and it still sends its notifications.
 hosts:
   - label: GATEWAY
     target: 192.0.2.1
+    group: UPSTREAM_PEER
   - label: CORE_SWITCH
     target: 192.0.2.2
+    group: CORE_SWITCH
   - label: UPS_INPUT_POWER
     target: 192.0.2.10
   - label: PUBLIC_CHECK

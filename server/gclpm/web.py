@@ -16,6 +16,7 @@ from pathlib import Path
 
 from aiohttp import web
 
+from . import config as cfgmod
 from . import editor
 from .state import Monitor, fmt_duration
 
@@ -100,6 +101,7 @@ class Server:
             hosts.append({
                 "label": h.label,
                 "target": h.target,
+                "group": h.group,
                 "status": "OFF" if not h.enabled else h.status,
                 "enabled": h.enabled,
                 "sound": h.sound,
@@ -132,9 +134,37 @@ class Server:
                 "down": sum(1 for h in active if h.status == "DOWN"),
                 "off": len(self.mon.all()) - len(active),
             },
+            "groups": self._groups(),
             "hosts": hosts,
             "log": list(self.mon.log),
         }
+
+    def _groups(self) -> list[dict]:
+        """The layers in hierarchy order, each with its own tally.
+
+        Counted here rather than in the page so that the numbers on a group
+        heading come from the same pass as the numbers in the banner. Two
+        places counting the same hosts is two places to disagree, and a
+        heading that says "12 up" over a red row is worse than no heading.
+        """
+        by_name: dict[str, dict] = {}
+        for name in self.cfg.groups:
+            by_name[name] = {"name": name, "total": 0, "up": 0,
+                             "down": 0, "warn": 0, "off": 0}
+        for h in self.mon.all():
+            g = by_name.get(h.group or cfgmod.UNGROUPED)
+            if g is None:                      # a group added since the reload
+                continue
+            g["total"] += 1
+            if not h.enabled:
+                g["off"] += 1
+            elif h.status == "DOWN":
+                g["down"] += 1
+            elif h.status == "WARN":
+                g["warn"] += 1
+            elif h.status == "UP":
+                g["up"] += 1
+        return list(by_name.values())
 
     # ---- handlers ------------------------------------------------------
     async def h_index(self, request: web.Request) -> web.StreamResponse:
@@ -196,7 +226,9 @@ class Server:
         denied = self._edit_guard()
         if denied:
             return denied
-        return web.json_response({"ok": True, "hosts": editor.read_hosts(self.cfg.path)})
+        return web.json_response({"ok": True,
+                                  "hosts": editor.read_hosts(self.cfg.path),
+                                  "groups": editor.read_groups(self.cfg.path)})
 
     async def h_hosts_post(self, request: web.Request) -> web.StreamResponse:
         denied = self._edit_guard()
@@ -208,7 +240,8 @@ class Server:
             return web.json_response({"ok": False, "error": "malformed request"}, status=400)
 
         try:
-            hosts = editor.save_hosts(self.cfg.path, body.get("hosts"))
+            hosts, groups = editor.save_hosts(self.cfg.path, body.get("hosts"),
+                                              body.get("groups"))
         except editor.ValidationError as exc:
             # 400, not 500: the person editing can fix this, and the page shows
             # the message next to the row it names
@@ -221,7 +254,7 @@ class Server:
         on, off = sum(1 for h in hosts if h["enabled"]), sum(1 for h in hosts if not h["enabled"])
         self.mon.note(f"CONFIG    : host list saved from a browser - "
                       f"{len(hosts)} host(s), {on} watched, {off} not")
-        return web.json_response({"ok": True, "hosts": hosts})
+        return web.json_response({"ok": True, "hosts": hosts, "groups": groups})
 
     async def h_manifest(self, request: web.Request) -> web.StreamResponse:
         return web.Response(text=MANIFEST.format(token=self.token),

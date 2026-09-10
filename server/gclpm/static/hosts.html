@@ -57,6 +57,12 @@ input.bad{border-color:var(--down);background:#2a1212}
 }
 .tg.on{background:#0d3320;border-color:#166534;color:#6ee7a0}
 .tg.snd.on{background:#3a2a08;border-color:#a16207;color:#fbbf24}
+select.grp{
+  font:inherit;font-size:12px;font-weight:600;color:var(--fg);background:#0f1218;
+  border:1px solid var(--line);border-radius:99px;padding:6px 9px;max-width:190px;
+}
+select.grp:focus{outline:none;border-color:var(--accent)}
+select.grp.none{color:var(--dim)}
 .grow{flex:1}
 .del{border-color:#4a2020;color:#f88;background:none;padding:8px 12px}
 @media (max-width:640px){
@@ -97,7 +103,11 @@ input.bad{border-color:var(--down);background:#2a1212}
     <b>Watching</b> off means the host is not pinged at all: greyed out, and it can
     never raise an alarm. Use it for a device that is deliberately switched off.<br>
     <b>Alarm</b> off means no <i>noise</i>. The host still goes red, still needs an
-    acknowledgement, and still sends its notifications.
+    acknowledgement, and still sends its notifications.<br>
+    <b>Group</b> is the layer of the network the device sits on, and only decides
+    where its row is drawn - never what is pinged or who is told. The
+    <i>order</i> of the layers is the hierarchy the dashboard follows; it comes
+    from <code>groups:</code> in config.yml, so re-ordering them is an edit there.
   </p>
 </div>
 
@@ -120,6 +130,7 @@ if (m) {
 }
 
 var rows = [];        // the working copy; the file is only touched on Save
+var groups = [];      // the layer names, in the order the dashboard draws them
 var dirty = false;
 var listEl = document.getElementById("list");
 var msgEl = document.getElementById("msg");
@@ -155,6 +166,21 @@ function esc(s) {
     .replace(/"/g, "&quot;");
 }
 
+/* The group a host belongs to. The list is the hierarchy the dashboard draws,
+   so its ORDER matters and is edited in config.yml - this picker only says
+   which layer a device is on, and can add a layer that is missing. */
+function groupPicker(current) {
+  var html = '<select class="grp' + (current ? "" : " none") + '" data-f="group">' +
+             '<option value=""' + (current ? "" : " selected") + '>no group</option>';
+  var known = groups.slice();
+  if (current && known.indexOf(current) < 0) { known.push(current); }
+  for (var i = 0; i < known.length; i++) {
+    html += '<option value="' + esc(known[i]) + '"' +
+            (known[i] === current ? " selected" : "") + ">" + esc(known[i]) + "</option>";
+  }
+  return html + '<option value="__new__">+ new group...</option></select>';
+}
+
 function render() {
   if (!rows.length) {
     listEl.innerHTML = '<div class="empty">No hosts yet. Nothing is being monitored.</div>';
@@ -169,6 +195,7 @@ function render() {
         '<input type="text" class="ip" data-f="target" value="' + esc(r.target) + '" placeholder="IP or hostname" autocomplete="off" spellcheck="false" inputmode="url">' +
         '<button class="del" data-act="del" title="Remove this host">Remove</button>' +
         '<div class="toggles">' +
+          groupPicker(r.group) +
           '<span class="tg' + (r.enabled ? " on" : "") + '" data-act="enabled">' +
             (r.enabled ? "Watching" : "Not watched") + '</span>' +
           '<span class="tg snd' + (r.sound ? " on" : "") + '" data-act="sound">' +
@@ -187,12 +214,30 @@ function indexOfEvent(e) {
 
 listEl.addEventListener("input", function (e) {
   var f = e.target.getAttribute && e.target.getAttribute("data-f");
-  if (!f) { return; }
+  if (!f || e.target.tagName === "SELECT") { return; }   /* selects: see below */
   var i = indexOfEvent(e);
   if (i < 0) { return; }
   rows[i][f] = e.target.value;
   e.target.classList.remove("bad");
   markDirty();
+});
+
+/* The group picker. Kept off the input handler because one of its options is
+   not a value at all - it is "ask me for a new one". */
+listEl.addEventListener("change", function (e) {
+  if (e.target.tagName !== "SELECT") { return; }
+  var i = indexOfEvent(e);
+  if (i < 0) { return; }
+  var value = e.target.value;
+  if (value === "__new__") {
+    var name = (prompt("New group name (a layer of the network):") || "").trim();
+    if (!name) { render(); return; }               /* cancelled: put it back */
+    if (groups.indexOf(name) < 0) { groups.push(name); }
+    value = name;
+  }
+  rows[i].group = value;
+  markDirty();
+  render();
 });
 
 listEl.addEventListener("click", function (e) {
@@ -212,7 +257,10 @@ listEl.addEventListener("click", function (e) {
 });
 
 document.getElementById("add").onclick = function () {
-  rows.push({ label: "", target: "", enabled: true, sound: true });
+  /* the layer of the row above: adding six POP routers should not mean
+     picking the same group six times */
+  var last = rows.length ? rows[rows.length - 1].group : "";
+  rows.push({ label: "", target: "", enabled: true, sound: true, group: last || "" });
   markDirty();
   render();
   var inputs = listEl.querySelectorAll(".lbl");
@@ -223,6 +271,7 @@ function load(quiet) {
   say(quiet ? "" : "loading...", "busy");
   return api("/api/hosts").then(function (j) {
     rows = j.hosts || [];
+    groups = j.groups || [];
     dirty = false;
     document.body.classList.remove("dirty");
     render();
@@ -247,9 +296,10 @@ saveEl.onclick = function () {
   api("/api/hosts", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ hosts: rows })
+    body: JSON.stringify({ hosts: rows, groups: groups })
   }).then(function (j) {
     rows = j.hosts || rows;
+    groups = j.groups || groups;
     dirty = false;
     document.body.classList.remove("dirty");
     render();

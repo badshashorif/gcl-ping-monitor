@@ -94,6 +94,41 @@ Only in `.env`, never in `config.yml`:
 `config.yml` is therefore safe to read over someone's shoulder, which matters
 because it is the file people actually open.
 
+## Layers
+
+`groups:` in `config.yml` is the network's hierarchy - upstream first, edge
+last - and the dashboard draws the groups in exactly that order:
+
+```yaml
+groups: [UPSTREAM_PEER, CORE_RTR, CORE_SWITCH, NAT_RTR, ACCESS_RTR, POP_RTR]
+hosts:
+  - { label: NCS540, target: 172.30.100.1, group: CORE_RTR }
+```
+
+A group is **presentation only**. It never changes what is pinged, when a host
+alarms, or who is told, and moving a device between layers costs it neither its
+ping history nor its acknowledgement.
+
+Three rules keep it from ever hiding anything:
+
+- **Trouble rises.** A layer with a DOWN or WARN host is lifted above the
+  healthy ones, and inside every layer the worst host is at the top -
+  unacknowledged before acknowledged.
+- **Headings count the whole layer**, never the filtered subset, and they add
+  up to the banner. A heading that quietly recounted itself to match a search
+  would be the page lying in a smaller font.
+- **Folds do not persist.** *Focus* collapses the healthy layers, but only
+  while something is actually wrong somewhere - on a quiet day the whole estate
+  stays open. A hand-folded layer reopens on reload rather than surviving to
+  hide a device from the next person.
+
+A group a host names but `groups:` omits still gets a heading, at the bottom:
+a typo must be visible, not swallow the device. Hosts with no group land under
+`Ungrouped`, a reserved name no host can join.
+
+The `/hosts` editor sets a host's layer and can add a new one. Re-ordering the
+layers is an edit to `groups:`, because the order is the hierarchy.
+
 ## Behaviour worth knowing
 
 - **`web.public_url`** - set it, and tapping a phone alert opens the dashboard

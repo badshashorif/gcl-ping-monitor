@@ -149,7 +149,7 @@ def test_a_rejected_save_changes_nothing(cfg_file):
 
 def test_saving_an_empty_list_is_allowed_but_visible(cfg_file):
     # legitimate while setting a new box up; the loader is what warns about it
-    assert editor.save_hosts(cfg_file, []) == []
+    assert editor.save_hosts(cfg_file, []) == ([], [])
     assert cfgmod.load(cfg_file).hosts == []
 
 

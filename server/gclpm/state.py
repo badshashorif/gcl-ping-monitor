@@ -27,6 +27,7 @@ class Host:
     target: str
     enabled: bool = True
     sound: bool = True
+    group: str = ""
 
     status: str = INIT
     latency: float | None = None
@@ -110,7 +111,8 @@ class Monitor:
             host = self.hosts.get(spec.key)
             if host is None:
                 host = Host(label=spec.label, target=spec.target,
-                            enabled=spec.enabled, sound=spec.sound)
+                            enabled=spec.enabled, sound=spec.sound,
+                            group=spec.group)
                 host.history = deque(maxlen=loss_window)
                 host.status = INIT if spec.enabled else OFF
                 self.hosts[spec.key] = host
@@ -133,6 +135,11 @@ class Monitor:
             if host.sound != spec.sound:
                 host.sound = spec.sound
                 notes.append(f"sound {'on' if spec.sound else 'off'} for {host.label}")
+            if host.group != spec.group:
+                # purely where the row is drawn - never touches what is pinged,
+                # so it must not disturb history or an acknowledgement
+                host.group = spec.group
+                notes.append(f"moved {host.label} to {spec.group or 'no group'}")
             if host.history.maxlen != loss_window:
                 host.history = deque(host.history, maxlen=loss_window)
 
